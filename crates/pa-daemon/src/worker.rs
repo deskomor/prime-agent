@@ -738,6 +738,16 @@ impl Worker {
                 before_tool_call: Some(tool_permissions.gate()),
                 after_tool_call: Some(host_hooks.after_tool_call()),
                 host_call_gate: Some(host_hooks.host_call_gate()),
+                before_agent_start: Some(
+                    host_hooks.optional_hook(crate::host_hooks::BEFORE_AGENT_START),
+                ),
+                turn_end: Some(host_hooks.optional_hook(crate::host_hooks::TURN_END)),
+                session_before_compact: Some(
+                    host_hooks.optional_hook(crate::host_hooks::SESSION_BEFORE_COMPACT),
+                ),
+                context: Some(host_hooks.optional_hook(crate::host_hooks::CONTEXT)),
+                message_end: Some(host_hooks.optional_hook(crate::host_hooks::MESSAGE_END)),
+                auto_refine_paused: Some(host_hooks.auto_refine_paused()),
             });
             if let Some(children) = concrete.children.as_ref() {
                 let probe = Arc::clone(&tool_permissions);
@@ -761,6 +771,7 @@ impl Worker {
             Arc::clone(&core),
             idle_notify.clone(),
         );
+        tree_navigation.set_host_hooks(Arc::clone(&host_hooks));
         let exports = crate::session_export::ExportCommands::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),

@@ -5,6 +5,9 @@ use super::{
     SessionAgentMessage, TrailingAssistantFilter,
 };
 
+/// The skip message when the host's `session_before_compact` cancels.
+pub(crate) const HOST_CANCELLED_COMPACTION: &str = "Compaction was cancelled by the host.";
+
 impl AgentSession {
     pub async fn latest_compaction_timestamp(&self) -> Option<u64> {
         let state = self.agent.state().await;
@@ -33,6 +36,13 @@ impl AgentSession {
             .filter_map(|message| serde_json::to_value(message).ok())
             .filter_map(|value| serde_json::from_value(value).ok())
             .collect();
+        // The host's `context` hook may project the view the threshold reads.
+        let messages = if self.host_hook(|hooks| hooks.context.clone()).is_some() {
+            let entry_ids = self.session.lock().await.active_context().entry_ids;
+            self.host_projected("budget", messages, &entry_ids).await
+        } else {
+            messages
+        };
         compaction::threshold_compaction_due(
             &messages,
             model.context_window,
@@ -285,12 +295,48 @@ impl AgentSession {
                 session_id: self.session_id().await,
                 bill: crate::session_engine::compact_session::SummaryBill::default(),
             };
-            let summarized = crate::session_engine::compact_session::summarize_attempt(
-                &attempt,
-                &attempt_options,
-                &summaries.bill,
-            )
-            .await;
+            // The host's `context` hook may project what the summarizer
+            // reads (no single entry backs these, so their ids are null).
+            attempt.history = self
+                .host_projected("compaction", std::mem::take(&mut attempt.history), &[])
+                .await;
+            // The host's `session_before_compact` may cancel the run or
+            // supply the summary in place of the summarizer calls.
+            let host_answer = match self.host_hook(|hooks| hooks.session_before_compact.clone()) {
+                Some(hook) => hook(attempt.host_hook_payload(options.custom_instructions)).await,
+                None => None,
+            };
+            if host_answer
+                .as_ref()
+                .and_then(|answer| answer.get("cancel"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return Ok(CompactOutcome::Skipped(HOST_CANCELLED_COMPACTION));
+            }
+            let host_summary = host_answer
+                .as_ref()
+                .and_then(|answer| answer.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|summary| !summary.trim().is_empty())
+                .map(str::to_string);
+            let summarized = match host_summary {
+                Some(summary) => Ok(
+                    crate::session_engine::compact_session::prepared_from_host_summary(
+                        &attempt,
+                        &attempt_options,
+                        summary,
+                    ),
+                ),
+                None => {
+                    crate::session_engine::compact_session::summarize_attempt(
+                        &attempt,
+                        &attempt_options,
+                        &summaries.bill,
+                    )
+                    .await
+                }
+            };
             let mut prepared = match summarized {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -456,6 +502,7 @@ impl AgentSession {
             messages,
             refinement_history,
         } = parts.await?;
+        let messages = self.host_projected("refine", messages, &[]).await;
         let (refine_call, billed) = refine::billed_refiner_call(refine_call, "refine");
         let refined = {
             let mut session = self.session.lock().await;

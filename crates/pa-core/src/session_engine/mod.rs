@@ -191,6 +191,9 @@ pub struct AgentSession {
     /// their `model_usage` rows: the session file unless the host binds
     /// its durable store (the daemon worker's).
     usage_store: std::sync::Arc<dyn rlm_usage::RlmChildUsageStore>,
+    /// The host's hooks the session's own seams call (prompt start,
+    /// compaction, tree navigation); the default installs none.
+    host_hooks: std::sync::RwLock<host_hooks::SessionHostHooks>,
 }
 
 impl AgentSession {
@@ -253,6 +256,7 @@ impl AgentSession {
             compact_auto_refine: std::sync::Mutex::default(),
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            host_hooks: std::sync::RwLock::default(),
             skills: Vec::new(),
             skill_telemetry: None,
             image_model_router: None,

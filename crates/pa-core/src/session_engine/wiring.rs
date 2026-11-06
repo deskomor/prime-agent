@@ -95,6 +95,46 @@ impl AgentSession {
         self.skills = skills;
     }
 
+    /// Install the host's hooks the session's own seams call.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host-hook lock is poisoned.
+    pub fn set_host_hooks(&self, hooks: super::host_hooks::SessionHostHooks) {
+        *self.host_hooks.write().expect("host hooks lock") = hooks;
+    }
+
+    /// One installed host hook, picked by `select`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host-hook lock is poisoned.
+    pub(crate) fn host_hook<T>(
+        &self,
+        select: impl FnOnce(&super::host_hooks::SessionHostHooks) -> Option<T>,
+    ) -> Option<T> {
+        select(&self.host_hooks.read().expect("host hooks lock"))
+    }
+
+    /// `messages` as the host's `context` hook projects them for `purpose`,
+    /// or unchanged when no hook is installed or it gives no usable answer.
+    pub(crate) async fn host_projected<M>(
+        &self,
+        purpose: &str,
+        messages: Vec<M>,
+        entry_ids: &[Option<String>],
+    ) -> Vec<M>
+    where
+        M: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let Some(hook) = self.host_hook(|hooks| hooks.context.clone()) else {
+            return messages;
+        };
+        super::host_hooks::project_messages(&hook, purpose, &messages, entry_ids)
+            .await
+            .unwrap_or(messages)
+    }
+
     /// Bind the telemetry handle the `skill_use_count` counter counts
     /// through (the engine wiring owns the telemetry lifetime and
     /// installs it once the session telemetry is assembled).
@@ -177,7 +217,10 @@ impl AgentSession {
 
     /// Whether the session may run auto-refinement.
     pub fn auto_refine_allowed(&self) -> bool {
-        self.auto_refine_allowed && self.harness_refinements_enabled()
+        let paused = self
+            .host_hook(|hooks| hooks.auto_refine_paused.clone())
+            .is_some_and(|paused| paused.load(std::sync::atomic::Ordering::SeqCst));
+        self.auto_refine_allowed && !paused && self.harness_refinements_enabled()
     }
 
     /// The resolved auto-refine gates.

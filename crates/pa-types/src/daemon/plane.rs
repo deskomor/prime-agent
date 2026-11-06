@@ -58,6 +58,8 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "request_tool_permission"
         | "set_host_hooks"
         | "respond_host_hook"
+        | "append_session_entry"
+        | "set_auto_refine"
         | "get_model_catalog"
         | "get_available_models"
         | "get_queue"

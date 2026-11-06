@@ -180,6 +180,7 @@ fn session_context(model: Option<(&str, &str)>) -> SessionContext {
         thinking_level: "off".into(),
         service_tier: None,
         model: model.map(|(provider, id)| (provider.to_string(), id.to_string())),
+        entry_ids: vec![None],
     }
 }
 

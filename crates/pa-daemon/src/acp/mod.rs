@@ -7,6 +7,7 @@ mod mcp;
 mod meta;
 mod permissions;
 mod producer;
+mod session_ext;
 mod types;
 mod wire_config;
 mod wire_events;

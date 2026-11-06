@@ -74,6 +74,7 @@ fn faux_registration() -> pa_ai::faux::FauxProviderRegistration {
 mod auxiliary_model;
 mod cut_math;
 mod execute_compaction;
+mod host_hooks;
 mod prepare_compaction;
 mod second_compaction;
 mod skip_guards;

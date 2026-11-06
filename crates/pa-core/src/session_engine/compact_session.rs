@@ -339,6 +339,53 @@ async fn summary_call_with_retry(
     })
 }
 
+impl CompactionAttempt {
+    /// What the host's `session_before_compact` hook sees of this attempt.
+    pub(crate) fn host_hook_payload(&self, custom_instructions: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "customInstructions": custom_instructions,
+            "tokensBefore": self.tokens_before,
+            "firstKeptEntryId": self.first_kept_entry,
+            "previousSummary": self.previous_summary,
+            "isSplitTurn": self.cut.is_split_turn,
+            "messagesToSummarize": self.history,
+            "turnPrefixMessages": self.turn_prefix_messages,
+        })
+    }
+}
+
+/// The prepared compaction for a summary the host supplied in place of the
+/// summarizer calls (no model usage; the digest snapshot attaches as usual).
+pub(crate) fn prepared_from_host_summary(
+    attempt: &CompactionAttempt,
+    options: &CompactOptions<'_>,
+    summary: String,
+) -> PreparedCompaction {
+    let result = CompactionResult {
+        summary,
+        first_kept_entry_id: attempt.first_kept_entry.clone(),
+        tokens_before: attempt.tokens_before,
+        usage: None,
+    };
+    let (harness_digest, harness_state_fingerprint) = options
+        .harness_digest
+        .as_ref()
+        .map(|inputs| {
+            let render =
+                super::harness_digest::HarnessDigestInputs::render_with_fingerprint(inputs);
+            (Some(render.digest), Some(render.state_fingerprint))
+        })
+        .unwrap_or_default();
+    let entry = compaction_entry_for(
+        &result,
+        &attempt.details,
+        options.custom_instructions,
+        harness_digest,
+        harness_state_fingerprint,
+    );
+    PreparedCompaction { result, entry }
+}
+
 /// SUMMARIZE: run the summarizer calls with no session lock held. Each
 /// resolved call adds to `bill`, whatever the attempt's outcome.
 pub(crate) async fn summarize_attempt(

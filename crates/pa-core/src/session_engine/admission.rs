@@ -135,6 +135,24 @@ impl AgentSession {
             // downgrading the images to placeholders.
             self.apply_image_model_routing(&images, &options.batch)
                 .await?;
+            // The host's `before_agent_start` runs before the prompt row
+            // exists: its answer appends to this run's system prompt.
+            if let Some(hook) = self.host_hook(|hooks| hooks.before_agent_start.clone()) {
+                let system_prompt = self.agent.state().await.system_prompt;
+                let answer = hook(serde_json::json!({
+                    "prompt": normalized,
+                    "systemPrompt": system_prompt,
+                    "imageCount": images.len(),
+                }))
+                .await;
+                let append = answer
+                    .as_ref()
+                    .and_then(|answer| answer.get("appendSystemPrompt"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(str::to_string);
+                self.agent.set_system_prompt_suffix(append).await;
+            }
             // The turn's prompt messages: the deferred first-turn harness
             // digest rides first when one is due, streamed ahead of the user
             // prompt and carried on `agent_end`.

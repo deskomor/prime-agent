@@ -2983,3 +2983,66 @@ fn acp_host_call_hook_refuses_a_kernel_host_call() {
         "a host error refuses: {errors:?}"
     );
 }
+
+/// The optional hooks reach an opted-in client in run order, and the
+/// session extension requests write a durable entry and pause
+/// auto-refinement.
+#[test]
+fn acp_optional_hooks_and_session_extensions() {
+    let script = json!({ "engine": "faux", "responses": [{ "text": "done" }] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({ "hooks": ["before_agent_start", "turn_end"] })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "hello there" }] }),
+    );
+    let start = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+    });
+    assert_eq!(start["params"]["hook"], "before_agent_start");
+    assert_eq!(start["params"]["payload"]["prompt"], "hello there");
+    assert!(start["params"]["payload"]["systemPrompt"].is_string());
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": start["id"],
+        "result": { "appendSystemPrompt": "Lead rules apply." },
+    }));
+    let turn_end = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+    });
+    assert_eq!(turn_end["params"]["hook"], "turn_end");
+    assert_eq!(
+        turn_end["params"]["payload"]["message"]["role"],
+        "assistant"
+    );
+    client.send(&json!({ "jsonrpc": "2.0", "id": turn_end["id"], "result": {} }));
+    let (response, _) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+
+    let append = client.request(
+        "_ai.primeintellect.prime-agent/append_session_entry",
+        &json!({ "sessionId": session_id, "customType": "studio.fleet", "data": { "role": "lead" } }),
+    );
+    let (appended, _) = client.wait_response(append, TIMEOUT);
+    assert!(
+        appended["result"]["entryId"].is_string(),
+        "the entry id answers: {appended}"
+    );
+    let pause = client.request(
+        "_ai.primeintellect.prime-agent/set_auto_refine",
+        &json!({ "sessionId": session_id, "enabled": false }),
+    );
+    let (paused, _) = client.wait_response(pause, TIMEOUT);
+    assert!(paused.get("error").is_none(), "{paused}");
+    let unknown = client.request(
+        "_ai.primeintellect.prime-agent/set_auto_refine",
+        &json!({ "sessionId": "nope", "enabled": true }),
+    );
+    let (refused, _) = client.wait_response(unknown, TIMEOUT);
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+}

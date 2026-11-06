@@ -37,6 +37,8 @@ pub struct BranchSummaryResult {
 #[derive(Debug, Default)]
 pub struct BranchPreparation {
     pub messages: Vec<AgentMessage>,
+    /// The session entry each message came from, index for index.
+    pub entry_ids: Vec<Option<String>>,
     pub file_ops: FileOperations,
     pub total_tokens: u64,
 }
@@ -174,6 +176,7 @@ fn prepare_branch_entries_with_refinements(
         }
     }
     let mut messages: Vec<AgentMessage> = Vec::new();
+    let mut entry_ids: Vec<Option<String>> = Vec::new();
     let mut total_tokens = 0u64;
     for entry in entries.iter().rev() {
         let Some(message) = get_message_from_entry(entry) else {
@@ -200,15 +203,18 @@ fn prepare_branch_entries_with_refinements(
             );
             if boundary && total_tokens < token_budget * 9 / 10 {
                 messages.insert(0, message);
+                entry_ids.insert(0, entry.id().map(str::to_string));
                 total_tokens += tokens;
             }
             break;
         }
         messages.insert(0, message);
+        entry_ids.insert(0, entry.id().map(str::to_string));
         total_tokens += tokens;
     }
     BranchPreparation {
         messages,
+        entry_ids,
         file_ops,
         total_tokens,
     }
@@ -243,7 +249,18 @@ fn build_branch_summary_request_with_refinements(
     enabled: bool,
 ) -> (Vec<AgentMessage>, BranchPreparation) {
     let preparation = prepare_branch_entries_with_refinements(entries, token_budget, enabled);
-    let messages = if preparation.messages.is_empty() {
+    let messages =
+        branch_summary_request_messages(&preparation, custom_instructions, replace_instructions);
+    (messages, preparation)
+}
+
+/// The summarizer request for prepared branch messages.
+fn branch_summary_request_messages(
+    preparation: &BranchPreparation,
+    custom_instructions: Option<&str>,
+    replace_instructions: bool,
+) -> Vec<AgentMessage> {
+    if preparation.messages.is_empty() {
         Vec::new()
     } else {
         let llm_messages = convert_to_llm(&preparation.messages);
@@ -262,8 +279,7 @@ fn build_branch_summary_request_with_refinements(
             timestamp: 0,
             rest: serde_json::Map::default(),
         })]
-    };
-    (messages, preparation)
+    }
 }
 
 /// Assemble the final summary text from a model response.
@@ -297,6 +313,9 @@ pub struct GenerateBranchSummaryOptions<'a> {
     pub custom_instructions: Option<&'a str>,
     /// Replace the default prompt instead of appending the custom focus.
     pub replace_instructions: bool,
+    /// The host's `context` hook, which may project the prepared branch
+    /// messages (purpose `branch_summary`) before the summarizer reads them.
+    pub project: Option<super::host_hooks::HostHookFn>,
     /// Tokens reserved for prompt + response (TS default 16384).
     pub reserve_tokens: u64,
     /// When present, the summary call resolves its model through the
@@ -360,6 +379,7 @@ pub async fn generate_branch_summary(
         api_key,
         custom_instructions,
         replace_instructions,
+        project,
         reserve_tokens,
         auxiliary,
         session_id,
@@ -425,13 +445,26 @@ pub async fn generate_branch_summary(
         }
         None => true,
     };
-    let (request_messages, preparation) = build_branch_summary_request_with_refinements(
-        entries,
-        token_budget,
-        custom_instructions,
-        replace_instructions,
-        enabled,
-    );
+    let mut preparation = prepare_branch_entries_with_refinements(entries, token_budget, enabled);
+    // The host's `context` hook may project the branch messages the
+    // summarizer reads; the file-op tally keeps the unprojected branch.
+    if let Some(hook) = project.as_ref() {
+        if !preparation.messages.is_empty() {
+            if let Some(messages) = super::host_hooks::project_messages(
+                hook,
+                "branch_summary",
+                &preparation.messages,
+                &preparation.entry_ids,
+            )
+            .await
+            {
+                preparation.entry_ids = vec![None; messages.len()];
+                preparation.messages = messages;
+            }
+        }
+    }
+    let request_messages =
+        branch_summary_request_messages(&preparation, custom_instructions, replace_instructions);
     if request_messages.is_empty() {
         let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
         return BranchSummaryResult {
@@ -733,6 +766,7 @@ mod tests {
                 api_key: None,
                 custom_instructions: Some("focus on x"),
                 replace_instructions: false,
+                project: None,
                 reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                 auxiliary: None,
                 session_id: None,
@@ -766,6 +800,7 @@ mod tests {
                 api_key: None,
                 custom_instructions: None,
                 replace_instructions: false,
+                project: None,
                 reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                 auxiliary: None,
                 session_id: None,
@@ -837,6 +872,7 @@ mod tests {
                     api_key: None,
                     custom_instructions: None,
                     replace_instructions: false,
+                    project: None,
                     reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                     auxiliary: Some(&aux),
                     session_id: Some("conversation"),

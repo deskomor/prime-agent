@@ -104,6 +104,8 @@ impl Worker {
             "request_tool_permission" => self.handle_request_tool_permission(payload).await,
             "set_host_hooks" => self.handle_set_host_hooks(payload),
             "respond_host_hook" => self.handle_respond_host_hook(payload),
+            "append_session_entry" => self.handle_append_session_entry(payload),
+            "set_auto_refine" => self.handle_set_auto_refine(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
             "cycle_model" => self.handle_cycle_model(payload).await,
@@ -349,6 +351,20 @@ impl Worker {
                 None,
             )
         }
+    }
+
+    /// Pause (`enabled: false`) or resume the session's own auto-refinement.
+    fn handle_set_auto_refine(&self, payload: &Value) -> DaemonResponse {
+        let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
+            return response_failure(
+                None,
+                "set_auto_refine",
+                "set_auto_refine requires a boolean enabled",
+                None,
+            );
+        };
+        self.host_hooks.set_auto_refine_paused(!enabled);
+        response_success(None, "set_auto_refine", None)
     }
 
     /// The session's owner-fenced ACP MCP store: the ACP transport resolves and

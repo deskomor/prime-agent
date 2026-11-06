@@ -235,6 +235,7 @@ impl Worker {
         let work_notify = Arc::clone(&self.work_notify);
         let command = command.to_string();
         let agent_dir = self.config.agent_dir.clone();
+        let host_hooks = Arc::clone(&self.host_hooks);
         tokio::spawn(async move {
             let cwd = {
                 let core = core.lock().unwrap();
@@ -286,6 +287,21 @@ impl Worker {
             }
             let event = merge_identity(event, &identity);
             emit_session_event_frame(&core, &events, event);
+            // The host's `user_bash_end` hears the run before queued work
+            // resumes (its answer is ignored).
+            let _ = host_hooks
+                .optional(
+                    crate::host_hooks::USER_BASH_END,
+                    json!({
+                        "command": command,
+                        "output": end.output,
+                        "exitCode": end.exit_code,
+                        "cancelled": end.cancelled,
+                        "truncated": end.truncated,
+                        "excludeFromContext": exclude_from_context,
+                    }),
+                )
+                .await;
             // The queue drains after the slot is released (TS
             // `_drainQueuedMessagesAfterBash`).
             work_notify.notify_one();

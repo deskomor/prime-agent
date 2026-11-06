@@ -9,8 +9,10 @@
 //! going away):
 //!
 //! - Enforcement hooks (`host_call`) guard a rule, so they refuse the call.
-//! - Optional hooks (`after_tool_call`) add context, so the session continues
-//!   as if the hook were not there.
+//! - Optional hooks (`after_tool_call`, `before_agent_start`, `turn_end`,
+//!   `session_before_compact`, `session_before_tree`, `context`,
+//!   `message_end`, `user_bash_end`) add context or listen, so the session
+//!   continues as if the hook were not there.
 //!
 //! With no hooks enabled (the default) every hook point answers at once and
 //! the session behaves exactly as without a host.
@@ -31,8 +33,32 @@ use tokio::sync::oneshot;
 pub(crate) const AFTER_TOOL_CALL: &str = "after_tool_call";
 /// The kernel host-call gate (enforcement).
 pub(crate) const HOST_CALL: &str = "host_call";
+/// The system-prompt addition before a prompt's run (optional).
+pub(crate) const BEFORE_AGENT_START: &str = "before_agent_start";
+/// Hidden rows after each turn (optional).
+pub(crate) const TURN_END: &str = "turn_end";
+/// Cancel or replace a compaction (optional).
+pub(crate) const SESSION_BEFORE_COMPACT: &str = "session_before_compact";
+/// Cancel or replace a tree navigation's branch summary (optional).
+pub(crate) const SESSION_BEFORE_TREE: &str = "session_before_tree";
+/// Project the messages a consumer reads, by purpose (optional).
+pub(crate) const CONTEXT: &str = "context";
+/// Hear each finished message (optional, notification).
+pub(crate) const MESSAGE_END: &str = "message_end";
+/// Hear each finished user `!` bash run (optional, notification).
+pub(crate) const USER_BASH_END: &str = "user_bash_end";
 /// Every hook a client may enable.
-pub(crate) const KNOWN_HOOKS: [&str; 2] = [AFTER_TOOL_CALL, HOST_CALL];
+pub(crate) const KNOWN_HOOKS: [&str; 9] = [
+    AFTER_TOOL_CALL,
+    HOST_CALL,
+    BEFORE_AGENT_START,
+    TURN_END,
+    SESSION_BEFORE_COMPACT,
+    SESSION_BEFORE_TREE,
+    CONTEXT,
+    MESSAGE_END,
+    USER_BASH_END,
+];
 
 /// How long one hook waits for its answer unless the client sets another.
 pub(crate) const HOST_HOOK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,6 +100,8 @@ struct BrokerState {
 pub(crate) struct HostHookBroker {
     state: Mutex<BrokerState>,
     emit: HostHookEmit,
+    /// `set_auto_refine`: while set, the session runs no auto-refinement.
+    auto_refine_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HostHookBroker {
@@ -81,7 +109,19 @@ impl HostHookBroker {
         Arc::new(Self {
             state: Mutex::new(BrokerState::default()),
             emit,
+            auto_refine_paused: Arc::default(),
         })
+    }
+
+    /// The shared pause flag the session's auto-refine trigger reads.
+    pub(crate) fn auto_refine_paused(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.auto_refine_paused)
+    }
+
+    /// Pause or resume the session's own auto-refinement.
+    pub(crate) fn set_auto_refine_paused(&self, paused: bool) {
+        self.auto_refine_paused
+            .store(paused, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Replace the session's hooks. An unknown hook name fails the whole
@@ -182,6 +222,24 @@ impl HostHookBroker {
             "outcome": if answer.is_ok() { "answered" } else { "failed" },
         }));
         Some(answer)
+    }
+
+    /// Ask one optional hook: its answer, or `None` when the hook is off or
+    /// gave no usable answer (the caller continues as if it were absent).
+    pub(crate) async fn optional(&self, hook: &str, payload: Value) -> Option<Value> {
+        self.call(hook, payload, None).await?.ok()
+    }
+
+    /// An optional hook as the engine's hook seam.
+    pub(crate) fn optional_hook(
+        self: &Arc<Self>,
+        hook: &'static str,
+    ) -> pa_core::session_engine::host_hooks::HostHookFn {
+        let broker = Arc::clone(self);
+        Arc::new(move |payload| {
+            let broker = Arc::clone(&broker);
+            Box::pin(async move { broker.optional(hook, payload).await })
+        })
     }
 
     fn gates_host_call(&self, request_type: &str) -> bool {
@@ -434,5 +492,47 @@ mod tests {
         // The timeout refuses too.
         let error = gate("rlm.spawn".to_string(), json!({})).await.unwrap_err();
         assert!(error.to_string().contains("so it was refused"), "{error}");
+    }
+    #[tokio::test]
+    async fn optional_hooks_continue_without_an_answer() {
+        let (broker, events) = recording_broker();
+        // Off: no event, no answer.
+        assert!(broker.optional(TURN_END, json!({})).await.is_none());
+        assert!(events.lock().unwrap().is_empty());
+        broker
+            .set_hooks(
+                &[TURN_END.to_string(), BEFORE_AGENT_START.to_string()],
+                None,
+                Some(Duration::from_millis(20)),
+            )
+            .unwrap();
+        // Only listed hooks ask.
+        assert!(broker.optional(CONTEXT, json!({})).await.is_none());
+        assert!(events.lock().unwrap().is_empty());
+
+        let hook = broker.optional_hook(TURN_END);
+        let call = tokio::spawn(hook(json!({ "toolResults": [] })));
+        let (id, event) = requested_id(&events).await;
+        assert_eq!(event["hook"], TURN_END);
+        broker.resolve(&id, Ok(json!({ "messages": ["note"] })));
+        assert_eq!(call.await.unwrap(), Some(json!({ "messages": ["note"] })));
+
+        events.lock().unwrap().clear();
+        let call = tokio::spawn(broker.optional_hook(BEFORE_AGENT_START)(json!({})));
+        let (id, _) = requested_id(&events).await;
+        broker.resolve(&id, Err("studio crashed".to_string()));
+        assert!(call.await.unwrap().is_none(), "an error is no answer");
+
+        // A timeout is no answer either.
+        assert!(broker.optional(TURN_END, json!({})).await.is_none());
+    }
+
+    #[test]
+    fn auto_refine_pause_is_shared() {
+        let (broker, _) = recording_broker();
+        let flag = broker.auto_refine_paused();
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        broker.set_auto_refine_paused(true);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

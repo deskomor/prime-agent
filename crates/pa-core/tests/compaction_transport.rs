@@ -207,6 +207,7 @@ async fn branch_summary_respects_mandatory_thinking() {
             api_key: Some("synthetic-key".into()),
             custom_instructions: None,
             replace_instructions: false,
+            project: None,
             reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
             auxiliary: None,
             session_id: None,

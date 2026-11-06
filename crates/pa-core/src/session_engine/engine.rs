@@ -710,6 +710,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         }
         None => timing_stream_fn,
     };
+    // The `turn_end` hook steers into the agent built just below.
+    let session_host_hooks = config.host_hooks.clone();
+    let turn_end_agent = std::sync::Arc::new(std::sync::OnceLock::<std::sync::Weak<Agent>>::new());
     let agent = Agent::new(AgentOptions {
         // Every request in the session carries this identity: providers key prompt caching
         // (`prompt_cache_key`), session headers, and WebSocket/`previous_response_id` reuse on it
@@ -734,15 +737,55 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // wraps a pass-through that marks the turn's dispatch moment.
         transform_context: Some(super::request_timing::instrument_transform_context(
             std::sync::Arc::clone(&request_timing_wiring),
-            super::request_timing::pass_through_transform(),
+            match config.host_hooks.context.clone() {
+                // The host's `context` hook projects the provider request.
+                Some(hook) => super::host_hooks::provider_projection(hook, wiring.session.clone()),
+                None => super::request_timing::pass_through_transform(),
+            },
         )),
         should_stop_after_turn: {
             let steering = config.queued_steering_probe.take();
             let boundary = config.should_stop_after_turn.take();
+            let turn_end = config.host_hooks.turn_end.clone();
+            let turn_end_agent = std::sync::Arc::clone(&turn_end_agent);
+            let next_turn_rows = std::sync::Arc::clone(&boot_notice_rows);
             Some(std::sync::Arc::new(move |context| {
                 let steering = steering.clone();
                 let boundary = boundary.clone();
+                let turn_end = turn_end.clone();
+                let turn_end_agent = std::sync::Arc::clone(&turn_end_agent);
+                let next_turn_rows = std::sync::Arc::clone(&next_turn_rows);
                 Box::pin(async move {
+                    // The host's `turn_end`: hidden rows ride the next model
+                    // call after a tool batch (steered into this run), or the
+                    // next admitted prompt after a final answer.
+                    if let Some(hook) = turn_end {
+                        let rows = hook(serde_json::json!({
+                            "message": pa_agent::types::Message::Assistant(
+                                context.message.clone()
+                            ),
+                            "toolResults": context.tool_results,
+                        }))
+                        .await
+                        .map(|answer| super::host_hooks::hidden_messages(&answer))
+                        .unwrap_or_default();
+                        let agent = turn_end_agent.get().and_then(std::sync::Weak::upgrade);
+                        match agent {
+                            Some(agent) if !context.tool_results.is_empty() => {
+                                for row in rows {
+                                    if let Some(message) = super::session_message_to_loop(
+                                        &super::SessionAgentMessage::Custom(row),
+                                    ) {
+                                        agent.steer(message);
+                                    }
+                                }
+                            }
+                            _ => next_turn_rows
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .extend(rows),
+                        }
+                    }
                     if steering.as_ref().is_some_and(|probe| probe()) {
                         return Ok(true);
                     }
@@ -762,6 +805,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     });
 
     let agent = Arc::new(agent);
+    let _ = turn_end_agent.set(Arc::downgrade(&agent));
     // The in-process bash-notice sinks bind their agent late: their
     // handlers registered before the agent existed.
     *bash_notice_agent
@@ -846,6 +890,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // inventory (TS `_expandSkillCommand` expands from the loader); the
     // model-visible list only shapes the prompt, pre-import, and counts.
     session.set_skills(resources.skills.clone());
+    session.set_host_hooks(session_host_hooks);
     session.set_image_model_router(config.image_model_router.clone());
     // The semantic-edge handoff: the daemon's child registry and retry
     // park read the recorder; the side question keeps the pre-semantic
@@ -875,6 +920,21 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                         if let Some(agent) = agent_at_end.upgrade() {
                             agent.set_model_override(None);
                         }
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+    }
+    // The host's `message_end` hears every finished message (awaited, its
+    // answer ignored).
+    if let Some(hook) = config.host_hooks.message_end.clone() {
+        agent
+            .subscribe(move |event, _signal| {
+                let hook = std::sync::Arc::clone(&hook);
+                Box::pin(async move {
+                    if let pa_agent::types::AgentEvent::MessageEnd { message } = event {
+                        let _ = hook(serde_json::json!({ "message": message })).await;
                     }
                     Ok(())
                 })
@@ -1156,6 +1216,9 @@ impl SessionEngine {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod host_hook_tests;
 
 #[cfg(test)]
 mod append_system_tests;

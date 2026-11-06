@@ -615,6 +615,7 @@ impl WindowedSessionStore {
             leaf_id,
             settings: SessionContext {
                 messages: Vec::new(),
+                entry_ids: Vec::new(),
                 thinking_level: thinking.unwrap_or_else(|| "off".to_owned()),
                 service_tier: tier.flatten(),
                 model,
@@ -692,6 +693,7 @@ impl WindowedSessionStore {
             leaf_id: snapshot.leaf.clone(),
             settings: SessionContext {
                 messages: Vec::new(),
+                entry_ids: Vec::new(),
                 thinking_level: snapshot.thinking.clone(),
                 service_tier: snapshot.tier,
                 model: snapshot.model.clone(),

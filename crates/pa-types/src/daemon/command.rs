@@ -778,7 +778,9 @@ pub enum DaemonCommand {
         rest: JsonMap,
     },
     /// Replace the session's enabled host hooks (`after_tool_call`,
-    /// `host_call`); an empty list turns them all off.
+    /// `host_call`, `before_agent_start`, `turn_end`, `context`,
+    /// `session_before_compact`, `session_before_tree`, `message_end`,
+    /// `user_bash_end`); an empty list turns them all off.
     SetHostHooks {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -803,6 +805,27 @@ pub enum DaemonCommand {
         result: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Append one durable custom entry (host state outside the model
+    /// context); answers its `entryId`.
+    AppendSessionEntry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        custom_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Pause (`enabled: false`) or resume the session's own auto-refinement.
+    SetAutoRefine {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        enabled: bool,
         #[serde(flatten)]
         rest: JsonMap,
     },

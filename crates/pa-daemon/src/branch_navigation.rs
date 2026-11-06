@@ -31,6 +31,8 @@ pub(crate) struct TreeNavigation {
     /// The live branch-summary run's abort slot; each run replaces it, like
     /// the TS `_branchSummaryAbortController`.
     abort: Mutex<Option<Arc<AbortController>>>,
+    /// The host's `session_before_tree` hook (`crate::host_hooks`).
+    host_hooks: std::sync::OnceLock<Arc<crate::host_hooks::HostHookBroker>>,
 }
 
 impl TreeNavigation {
@@ -44,7 +46,13 @@ impl TreeNavigation {
             core,
             idle_notify,
             abort: Mutex::new(None),
+            host_hooks: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bind the worker's host hooks (`session_before_tree`).
+    pub(crate) fn set_host_hooks(&self, hooks: Arc<crate::host_hooks::HostHookBroker>) {
+        let _ = self.host_hooks.set(hooks);
     }
 
     /// `abort_branch_summary`: abort the live run; the TS handler always
@@ -179,11 +187,45 @@ impl TreeNavigation {
 
         let (new_leaf, editor_text) = navigation_point(&target);
 
+        // The host's `session_before_tree` may cancel the navigation or
+        // supply the branch summary in place of the generated one.
+        let host_answer = match self.host_hooks.get() {
+            Some(hooks) => {
+                hooks
+                    .optional(
+                        crate::host_hooks::SESSION_BEFORE_TREE,
+                        json!({
+                            "targetId": target_id,
+                            "oldLeafId": old_leaf,
+                            "summarize": summarize,
+                            "customInstructions": custom_instructions,
+                        }),
+                    )
+                    .await
+            }
+            None => None,
+        };
+        if host_answer
+            .as_ref()
+            .and_then(|answer| answer.get("cancel"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return response_success(None, "navigate_tree", Some(json!({ "cancelled": true })));
+        }
+        let host_summary = host_answer
+            .as_ref()
+            .and_then(|answer| answer.get("summary"))
+            .and_then(Value::as_str)
+            .filter(|summary| !summary.trim().is_empty())
+            .map(str::to_string);
+
         // The abandoned-branch summary (TS `generateBranchSummary`).
-        let mut summary: Option<PendingBranchSummary> = None;
+        let mut summary: Option<PendingBranchSummary> =
+            host_summary.map(|text| (text, None, None, None));
         let replace_instructions =
             payload.get("replaceInstructions").and_then(Value::as_bool) == Some(true);
-        if summarize {
+        if summarize && summary.is_none() {
             let file_entries: Vec<_> = entries
                 .iter()
                 .filter_map(session_tree::entry_as_file_entry)

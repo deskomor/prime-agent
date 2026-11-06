@@ -739,6 +739,13 @@ impl SessionEngine for AgentSessionEngine {
             cwd: self.cwd(),
             agent_dir: self.config.agent_dir.clone(),
         };
+        // The host's `context` hook may project the branch the summary reads.
+        let project = self
+            .host_hooks
+            .lock()
+            .expect("host hooks lock")
+            .context
+            .clone();
         let run = async {
             pa_core::session_engine::branch_summarization::generate_branch_summary(
                 &entries,
@@ -747,6 +754,7 @@ impl SessionEngine for AgentSessionEngine {
                     api_key,
                     custom_instructions: custom_instructions.as_deref(),
                     replace_instructions,
+                    project,
                     reserve_tokens,
                     auxiliary: Some(&auxiliary),
                     session_id: Some(&session_id),

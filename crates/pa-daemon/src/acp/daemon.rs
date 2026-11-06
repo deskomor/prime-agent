@@ -1080,6 +1080,10 @@ async fn handle_incoming(
         "session/set_config_option" => {
             handle_set_config_option(id, params, link, state, tx).await;
         }
+        super::session_ext::APPEND_SESSION_ENTRY_METHOD
+        | super::session_ext::SET_AUTO_REFINE_METHOD => {
+            super::session_ext::handle_session_ext(id, &method, params, link, state, tx).await;
+        }
         other => {
             let _ = tx.send(jsonrpc::error_response(
                 &id,

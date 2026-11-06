@@ -30,6 +30,47 @@ impl Worker {
         response_success(None, "append_custom_message", None)
     }
 
+    /// `append_session_entry { customType, data }`: append one durable custom
+    /// entry (host state, outside the model context); answers its `entryId`.
+    pub(crate) fn handle_append_session_entry(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("append_session_entry") {
+            return response;
+        }
+        let Some(custom_type) = payload
+            .get("customType")
+            .and_then(Value::as_str)
+            .filter(|custom_type| !custom_type.is_empty())
+        else {
+            return response_failure(
+                None,
+                "append_session_entry",
+                "append_session_entry requires a customType",
+                None,
+            );
+        };
+        let mut core = self.core.lock().unwrap();
+        let Some(store) = core.store.as_mut() else {
+            return response_failure(
+                None,
+                "append_session_entry",
+                "Session is still initializing",
+                None,
+            );
+        };
+        let mut fields = json!({ "customType": custom_type });
+        if let Some(data) = payload.get("data").filter(|data| !data.is_null()) {
+            fields["data"] = data.clone();
+        }
+        match store.persist_entry("custom", fields) {
+            Ok(entry_id) => response_success(
+                None,
+                "append_session_entry",
+                Some(json!({ "entryId": entry_id })),
+            ),
+            Err(error) => response_failure(None, "append_session_entry", &error.to_string(), None),
+        }
+    }
+
     /// `restore_next_turn { messages }`: park the custom rows; the next delivered
     /// turn replays them as prefix rows, in order, before the accepted prompt.
     pub(crate) fn handle_restore_next_turn(&self, payload: &Value) -> DaemonResponse {

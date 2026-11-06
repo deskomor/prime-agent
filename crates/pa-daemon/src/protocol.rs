@@ -174,6 +174,8 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "request_tool_permission",
     "set_host_hooks",
     "respond_host_hook",
+    "append_session_entry",
+    "set_auto_refine",
 ];
 
 /// Parsed client command envelope.
@@ -757,6 +759,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::RespondHostHook {
             active_session_id, ..
         }
+        | DaemonCommand::AppendSessionEntry {
+            active_session_id, ..
+        }
+        | DaemonCommand::SetAutoRefine {
+            active_session_id, ..
+        }
         | DaemonCommand::GetModelCatalog {
             active_session_id, ..
         }
@@ -1032,6 +1040,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::RequestToolPermission { .. } => "request_tool_permission",
         DaemonCommand::SetHostHooks { .. } => "set_host_hooks",
         DaemonCommand::RespondHostHook { .. } => "respond_host_hook",
+        DaemonCommand::AppendSessionEntry { .. } => "append_session_entry",
+        DaemonCommand::SetAutoRefine { .. } => "set_auto_refine",
         DaemonCommand::GetModelCatalog { .. } => "get_model_catalog",
         DaemonCommand::GetAvailableModels { .. } => "get_available_models",
         DaemonCommand::GetQueue { .. } => "get_queue",

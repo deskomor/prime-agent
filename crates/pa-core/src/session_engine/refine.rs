@@ -556,6 +556,7 @@ impl AgentSession {
             messages,
             refinement_history: session_history,
         } = parts.await?;
+        let messages = self.host_projected("refine", messages, &[]).await;
         let history = crate::refinement::merge_refinement_history(&history, &session_history);
         let (review_call, billed) =
             billed_refiner_call(self.refiner_call(model, api_key).await?, "refine_review");

@@ -111,6 +111,9 @@ pub struct AgentOptions {
 
 struct MutableAgentState {
     system_prompt: String,
+    /// Appended to the system prompt of every run context until replaced
+    /// (a host's per-prompt addition); `None` adds nothing.
+    system_prompt_suffix: Option<String>,
     model: Model,
     thinking_level: ThinkingLevel,
     tools: Vec<Arc<dyn AgentTool>>,
@@ -125,6 +128,7 @@ impl Default for MutableAgentState {
     fn default() -> Self {
         MutableAgentState {
             system_prompt: String::new(),
+            system_prompt_suffix: None,
             model: Model::unknown(),
             thinking_level: ThinkingLevel::Off,
             tools: Vec::new(),
@@ -517,8 +521,12 @@ impl AgentInner {
     }
 
     fn snapshot_locked(shared: &Shared) -> crate::types::AgentContext {
+        let system_prompt = match &shared.state.system_prompt_suffix {
+            Some(suffix) => format!("{}\n\n{suffix}", shared.state.system_prompt),
+            None => shared.state.system_prompt.clone(),
+        };
         crate::types::AgentContext {
-            system_prompt: shared.state.system_prompt.clone(),
+            system_prompt,
             messages: shared.state.messages.clone(),
             tools: shared.state.tools.clone(),
         }
@@ -871,6 +879,12 @@ impl Agent {
 
     pub async fn set_system_prompt(&self, system_prompt: impl Into<String>) {
         self.inner.shared.lock().await.state.system_prompt = system_prompt.into();
+    }
+
+    /// Replace the text appended to the system prompt of later run contexts
+    /// (`None` appends nothing). The base system prompt is untouched.
+    pub async fn set_system_prompt_suffix(&self, suffix: Option<String>) {
+        self.inner.shared.lock().await.state.system_prompt_suffix = suffix;
     }
 
     pub async fn set_model(&self, model: Model) {

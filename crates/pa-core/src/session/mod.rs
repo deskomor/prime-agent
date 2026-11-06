@@ -292,6 +292,9 @@ pub fn get_latest_compaction_entry(entries: &[FileEntry]) -> Option<&CompactionE
 /// Reconstructed conversation state at a leaf.
 pub struct SessionContext {
     pub messages: Vec<AgentMessage>,
+    /// The session entry each message came from, index for index (`None`
+    /// for the compaction summary, which stands for many entries).
+    pub entry_ids: Vec<Option<String>>,
     pub thinking_level: String,
     pub service_tier: Option<pa_types::ai::ServiceTier>,
     pub model: Option<(String, String)>,
@@ -411,7 +414,8 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
     });
 
     let mut messages: Vec<AgentMessage> = Vec::new();
-    let append_message =
+    let mut entry_ids: Vec<Option<String>> = Vec::new();
+    let push_message =
         |entry: &FileEntry, target: &mut Vec<AgentMessage>, keep_digest_entry_id: Option<&str>| {
             match entry {
                 FileEntry::Message { message, .. } => target.push(message.clone()),
@@ -442,6 +446,15 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
                 _ => {}
             }
         };
+    // Each pushed message records the entry it came from.
+    let append_message = |entry: &FileEntry,
+                          target: &mut Vec<AgentMessage>,
+                          ids: &mut Vec<Option<String>>,
+                          keep_digest_entry_id: Option<&str>| {
+        let before = target.len();
+        push_message(entry, target, keep_digest_entry_id);
+        ids.extend((before..target.len()).map(|_| entry.id().map(str::to_string)));
+    };
 
     if let Some(compaction_index) = compaction {
         let payload = match &entries[compaction_index] {
@@ -450,6 +463,7 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
         };
         let first_kept_id = payload.first_kept_entry_id.clone();
         let mut retained: Vec<AgentMessage> = Vec::new();
+        let mut retained_ids: Vec<Option<String>> = Vec::new();
         let mut found_first_kept = false;
         for &index in &path[..path.partition_point(|&i| i < compaction_index)] {
             if Some(entries[index].id().unwrap_or_default().to_string())
@@ -458,7 +472,12 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
                 found_first_kept = true;
             }
             if found_first_kept {
-                append_message(&entries[index], &mut retained, keep_digest_entry_id);
+                append_message(
+                    &entries[index],
+                    &mut retained,
+                    &mut retained_ids,
+                    keep_digest_entry_id,
+                );
             }
         }
         let summary_harness_digest = if summary_yields_snapshot {
@@ -480,18 +499,31 @@ pub fn build_session_context(entries: &[FileEntry], leaf_id: Option<&str>) -> Se
             harness_state_fingerprint: summary_harness_state_fingerprint,
             timestamp: timestamp_to_millis(entries[compaction_index].timestamp()),
         }));
+        entry_ids.push(None);
         messages.extend(retained);
+        entry_ids.extend(retained_ids);
         for &index in &path[path.partition_point(|&i| i <= compaction_index)..] {
-            append_message(&entries[index], &mut messages, keep_digest_entry_id);
+            append_message(
+                &entries[index],
+                &mut messages,
+                &mut entry_ids,
+                keep_digest_entry_id,
+            );
         }
     } else {
         for &index in &path {
-            append_message(&entries[index], &mut messages, keep_digest_entry_id);
+            append_message(
+                &entries[index],
+                &mut messages,
+                &mut entry_ids,
+                keep_digest_entry_id,
+            );
         }
     }
 
     SessionContext {
         messages,
+        entry_ids,
         thinking_level,
         service_tier,
         model,
@@ -515,6 +547,7 @@ pub(crate) fn create_custom_message(
 fn empty_context() -> SessionContext {
     SessionContext {
         messages: Vec::new(),
+        entry_ids: Vec::new(),
         thinking_level: "off".to_string(),
         service_tier: None,
         model: None,
