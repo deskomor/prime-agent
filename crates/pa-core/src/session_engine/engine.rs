@@ -109,6 +109,11 @@ pub struct SessionEngineConfig {
     /// request ids on the wire).
     pub semantic_edges: Option<super::semantic_edges::SemanticEdgeIdentity>,
     pub on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
+    /// The host's tool-permission gate: awaited after a tool call's
+    /// arguments validate and before it runs; a `block` answer turns the
+    /// call into an error tool result carrying the reason. `None` runs
+    /// every call ungated (the TS behavior).
+    pub tool_permission_gate: Option<pa_agent::agent_loop::BeforeToolCallFn>,
 }
 
 pub struct SessionEngine {
@@ -747,6 +752,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         should_stop_before_turn: config.queued_steering_probe.clone(),
         steering_mode: config.steering_mode,
         follow_up_mode: config.follow_up_mode,
+        before_tool_call: config.tool_permission_gate.take(),
         ..Default::default()
     });
 

@@ -754,6 +754,29 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Switch the session's host tool-permission gate: `ask` makes every
+    /// model tool call wait for `respond_tool_permission`; `off` runs them
+    /// ungated (the default).
+    SetToolPermissionMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        mode: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Answer one `tool_permission_request` session event with an ACP
+    /// permission option kind (`allow_once`, `allow_always`, `reject_once`,
+    /// `reject_always`) or `cancelled`.
+    RespondToolPermission {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        request_id: String,
+        outcome: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     GetModelCatalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

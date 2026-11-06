@@ -2733,3 +2733,52 @@ fn acp_daemon_attached_close_holds_the_input_pause_until_the_next_session_new() 
     let _second = new_session(&mut client);
     drop(client);
 }
+
+/// A client that opts in at `initialize` gets each model tool call as a
+/// `session/request_permission` request, and a reject keeps the call from
+/// running: the model reads the denial and the turn still ends normally.
+#[test]
+fn acp_opted_in_client_rejects_a_tool_call_before_it_runs() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let marker = scratch.path().join("ran");
+    let code = format!("open({:?}, 'w').close()", marker.display().to_string());
+    let script = json!({ "engine": "faux", "responses": [
+        { "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": code } },
+        ] },
+        { "text": "after the denial" },
+    ] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let mut params = initialize_params();
+    params["clientCapabilities"]["_meta"] =
+        json!({ "ai.primeintellect.prime-agent": { "toolPermissions": true } });
+    let init = client.request("initialize", &params);
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "run it" }] }),
+    );
+    let request = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "session/request_permission"
+    });
+    assert_eq!(request["params"]["sessionId"], session_id.as_str());
+    assert_eq!(
+        request["params"]["toolCall"]["rawInput"],
+        json!({ "code": code })
+    );
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": { "outcome": { "outcome": "selected", "optionId": "reject_once" } },
+    }));
+    let (response, updates) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+    assert!(
+        updates.iter().any(|frame| frame
+            .to_string()
+            .contains("The user denied this tool call.")),
+        "the denial reaches the stream: {updates:?}"
+    );
+    assert!(!marker.exists(), "the rejected command ran");
+}

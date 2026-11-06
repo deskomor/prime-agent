@@ -29,6 +29,13 @@ pub enum Incoming {
         method: String,
         params: Value,
     },
+    /// The client's answer to a request this agent sent
+    /// (`session/request_permission`): `result` on success, `error` otherwise.
+    Response {
+        id: Value,
+        result: Option<Value>,
+        error: Option<Value>,
+    },
 }
 
 /// Parse one line into an incoming message. `Err` carries the error
@@ -55,9 +62,22 @@ pub fn parse_line(line: &str) -> Result<Incoming, Value> {
         return Err(bad_request());
     }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
-        // A bare response (no method) is client traffic; it is not an error,
-        // but it is also not a message the server can act on.
-        return Err(bad_request());
+        // A bare response (no method) answers a request this agent sent.
+        let (Some(id), result, error) = (
+            object.get("id").filter(|id| !id.is_null()),
+            object.get("result"),
+            object.get("error"),
+        ) else {
+            return Err(bad_request());
+        };
+        if result.is_none() == error.is_none() {
+            return Err(bad_request());
+        }
+        return Ok(Incoming::Response {
+            id: id.clone(),
+            result: result.cloned(),
+            error: error.cloned(),
+        });
     };
     let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
     match object.get("id") {
@@ -123,6 +143,20 @@ mod tests {
         assert_eq!(parse_error["error"]["code"], PARSE_ERROR);
         let invalid = parse_line(r#"{"id":3,"result":null}"#).unwrap_err();
         assert_eq!(invalid["error"]["code"], INVALID_REQUEST);
+        let answer = parse_line(
+            r#"{"jsonrpc":"2.0","id":"p1","result":{"outcome":{"outcome":"cancelled"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            answer,
+            Incoming::Response {
+                id: json!("p1"),
+                result: Some(json!({"outcome":{"outcome":"cancelled"}})),
+                error: None,
+            }
+        );
+        let both = parse_line(r#"{"jsonrpc":"2.0","id":"p1","result":{},"error":{}}"#).unwrap_err();
+        assert_eq!(both["error"]["code"], INVALID_REQUEST);
     }
 
     #[test]

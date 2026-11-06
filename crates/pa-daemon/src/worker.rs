@@ -154,6 +154,9 @@ pub struct Worker {
     pub(crate) model_catalog_refresh_gate: std::sync::Arc<crate::model_catalog::RefreshGate>,
     recovery: Arc<Mutex<Option<WorkerRecoveryJournal>>>,
     side_questions: crate::side_question::SideQuestionManager,
+    /// The host tool-permission broker (`set_tool_permission_mode`,
+    /// `respond_tool_permission`).
+    pub(crate) tool_permissions: Arc<crate::tool_permission::ToolPermissionBroker>,
     /// Single-use peer-transport grants (worker memory only).
     pub(crate) peer_grants: PeerGrantStore,
     pub(crate) compaction: crate::compaction::CompactionManager,
@@ -713,6 +716,19 @@ impl Worker {
             });
             (engine, agent_engine, roster_pushes)
         };
+        // The host tool-permission broker: its requests frame as session
+        // events on the pump; the real engine's builds await its gate.
+        let permission_core = Arc::clone(&core);
+        let permission_events = events.clone();
+        let tool_permissions = crate::tool_permission::ToolPermissionBroker::new(
+            Arc::new(move |event| {
+                emit_worker_event_with(&permission_core, &permission_events, event);
+            }),
+            crate::tool_permission::TOOL_PERMISSION_TIMEOUT,
+        );
+        if let Some(concrete) = agent_engine.as_ref() {
+            concrete.set_tool_permission_gate(tool_permissions.gate());
+        }
         let side_questions = crate::side_question::SideQuestionManager::new(
             std::sync::Arc::clone(&engine),
             events.clone(),
@@ -773,6 +789,7 @@ impl Worker {
             ),
             recovery,
             side_questions,
+            tool_permissions,
             peer_grants: PeerGrantStore::new(),
             compaction,
             tree_navigation,

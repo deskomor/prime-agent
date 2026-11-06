@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::jsonrpc::{self, Incoming};
 use super::meta::{self, PrimeAgentEventPhase, PrimeAgentOutcome, PrimeAgentSessionMeta};
+use super::permissions::PermissionRelay;
 use super::producer::{self, UpdateProducer};
 use super::types;
 use super::wire_config::{
@@ -298,6 +299,9 @@ pub(crate) struct DaemonAcpState {
     pub(crate) closed_input_pause_id: Option<String>,
     pub(crate) closed_input_pause_key: Option<String>,
     pub(crate) mcp_server_names: Vec<String>,
+    /// The connection's `session/request_permission` relay
+    /// (`super::permissions`).
+    pub(crate) permissions: Arc<PermissionRelay>,
 }
 
 /// Serve the daemon-attached ACP mode until stdin closes. The caller
@@ -339,6 +343,9 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
     {
         let link = Arc::clone(&link);
         let state = Arc::clone(&state);
+        // Weak: the EOF teardown waits for every strong sender to drop
+        // before the writer exits.
+        let permission_tx = tx.downgrade();
         tokio::spawn(async move {
             let mut frames = link.frames.lock().await;
             while let Some(frame) = frames.recv().await {
@@ -352,11 +359,22 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             None;
                         {
                             let mut guard = state.lock().await;
+                            let permissions = Arc::clone(&guard.permissions);
                             let Some(current) = guard.session.as_mut() else {
                                 continue;
                             };
                             if let Some(stop) = wire_events::assistant_stop(&event) {
                                 current.assistant_stop_reason = stop.stop_reason;
+                            }
+                            if let Some(request) = permissions.request_frame(
+                                &event,
+                                &current.acp_session_id,
+                                &current.daemon_active_session_id,
+                            ) {
+                                if let Some(permission_tx) = permission_tx.upgrade() {
+                                    let _ = permission_tx.send(request);
+                                }
+                                continue;
                             }
                             if event.get("type").and_then(Value::as_str) == Some("rlm_child_update")
                             {
@@ -468,6 +486,32 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                 continue;
             }
         };
+        // Client answers to `session/request_permission` go straight back
+        // to the worker; any other response is ignored.
+        if let Incoming::Response { id, result, .. } = &incoming {
+            let permissions = Arc::clone(&state.lock().await.permissions);
+            if let Some(answer) = permissions.take_answer(id, result.as_ref()) {
+                let link = Arc::clone(&link);
+                tokio::spawn(async move {
+                    // A lost answer leaves the worker gate to time out and deny.
+                    let _ = link
+                        .request_ok(DaemonCommand::RespondToolPermission {
+                            id: None,
+                            active_session_id: answer.daemon_session_id,
+                            request_id: answer.request_id,
+                            outcome: answer.outcome,
+                            rest: Map::new(),
+                        })
+                        .await;
+                });
+            }
+            continue;
+        }
+        if let Incoming::Request { method, params, .. } = &incoming {
+            if method == "initialize" {
+                state.lock().await.permissions.observe_initialize(params);
+            }
+        }
         // Handlers run concurrently (like the TS acp agent's request
         // handling): a prompt turn may span minutes, and `session/cancel`
         // must reach the daemon while it is in flight. The state machine
@@ -1206,6 +1250,32 @@ async fn handle_session_new(
         }
     }
 
+    // An opted-in client gets every tool call gated before the session can
+    // take a prompt; a failed switch fails the session instead of running
+    // ungated.
+    let permissions = Arc::clone(&state.lock().await.permissions);
+    if permissions.opted_in() {
+        if let Err(error) = link
+            .request_ok(DaemonCommand::SetToolPermissionMode {
+                id: None,
+                active_session_id: binding.active_session_id.clone(),
+                mode: "ask".to_string(),
+                rest: Map::new(),
+            })
+            .await
+        {
+            let _ = clear_connection_servers(
+                link,
+                &binding.active_session_id,
+                &binding.mcp_owner_id,
+                state,
+            )
+            .await;
+            state.lock().await.session_new_in_flight = false;
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+            return;
+        }
+    }
     let mut result = json!({
         "sessionId": acp_session_id,
         "configOptions": *hosted.config.published.lock().await,

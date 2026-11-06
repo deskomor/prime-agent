@@ -237,6 +237,9 @@ pub struct AgentSessionEngine {
     /// build; `None` without a worker pump.
     progress_note_emit:
         std::sync::Mutex<Option<pa_core::session_engine::rlm_host::RlmProgressNoteEmit>>,
+    /// The host's tool-permission gate (`crate::tool_permission`), threaded
+    /// into every session build; `None` runs every tool call ungated.
+    tool_permission_gate: std::sync::Mutex<Option<pa_agent::agent_loop::BeforeToolCallFn>>,
     /// The attribution producer the children registry's sink last got:
     /// children outlive a rebuild, so their spawn registrations are adopted
     /// forward.

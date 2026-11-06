@@ -99,6 +99,8 @@ impl Worker {
             "rename_saved_session" => self.handle_rename_saved_session(payload),
             "delete_saved_session" => self.handle_delete_saved_session(payload).await,
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
+            "set_tool_permission_mode" => self.handle_set_tool_permission_mode(payload),
+            "respond_tool_permission" => self.handle_respond_tool_permission(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
             "cycle_model" => self.handle_cycle_model(payload).await,
@@ -211,6 +213,48 @@ impl Worker {
             }
         }
         response
+    }
+
+    /// Switch the host tool-permission gate (`ask` / `off`).
+    fn handle_set_tool_permission_mode(&self, payload: &Value) -> DaemonResponse {
+        let mode = payload
+            .get("mode")
+            .and_then(Value::as_str)
+            .and_then(crate::tool_permission::ToolPermissionMode::parse);
+        let Some(mode) = mode else {
+            return response_failure(
+                None,
+                "set_tool_permission_mode",
+                "Tool permission mode must be \"ask\" or \"off\"",
+                None,
+            );
+        };
+        self.tool_permissions.set_mode(mode);
+        response_success(None, "set_tool_permission_mode", None)
+    }
+
+    /// Answer one `tool_permission_request`. An unknown outcome denies the
+    /// call; an unknown request id fails (it already settled).
+    fn handle_respond_tool_permission(&self, payload: &Value) -> DaemonResponse {
+        let request_id = payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let outcome = payload
+            .get("outcome")
+            .and_then(Value::as_str)
+            .and_then(crate::tool_permission::ToolPermissionOutcome::parse)
+            .unwrap_or(crate::tool_permission::ToolPermissionOutcome::Cancelled);
+        if self.tool_permissions.resolve(request_id, outcome) {
+            response_success(None, "respond_tool_permission", None)
+        } else {
+            response_failure(
+                None,
+                "respond_tool_permission",
+                "No tool permission request is waiting with that id",
+                None,
+            )
+        }
     }
 
     /// The session's owner-fenced ACP MCP store: the ACP transport resolves and
