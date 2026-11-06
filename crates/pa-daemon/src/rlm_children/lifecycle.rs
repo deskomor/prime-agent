@@ -105,6 +105,16 @@ impl SupervisorChildSessionsInner {
         if let Some(request_id) = spawned_by_request_id {
             config["spawnedByRequestId"] = json!(request_id);
         }
+        // An asking parent's child asks it too.
+        let parent_asks = self
+            .tool_permission_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|probe| probe());
+        if parent_asks {
+            config["toolPermissionParent"] = json!(self.parent_active_session_id);
+        }
         if let Some(script) = &identity.child_script {
             config["script"] = json!(script);
             // The scripted engine rides the identity down the recursion (TS

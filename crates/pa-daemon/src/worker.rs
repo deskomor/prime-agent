@@ -728,6 +728,10 @@ impl Worker {
         );
         if let Some(concrete) = agent_engine.as_ref() {
             concrete.set_tool_permission_gate(tool_permissions.gate());
+            if let Some(children) = concrete.children.as_ref() {
+                let probe = Arc::clone(&tool_permissions);
+                children.set_tool_permission_probe(Arc::new(move || probe.asks()));
+            }
         }
         let side_questions = crate::side_question::SideQuestionManager::new(
             std::sync::Arc::clone(&engine),

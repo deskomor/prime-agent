@@ -361,6 +361,9 @@ pub type DeleteNotifier = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 pub(crate) type ChildUpdateSink = std::sync::Arc<dyn Fn(Value) + Send + Sync>;
 
+/// Reads whether the parent session's tool calls wait for a host decision.
+pub(crate) type ToolPermissionProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[derive(Debug, Clone, Copy)]
 enum RetirementIntent {
     Delete { was_running: bool },
@@ -421,6 +424,9 @@ struct SupervisorChildSessionsInner {
     /// and once per close walk, so a barrier parked behind descendant
     /// work re-reads the registry when the descendants settle.
     settle_notify: tokio::sync::Notify,
+    /// Whether this session's tool calls wait for a host decision: a child
+    /// created while it does asks this session for its own calls.
+    tool_permission_probe: std::sync::Mutex<Option<ToolPermissionProbe>>,
     /// The model-allowlist refusal telemetry: `spawn`/`create_session`
     /// refusals emit through the engine's shared lazily-built client.
     model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
@@ -478,6 +484,7 @@ impl SupervisorChildSessions {
                 settle_hook: std::sync::Mutex::new(None),
                 running: tokio::sync::watch::Sender::new(false),
                 settle_notify: tokio::sync::Notify::new(),
+                tool_permission_probe: std::sync::Mutex::new(None),
                 model_refusal_telemetry,
                 usage_sink: std::sync::Mutex::new(None),
                 delete_notifier: std::sync::Mutex::new(None),
@@ -498,6 +505,16 @@ impl SupervisorChildSessions {
             .delete_notifier
             .lock()
             .expect("delete notifier lock") = Some(notifier);
+    }
+
+    /// Wire the parent's tool-permission state (children created while it
+    /// asks inherit the gate, with this session deciding).
+    pub(crate) fn set_tool_permission_probe(&self, probe: ToolPermissionProbe) {
+        *self
+            .inner
+            .tool_permission_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
 
     pub(crate) fn set_child_update_sink(&self, sink: ChildUpdateSink) {

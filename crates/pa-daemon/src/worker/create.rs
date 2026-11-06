@@ -13,6 +13,50 @@ use crate::agent_engine::CreateSessionResources;
 use crate::protocol::DaemonResponse;
 
 impl Worker {
+    /// The upstream that sends this child's requests to its parent session
+    /// as `request_tool_permission`, stamped with the child's identity. A
+    /// failed or unreadable answer is no answer: the call is denied.
+    fn tool_permission_upstream(
+        &self,
+        parent_active_session_id: &str,
+        rlm_child_id: Option<&str>,
+        name: Option<&str>,
+    ) -> crate::tool_permission::ToolPermissionUpstream {
+        let link = Arc::new(crate::supervisor_link::SupervisorLink::new(
+            self.config.supervisor_socket_path.clone(),
+        ));
+        let parent = parent_active_session_id.to_string();
+        let origin = json!({
+            "activeSessionId": self.config.active_session_id,
+            "rlmChildId": rlm_child_id,
+            "sessionName": name,
+        });
+        Arc::new(move |request| {
+            let link = Arc::clone(&link);
+            let mut command = request;
+            command["type"] = json!("request_tool_permission");
+            command["activeSessionId"] = json!(parent);
+            // A grandchild's request keeps the origin it started with.
+            if command.get("origin").is_none_or(Value::is_null) {
+                command["origin"] = origin.clone();
+            }
+            Box::pin(async move {
+                let answer = link
+                    .request_success(
+                        command,
+                        crate::tool_permission::TOOL_PERMISSION_TIMEOUT
+                            + std::time::Duration::from_secs(60),
+                    )
+                    .await
+                    .ok()?;
+                answer
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .and_then(crate::tool_permission::ToolPermissionOutcome::parse)
+            })
+        })
+    }
+
     pub(super) async fn handle_create(&self, payload: &Value) -> DaemonResponse {
         // One create in flight at a time: a concurrent create joins this open and
         // answers with the created summary instead of racing a second init.
@@ -192,6 +236,12 @@ impl Worker {
             .get("childScript")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // A child spawned by an ask-mode parent asks that parent for every
+        // tool call (the durable create replays the key on a respawn).
+        if let Some(parent) = payload.get("toolPermissionParent").and_then(Value::as_str) {
+            self.tool_permissions
+                .set_upstream(self.tool_permission_upstream(parent, rlm_child_id.as_deref(), name));
+        }
 
         // Set by the fresh-path arm when the name landed in its single rewrite:
         // the shared name persist must not append a second `session_info` line.

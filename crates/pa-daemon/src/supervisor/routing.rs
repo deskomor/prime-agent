@@ -52,6 +52,8 @@ pub(crate) fn client_route_timeout(command: &DaemonCommand) -> u64 {
             | DaemonCommand::Compact { .. }
             // A tree navigation may run a branch-summary model call.
             | DaemonCommand::NavigateTree { .. }
+            // A child's permission request waits for the user's answer.
+            | DaemonCommand::RequestToolPermission { .. }
     ) {
         WORKER_REQUEST_TIMEOUT_MS
     } else {

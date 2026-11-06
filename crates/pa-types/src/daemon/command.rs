@@ -777,6 +777,22 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// An RLM child asks its parent session to decide one of its tool calls
+    /// (`origin` names the child); the answer's `outcome` is a permission
+    /// option kind, `cancelled`, or `timed_out`.
+    RequestToolPermission {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        #[serde(default)]
+        args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Value>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     GetModelCatalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

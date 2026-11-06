@@ -12,14 +12,23 @@
 //! `reject_always` are remembered per tool name for the life of the worker.
 //! With the mode `off` (the default) the gate answers at once and the session
 //! behaves exactly as without a host.
+//!
+//! An RLM child spawned while its parent asks inherits the gate with the
+//! parent as its upstream: each request goes to the parent worker as
+//! `request_tool_permission`, which decides it like its own call (its rules,
+//! its clients, or its own upstream) and answers with the outcome. The
+//! request carries the child's identity as `origin`.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use pa_agent::abort::AbortSignal;
 use pa_agent::agent_loop::BeforeToolCallFn;
 use pa_agent::types::BeforeToolCallResult;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
 /// How long one request waits for an answer before it is denied.
@@ -72,7 +81,7 @@ impl ToolPermissionOutcome {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AllowOnce => "allow_once",
             Self::AllowAlways => "allow_always",
@@ -93,6 +102,38 @@ impl ToolPermissionOutcome {
 /// Emits one session event to the worker's attached clients.
 pub(crate) type ToolPermissionEmit = Arc<dyn Fn(Value) + Send + Sync>;
 
+/// Forwards one request (its wire shape) to the session that decides for
+/// this one: an RLM child asks its parent. Resolves to the outcome, `None`
+/// when no answer arrived.
+pub(crate) type ToolPermissionUpstream = Arc<
+    dyn Fn(Value) -> Pin<Box<dyn Future<Output = Option<ToolPermissionOutcome>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// One tool call waiting for a decision.
+pub(crate) struct ToolPermissionRequest {
+    pub(crate) tool_call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) args: Value,
+    /// The RLM child session the call runs in; `None` for this session's own calls.
+    pub(crate) origin: Option<Value>,
+}
+
+impl ToolPermissionRequest {
+    /// The request fields as events and the delegation command carry them.
+    fn wire(&self) -> Map<String, Value> {
+        let mut wire = Map::new();
+        wire.insert("toolCallId".to_string(), json!(self.tool_call_id));
+        wire.insert("toolName".to_string(), json!(self.tool_name));
+        wire.insert("args".to_string(), self.args.clone());
+        if let Some(origin) = &self.origin {
+            wire.insert("origin".to_string(), origin.clone());
+        }
+        wire
+    }
+}
+
 struct PendingRequest {
     tool_name: String,
     answer: oneshot::Sender<ToolPermissionOutcome>,
@@ -101,9 +142,17 @@ struct PendingRequest {
 #[derive(Default)]
 struct BrokerState {
     mode: Option<ToolPermissionMode>,
+    upstream: Option<ToolPermissionUpstream>,
     pending: HashMap<String, PendingRequest>,
     always_allow: HashSet<String>,
     always_reject: HashSet<String>,
+}
+
+/// Where one request goes, decided under the lock.
+enum Route {
+    Decided(ToolPermissionOutcome),
+    Local(OpenRequest),
+    Upstream(ToolPermissionUpstream),
 }
 
 /// The session's permission broker: the engine gate awaits it, the worker
@@ -133,10 +182,32 @@ impl ToolPermissionBroker {
         let mut state = self.state.lock().expect("tool permission lock");
         state.mode = Some(mode);
         if mode == ToolPermissionMode::Off {
+            state.upstream = None;
             for (_, request) in state.pending.drain() {
                 let _ = request.answer.send(ToolPermissionOutcome::Cancelled);
             }
         }
+    }
+
+    /// Ask, and send every request to `upstream` instead of this session's
+    /// clients (an RLM child whose parent's host approves its calls).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the broker lock is poisoned.
+    pub(crate) fn set_upstream(&self, upstream: ToolPermissionUpstream) {
+        let mut state = self.state.lock().expect("tool permission lock");
+        state.mode = Some(ToolPermissionMode::Ask);
+        state.upstream = Some(upstream);
+    }
+
+    /// Whether calls wait for a decision (children spawned now inherit it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the broker lock is poisoned.
+    pub(crate) fn asks(&self) -> bool {
+        self.state.lock().expect("tool permission lock").mode == Some(ToolPermissionMode::Ask)
     }
 
     /// Answer one waiting request; `false` when no request has that id.
@@ -149,19 +220,7 @@ impl ToolPermissionBroker {
         let Some(request) = state.pending.remove(request_id) else {
             return false;
         };
-        match outcome {
-            ToolPermissionOutcome::AllowAlways => {
-                state.always_reject.remove(&request.tool_name);
-                state.always_allow.insert(request.tool_name);
-            }
-            ToolPermissionOutcome::RejectAlways => {
-                state.always_allow.remove(&request.tool_name);
-                state.always_reject.insert(request.tool_name);
-            }
-            ToolPermissionOutcome::AllowOnce
-            | ToolPermissionOutcome::RejectOnce
-            | ToolPermissionOutcome::Cancelled => {}
-        }
+        remember(&mut state, &request.tool_name, outcome);
         let _ = request.answer.send(outcome);
         true
     }
@@ -172,96 +231,140 @@ impl ToolPermissionBroker {
         Arc::new(move |context, signal| {
             let broker = Arc::clone(&broker);
             Box::pin(async move {
-                let tool_call_id = context.tool_call.id.clone();
-                let tool_name = context.tool_call.name.clone();
-                let Some(answer) = broker.open_request(&tool_call_id, &tool_name, &context.args)
-                else {
-                    return Ok(None);
+                let request = ToolPermissionRequest {
+                    tool_call_id: context.tool_call.id.clone(),
+                    tool_name: context.tool_call.name.clone(),
+                    args: context.args.clone(),
+                    origin: None,
                 };
-                let request_id = answer.request_id.clone();
-                let outcome = tokio::select! {
-                    outcome = answer.receiver => outcome.ok(),
-                    () = tokio::time::sleep(broker.timeout) => None,
-                    () = signal.aborted() => Some(ToolPermissionOutcome::Cancelled),
-                };
-                Ok(broker.settle(&request_id, outcome))
+                let outcome = broker.decide(request, Some(signal)).await;
+                Ok(gate_answer(outcome))
             })
         })
     }
 
-    fn open_request(
+    /// Decide one call: at once when the gate is off or a rule covers the
+    /// tool, else by this session's clients or the upstream session. `None`
+    /// is the timeout (or an upstream that never answered); an abort is
+    /// `Cancelled`.
+    pub(crate) async fn decide(
         &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        args: &Value,
-    ) -> Option<OpenRequest> {
+        request: ToolPermissionRequest,
+        signal: Option<AbortSignal>,
+    ) -> Option<ToolPermissionOutcome> {
+        match self.route(&request) {
+            Route::Decided(outcome) => Some(outcome),
+            Route::Local(open) => {
+                let outcome = tokio::select! {
+                    outcome = open.receiver => outcome.ok(),
+                    () = tokio::time::sleep(self.timeout) => None,
+                    () = aborted(signal) => Some(ToolPermissionOutcome::Cancelled),
+                };
+                self.settle(&open.request_id, outcome);
+                outcome
+            }
+            Route::Upstream(upstream) => {
+                let outcome = tokio::select! {
+                    outcome = upstream(Value::Object(request.wire())) => outcome,
+                    () = tokio::time::sleep(self.timeout) => None,
+                    () = aborted(signal) => Some(ToolPermissionOutcome::Cancelled),
+                };
+                if let Some(outcome) = outcome {
+                    let mut state = self.state.lock().expect("tool permission lock");
+                    remember(&mut state, &request.tool_name, outcome);
+                }
+                outcome
+            }
+        }
+    }
+
+    fn route(&self, request: &ToolPermissionRequest) -> Route {
         let mut state = self.state.lock().expect("tool permission lock");
-        if state.mode != Some(ToolPermissionMode::Ask) || state.always_allow.contains(tool_name) {
-            return None;
+        if state.mode != Some(ToolPermissionMode::Ask) {
+            return Route::Decided(ToolPermissionOutcome::AllowOnce);
+        }
+        if state.always_allow.contains(&request.tool_name) {
+            return Route::Decided(ToolPermissionOutcome::AllowAlways);
+        }
+        if state.always_reject.contains(&request.tool_name) {
+            return Route::Decided(ToolPermissionOutcome::RejectAlways);
+        }
+        if let Some(upstream) = &state.upstream {
+            return Route::Upstream(Arc::clone(upstream));
         }
         let request_id = uuid::Uuid::new_v4().to_string();
         let (answer, receiver) = oneshot::channel();
-        if state.always_reject.contains(tool_name) {
-            let _ = answer.send(ToolPermissionOutcome::RejectAlways);
-            return Some(OpenRequest {
-                request_id,
-                receiver,
-            });
-        }
         state.pending.insert(
             request_id.clone(),
             PendingRequest {
-                tool_name: tool_name.to_string(),
+                tool_name: request.tool_name.clone(),
                 answer,
             },
         );
         drop(state);
-        (self.emit)(json!({
-            "type": "tool_permission_request",
-            "requestId": request_id,
-            "toolCallId": tool_call_id,
-            "toolName": tool_name,
-            "args": args,
-        }));
-        Some(OpenRequest {
+        let mut event = request.wire();
+        event.insert("type".to_string(), json!("tool_permission_request"));
+        event.insert("requestId".to_string(), json!(request_id));
+        (self.emit)(Value::Object(event));
+        Route::Local(OpenRequest {
             request_id,
             receiver,
         })
     }
 
-    /// Close the request and turn its outcome into the gate's answer. `None`
-    /// is the timeout.
-    fn settle(
-        &self,
-        request_id: &str,
-        outcome: Option<ToolPermissionOutcome>,
-    ) -> Option<BeforeToolCallResult> {
-        let waited = self
-            .state
+    /// Close a local request and tell the clients how it ended. `None` is
+    /// the timeout.
+    fn settle(&self, request_id: &str, outcome: Option<ToolPermissionOutcome>) {
+        self.state
             .lock()
             .expect("tool permission lock")
             .pending
-            .remove(request_id)
-            .is_some();
-        let resolved = outcome.map_or("timed_out", ToolPermissionOutcome::as_str);
-        if waited || outcome.is_some() {
-            (self.emit)(json!({
-                "type": "tool_permission_resolved",
-                "requestId": request_id,
-                "outcome": resolved,
-            }));
+            .remove(request_id);
+        (self.emit)(json!({
+            "type": "tool_permission_resolved",
+            "requestId": request_id,
+            "outcome": outcome.map_or("timed_out", ToolPermissionOutcome::as_str),
+        }));
+    }
+}
+
+/// Record an `always` answer for the tool.
+fn remember(state: &mut BrokerState, tool_name: &str, outcome: ToolPermissionOutcome) {
+    match outcome {
+        ToolPermissionOutcome::AllowAlways => {
+            state.always_reject.remove(tool_name);
+            state.always_allow.insert(tool_name.to_string());
         }
-        match outcome {
-            Some(outcome) if outcome.allows() => None,
-            Some(_) => Some(BeforeToolCallResult {
-                block: true,
-                reason: Some(TOOL_PERMISSION_DENIED.to_string()),
-            }),
-            None => Some(BeforeToolCallResult {
-                block: true,
-                reason: Some(TOOL_PERMISSION_TIMED_OUT.to_string()),
-            }),
+        ToolPermissionOutcome::RejectAlways => {
+            state.always_allow.remove(tool_name);
+            state.always_reject.insert(tool_name.to_string());
         }
+        ToolPermissionOutcome::AllowOnce
+        | ToolPermissionOutcome::RejectOnce
+        | ToolPermissionOutcome::Cancelled => {}
+    }
+}
+
+/// The gate's answer for an outcome (`None` is the timeout).
+fn gate_answer(outcome: Option<ToolPermissionOutcome>) -> Option<BeforeToolCallResult> {
+    match outcome {
+        Some(outcome) if outcome.allows() => None,
+        Some(_) => Some(BeforeToolCallResult {
+            block: true,
+            reason: Some(TOOL_PERMISSION_DENIED.to_string()),
+        }),
+        None => Some(BeforeToolCallResult {
+            block: true,
+            reason: Some(TOOL_PERMISSION_TIMED_OUT.to_string()),
+        }),
+    }
+}
+
+/// Resolves when the turn aborts; never without a signal.
+async fn aborted(signal: Option<AbortSignal>) {
+    match signal {
+        Some(signal) => signal.aborted().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -273,7 +376,6 @@ struct OpenRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pa_agent::abort::AbortSignal;
     use pa_agent::types::{AgentContext, AssistantMessage, BeforeToolCallContext, ToolCall};
 
     fn context(tool: &str) -> BeforeToolCallContext {
@@ -377,6 +479,64 @@ mod tests {
         assert_eq!(
             (answer.block, answer.reason),
             (true, Some(TOOL_PERMISSION_TIMED_OUT.to_string()))
+        );
+    }
+    #[tokio::test]
+    async fn a_child_asks_its_upstream_and_keeps_always_answers() {
+        let (broker, events) = recording_broker(TOOL_PERMISSION_TIMEOUT);
+        let forwarded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&forwarded);
+        broker.set_upstream(Arc::new(move |request| {
+            sink.lock().unwrap().push(request);
+            Box::pin(async { Some(ToolPermissionOutcome::RejectAlways) })
+        }));
+        assert!(broker.asks());
+        for _ in 0..2 {
+            let answer = broker.gate()(context("bash"), AbortSignal::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (answer.block, answer.reason.as_deref()),
+                (true, Some(TOOL_PERMISSION_DENIED))
+            );
+        }
+        let forwarded = forwarded.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "the remembered rule answers the second call"
+        );
+        assert_eq!(forwarded[0]["toolName"], "bash");
+        assert_eq!(forwarded[0]["args"], json!({ "command": "ls" }));
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no local client is asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_request_carries_its_origin_and_off_allows_it() {
+        let (broker, events) = recording_broker(TOOL_PERMISSION_TIMEOUT);
+        broker.set_mode(ToolPermissionMode::Ask);
+        let request = || ToolPermissionRequest {
+            tool_call_id: "call-9".to_string(),
+            tool_name: "python_repl".to_string(),
+            args: json!({ "code": "1" }),
+            origin: Some(json!({ "rlmChildId": "kid" })),
+        };
+        let asking = Arc::clone(&broker);
+        let call = tokio::spawn(async move { asking.decide(request(), None).await });
+        let id = requested_id(&events).await;
+        assert_eq!(events.lock().unwrap()[0]["origin"]["rlmChildId"], "kid");
+        assert!(broker.resolve(&id, ToolPermissionOutcome::AllowOnce));
+        assert_eq!(call.await.unwrap(), Some(ToolPermissionOutcome::AllowOnce));
+
+        broker.set_mode(ToolPermissionMode::Off);
+        assert!(!broker.asks());
+        assert_eq!(
+            broker.decide(request(), None).await,
+            Some(ToolPermissionOutcome::AllowOnce)
         );
     }
 }

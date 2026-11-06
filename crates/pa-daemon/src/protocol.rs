@@ -171,6 +171,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "get_session_messages",
     "set_tool_permission_mode",
     "respond_tool_permission",
+    "request_tool_permission",
 ];
 
 /// Parsed client command envelope.
@@ -745,6 +746,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::RespondToolPermission {
             active_session_id, ..
         }
+        | DaemonCommand::RequestToolPermission {
+            active_session_id, ..
+        }
         | DaemonCommand::GetModelCatalog {
             active_session_id, ..
         }
@@ -1017,6 +1021,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::ReplaceAcpMcpServers { .. } => "replace_acp_mcp_servers",
         DaemonCommand::SetToolPermissionMode { .. } => "set_tool_permission_mode",
         DaemonCommand::RespondToolPermission { .. } => "respond_tool_permission",
+        DaemonCommand::RequestToolPermission { .. } => "request_tool_permission",
         DaemonCommand::GetModelCatalog { .. } => "get_model_catalog",
         DaemonCommand::GetAvailableModels { .. } => "get_available_models",
         DaemonCommand::GetQueue { .. } => "get_queue",

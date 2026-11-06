@@ -55,6 +55,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "replace_acp_mcp_servers"
         | "set_tool_permission_mode"
         | "respond_tool_permission"
+        | "request_tool_permission"
         | "get_model_catalog"
         | "get_available_models"
         | "get_queue"

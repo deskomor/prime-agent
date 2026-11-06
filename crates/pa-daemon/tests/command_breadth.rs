@@ -544,6 +544,10 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         "respond_tool_permission",
         r#"{"type": "respond_tool_permission", "activeSessionId": "sess", "requestId": "r1", "outcome": "allow_once"}"#,
     ),
+    (
+        "request_tool_permission",
+        r#"{"type": "request_tool_permission", "activeSessionId": "sess", "toolCallId": "c1", "toolName": "python_repl", "args": {"code": "1"}, "origin": {"rlmChildId": "kid"}}"#,
+    ),
 ];
 
 /// The accept list is the TS list, in TS order, then the Rust-native supervisor/worker frames.
@@ -578,6 +582,7 @@ fn known_command_types_match_the_ts_list() {
                     | "get_session_messages"
                     | "set_tool_permission_mode"
                     | "respond_tool_permission"
+                    | "request_tool_permission"
             ),
             "unexpected non-TS command type: {extra}"
         );

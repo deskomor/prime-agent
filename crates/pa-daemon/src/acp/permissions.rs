@@ -8,7 +8,9 @@
 //! `tool_permission_request` session event becomes one
 //! `session/request_permission` request to the client, and the client's
 //! answer goes back as `respond_tool_permission`. An error answer, an
-//! unknown option id, or a `cancelled` outcome deny the call.
+//! unknown option id, or a `cancelled` outcome deny the call. Subagents
+//! spawned by the session ask through it: their requests carry an `origin`
+//! (the subagent's ids and name), shown in the title and `_meta`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,19 +112,30 @@ impl PermissionRelay {
             .iter()
             .map(|(kind, name)| json!({ "optionId": kind, "name": name, "kind": kind }))
             .collect();
+        let mut tool_call = json!({
+            "toolCallId": tool_call_id,
+            "title": tool_name,
+            "kind": AcpToolKind::of_tool(tool_name),
+            "status": "pending",
+            "rawInput": event.get("args").cloned().unwrap_or(Value::Null),
+        });
+        // A subagent's call names the subagent in the title and carries its
+        // identity under the prime-agent `_meta` namespace.
+        if let Some(origin) = event.get("origin").filter(|origin| origin.is_object()) {
+            let subagent = ["sessionName", "rlmChildId", "activeSessionId"]
+                .iter()
+                .find_map(|key| origin.get(*key).and_then(Value::as_str))
+                .unwrap_or("subagent");
+            tool_call["title"] = json!(format!("{tool_name} (subagent {subagent})"));
+            tool_call["_meta"] = json!({ PRIME_AGENT_META_NAMESPACE: { "origin": origin } });
+        }
         Some(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "session/request_permission",
             "params": {
                 "sessionId": acp_session_id,
-                "toolCall": {
-                    "toolCallId": tool_call_id,
-                    "title": tool_name,
-                    "kind": AcpToolKind::of_tool(tool_name),
-                    "status": "pending",
-                    "rawInput": event.get("args").cloned().unwrap_or(Value::Null),
-                },
+                "toolCall": tool_call,
                 "options": options,
             },
         }))
@@ -250,5 +263,31 @@ mod tests {
             let answer = relay.take_answer(&frame["id"], result.as_ref()).unwrap();
             assert_eq!(answer.outcome, "cancelled");
         }
+    }
+
+    #[test]
+    fn a_subagent_request_names_the_subagent() {
+        let relay = opted_in_relay();
+        let mut event = request_event();
+        event["origin"] =
+            json!({ "activeSessionId": "w-2", "rlmChildId": "c1", "sessionName": "kid" });
+        let frame = relay.request_frame(&event, "acp-1", "daemon-1").unwrap();
+        let tool_call = &frame["params"]["toolCall"];
+        assert_eq!(tool_call["title"], "bash (subagent kid)");
+        assert_eq!(
+            tool_call["_meta"]["ai.primeintellect.prime-agent"]["origin"]["rlmChildId"],
+            "c1"
+        );
+        let answer = relay
+            .take_answer(
+                &frame["id"],
+                Some(&json!({ "outcome": { "outcome": "selected", "optionId": "reject_once" } })),
+            )
+            .unwrap();
+        assert_eq!(
+            (answer.daemon_session_id.as_str(), answer.outcome.as_str()),
+            ("daemon-1", "reject_once"),
+            "the parent session decides the subagent's call"
+        );
     }
 }

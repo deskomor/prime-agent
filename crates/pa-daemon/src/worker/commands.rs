@@ -101,6 +101,7 @@ impl Worker {
             "replace_acp_mcp_servers" => self.handle_replace_acp_mcp_servers(payload),
             "set_tool_permission_mode" => self.handle_set_tool_permission_mode(payload),
             "respond_tool_permission" => self.handle_respond_tool_permission(payload),
+            "request_tool_permission" => self.handle_request_tool_permission(payload).await,
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
             "cycle_model" => self.handle_cycle_model(payload).await,
@@ -255,6 +256,45 @@ impl Worker {
                 None,
             )
         }
+    }
+
+    /// Decide one of an RLM child's tool calls like this session's own:
+    /// the gate's rules, then this session's clients or its own upstream.
+    /// The answer waits for the decision; `timed_out` when none arrived.
+    async fn handle_request_tool_permission(&self, payload: &Value) -> DaemonResponse {
+        let field = |key: &str| {
+            payload
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let tool_name = field("toolName");
+        if tool_name.is_empty() {
+            return response_failure(
+                None,
+                "request_tool_permission",
+                "A tool permission request needs a toolName",
+                None,
+            );
+        }
+        let request = crate::tool_permission::ToolPermissionRequest {
+            tool_call_id: field("toolCallId"),
+            tool_name,
+            args: payload.get("args").cloned().unwrap_or(Value::Null),
+            origin: payload
+                .get("origin")
+                .filter(|origin| !origin.is_null())
+                .cloned(),
+        };
+        let outcome = self.tool_permissions.decide(request, None).await;
+        response_success(
+            None,
+            "request_tool_permission",
+            Some(json!({
+                "outcome": outcome.map_or("timed_out", crate::tool_permission::ToolPermissionOutcome::as_str),
+            })),
+        )
     }
 
     /// The session's owner-fenced ACP MCP store: the ACP transport resolves and

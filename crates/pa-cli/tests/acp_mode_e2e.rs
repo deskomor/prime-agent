@@ -2782,3 +2782,77 @@ fn acp_opted_in_client_rejects_a_tool_call_before_it_runs() {
     );
     assert!(!marker.exists(), "the rejected command ran");
 }
+
+/// A subagent spawned by an opted-in session asks through it: the parent's
+/// own call comes first, then the subagent's call arrives on the parent's
+/// ACP session naming the subagent, and a reject keeps it from running.
+#[test]
+fn acp_opted_in_client_rejects_a_subagent_tool_call() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let scratch = tempfile::TempDir::new().unwrap();
+    let marker = scratch.path().join("child-ran");
+    let code = format!("open({:?}, 'w').close()", marker.display().to_string());
+    let parent = spawn_parent_script(spawn_cell());
+    let child_script = json!({ "engine": "faux", "responses": [
+        { "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": code } },
+        ] },
+        { "text": "kid done" },
+    ] });
+    let mut client = AcpChild::spawn_with_child_script(
+        &["--mode", "acp"],
+        &parent,
+        &child_script,
+        &kernel_python,
+    );
+    let mut params = initialize_params();
+    params["clientCapabilities"]["_meta"] =
+        json!({ "ai.primeintellect.prime-agent": { "toolPermissions": true } });
+    let init = client.request("initialize", &params);
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let own = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "session/request_permission"
+    });
+    assert!(
+        own["params"]["toolCall"].get("_meta").is_none(),
+        "the parent's own call has no origin: {own}"
+    );
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": own["id"],
+        "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } },
+    }));
+    let child = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "session/request_permission"
+    });
+    assert_eq!(child["params"]["sessionId"], session_id.as_str());
+    assert_eq!(
+        child["params"]["toolCall"]["title"],
+        "python_repl (subagent kid)"
+    );
+    assert_eq!(
+        child["params"]["toolCall"]["rawInput"],
+        json!({ "code": code })
+    );
+    assert!(
+        child["params"]["toolCall"]["_meta"]["ai.primeintellect.prime-agent"]["origin"]
+            ["rlmChildId"]
+            .is_string(),
+        "the subagent's identity rides the request: {child}"
+    );
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": child["id"],
+        "result": { "outcome": { "outcome": "selected", "optionId": "reject_once" } },
+    }));
+    let (response, _) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+    assert!(!marker.exists(), "the rejected subagent call ran");
+}

@@ -283,6 +283,9 @@ impl Supervisor {
             // respawned child keeps its provenance (its ledger
             // re-registers idempotently either way).
             "spawnedByRequestId",
+            // The child's tool calls ask this parent session (an ask-mode
+            // parent spawned it), and keep asking after a respawn.
+            "toolPermissionParent",
             "systemPrompt",
             "appendSystemPrompt",
             "skills",
