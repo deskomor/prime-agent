@@ -20,6 +20,7 @@ pub mod goal_boundary;
 pub mod goal_driver;
 pub mod harness_digest;
 pub mod headless;
+pub mod host_hooks;
 pub mod host_requests;
 pub mod image_model_routing;
 pub mod ipython_state;

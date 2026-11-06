@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::jsonrpc::{self, Incoming};
 use super::meta::{self, PrimeAgentEventPhase, PrimeAgentOutcome, PrimeAgentSessionMeta};
-use super::permissions::PermissionRelay;
+use super::permissions::{PermissionRelay, RelayAnswer};
 use super::producer::{self, UpdateProducer};
 use super::types;
 use super::wire_config::{
@@ -366,7 +366,7 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             if let Some(stop) = wire_events::assistant_stop(&event) {
                                 current.assistant_stop_reason = stop.stop_reason;
                             }
-                            if let Some(request) = permissions.request_frame(
+                            if let Some(request) = permissions.client_request(
                                 &event,
                                 &current.acp_session_id,
                                 &current.daemon_active_session_id,
@@ -486,23 +486,33 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                 continue;
             }
         };
-        // Client answers to `session/request_permission` go straight back
-        // to the worker; any other response is ignored.
-        if let Incoming::Response { id, result, .. } = &incoming {
+        // Client answers to `session/request_permission` and to host hooks
+        // go straight back to the worker; any other response is ignored.
+        if let Incoming::Response { id, result, error } = &incoming {
             let permissions = Arc::clone(&state.lock().await.permissions);
-            if let Some(answer) = permissions.take_answer(id, result.as_ref()) {
+            if let Some(answer) = permissions.take_answer(id, result.as_ref(), error.as_ref()) {
                 let link = Arc::clone(&link);
                 tokio::spawn(async move {
-                    // A lost answer leaves the worker gate to time out and deny.
-                    let _ = link
-                        .request_ok(DaemonCommand::RespondToolPermission {
+                    // A lost answer leaves the worker's hook point to time
+                    // out and settle by its kind's rule.
+                    let command = match answer {
+                        RelayAnswer::Permission(answer) => DaemonCommand::RespondToolPermission {
                             id: None,
                             active_session_id: answer.daemon_session_id,
                             request_id: answer.request_id,
                             outcome: answer.outcome,
                             rest: Map::new(),
-                        })
-                        .await;
+                        },
+                        RelayAnswer::Hook(answer) => DaemonCommand::RespondHostHook {
+                            id: None,
+                            active_session_id: answer.daemon_session_id,
+                            request_id: answer.request_id,
+                            result: answer.result,
+                            error: answer.error,
+                            rest: Map::new(),
+                        },
+                    };
+                    let _ = link.request_ok(command).await;
                 });
             }
             continue;
@@ -1253,17 +1263,30 @@ async fn handle_session_new(
     // An opted-in client gets every tool call gated before the session can
     // take a prompt; a failed switch fails the session instead of running
     // ungated.
+    // The hooks the client listed turn on the same way.
     let permissions = Arc::clone(&state.lock().await.permissions);
+    let hooks = permissions.hook_opt_in();
+    let mut setup = Vec::new();
     if permissions.opted_in() {
-        if let Err(error) = link
-            .request_ok(DaemonCommand::SetToolPermissionMode {
-                id: None,
-                active_session_id: binding.active_session_id.clone(),
-                mode: "ask".to_string(),
-                rest: Map::new(),
-            })
-            .await
-        {
+        setup.push(DaemonCommand::SetToolPermissionMode {
+            id: None,
+            active_session_id: binding.active_session_id.clone(),
+            mode: "ask".to_string(),
+            rest: Map::new(),
+        });
+    }
+    if !hooks.hooks.is_empty() {
+        setup.push(DaemonCommand::SetHostHooks {
+            id: None,
+            active_session_id: binding.active_session_id.clone(),
+            hooks: hooks.hooks,
+            host_call_types: hooks.host_call_types,
+            timeout_ms: hooks.timeout_ms,
+            rest: Map::new(),
+        });
+    }
+    for command in setup {
+        if let Err(error) = link.request_ok(command).await {
             let _ = clear_connection_servers(
                 link,
                 &binding.active_session_id,

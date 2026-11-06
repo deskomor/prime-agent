@@ -102,6 +102,8 @@ impl Worker {
             "set_tool_permission_mode" => self.handle_set_tool_permission_mode(payload),
             "respond_tool_permission" => self.handle_respond_tool_permission(payload),
             "request_tool_permission" => self.handle_request_tool_permission(payload).await,
+            "set_host_hooks" => self.handle_set_host_hooks(payload),
+            "respond_host_hook" => self.handle_respond_host_hook(payload),
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
             "cycle_model" => self.handle_cycle_model(payload).await,
@@ -295,6 +297,58 @@ impl Worker {
                 "outcome": outcome.map_or("timed_out", crate::tool_permission::ToolPermissionOutcome::as_str),
             })),
         )
+    }
+
+    /// Replace the session's enabled host hooks (`hooks`, optional
+    /// `hostCallTypes` and `timeoutMs`).
+    fn handle_set_host_hooks(&self, payload: &Value) -> DaemonResponse {
+        let strings = |key: &str| {
+            payload.get(key).and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let hooks = strings("hooks").unwrap_or_default();
+        let timeout = payload
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis);
+        match self
+            .host_hooks
+            .set_hooks(&hooks, strings("hostCallTypes"), timeout)
+        {
+            Ok(()) => response_success(None, "set_host_hooks", None),
+            Err(message) => response_failure(None, "set_host_hooks", &message, None),
+        }
+    }
+
+    /// Answer one `host_hook_request` with its `result`, or an `error`
+    /// (the hook then settles by its kind's rule).
+    fn handle_respond_host_hook(&self, payload: &Value) -> DaemonResponse {
+        let request_id = payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let answer = match payload.get("error").filter(|error| !error.is_null()) {
+            Some(error) => Err(error
+                .as_str()
+                .map_or_else(|| error.to_string(), str::to_string)),
+            None => Ok(payload.get("result").cloned().unwrap_or(Value::Null)),
+        };
+        if self.host_hooks.resolve(request_id, answer) {
+            response_success(None, "respond_host_hook", None)
+        } else {
+            response_failure(
+                None,
+                "respond_host_hook",
+                "No host hook is waiting with that id",
+                None,
+            )
+        }
     }
 
     /// The session's owner-fenced ACP MCP store: the ACP transport resolves and

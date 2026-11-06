@@ -29,7 +29,7 @@ async fn scripted_engine(
     let cwd = tmp.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
     let engine = create_session(SessionEngineConfig {
-        tool_permission_gate: None,
+        host_hooks: crate::session_engine::host_hooks::SessionHostHooks::default(),
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,

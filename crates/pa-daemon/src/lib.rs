@@ -51,6 +51,7 @@ mod goal_continuation;
 pub(crate) mod goal_state_persist;
 pub(crate) mod herdr;
 pub mod hold_refusal;
+pub(crate) mod host_hooks;
 pub(crate) mod image_route;
 pub mod input_pause_lease;
 pub mod journal;

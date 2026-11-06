@@ -323,6 +323,35 @@ impl HostRequestHandlers {
         self.handlers = Arc::new(map);
     }
 
+    /// Every handler wrapped so `gate` decides each request first: a refusal
+    /// (or a failing gate) answers the caller with the gate's error and the
+    /// handler never runs.
+    #[must_use]
+    pub fn gated(&self, gate: &crate::session_engine::host_hooks::HostCallGateFn) -> Self {
+        let handlers = self
+            .handlers
+            .iter()
+            .map(|(request_type, handler)| {
+                let gate = Arc::clone(gate);
+                let handler = Arc::clone(handler);
+                let gated_type = request_type.clone();
+                let gated: HostHandlerFn = Arc::new(move |payload: HostRequestPayload| {
+                    let gate = Arc::clone(&gate);
+                    let handler = Arc::clone(&handler);
+                    let request_type = gated_type.clone();
+                    Box::pin(async move {
+                        gate(request_type, payload.data.clone()).await?;
+                        handler(payload).await
+                    }) as HostHandlerFuture
+                });
+                (request_type.clone(), gated)
+            })
+            .collect();
+        Self {
+            handlers: Arc::new(handlers),
+        }
+    }
+
     #[must_use]
     pub fn get(&self, request_type: &str) -> Option<&HostHandlerFn> {
         self.handlers.get(request_type)

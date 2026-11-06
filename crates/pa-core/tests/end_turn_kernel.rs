@@ -170,7 +170,7 @@ async fn an_end_turn_cell_ends_the_turn_without_another_assistant_response() {
     provider.push_text_turn("never reached");
 
     let engine = create_session(SessionEngineConfig {
-        tool_permission_gate: None,
+        host_hooks: pa_core::session_engine::host_hooks::SessionHostHooks::default(),
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,

@@ -812,7 +812,7 @@ pub(crate) async fn build_headless_engine_with(
     };
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
-            tool_permission_gate: None,
+            host_hooks: pa_core::session_engine::host_hooks::SessionHostHooks::default(),
             on_late_sent_agent_message,
             cron_store: None,
             semantic_edges,

@@ -109,11 +109,9 @@ pub struct SessionEngineConfig {
     /// request ids on the wire).
     pub semantic_edges: Option<super::semantic_edges::SemanticEdgeIdentity>,
     pub on_late_sent_agent_message: Option<crate::tools::ipython::LateSentAgentMessageHandler>,
-    /// The host's tool-permission gate: awaited after a tool call's
-    /// arguments validate and before it runs; a `block` answer turns the
-    /// call into an error tool result carrying the reason. `None` runs
-    /// every call ungated (the TS behavior).
-    pub tool_permission_gate: Option<pa_agent::agent_loop::BeforeToolCallFn>,
+    /// The host's hooks (tool-permission gate, tool-result override, kernel
+    /// host-call gate). The default installs none: the TS behavior.
+    pub host_hooks: super::host_hooks::SessionHostHooks,
 }
 
 pub struct SessionEngine {
@@ -503,6 +501,12 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // unbounded by design (#3523), so their cells are never interrupted.
     let cell_timeout_ms =
         super::runtime_wiring::arm_cell_timeout_ms(config.daemonless, python_cell_timeout_ms);
+    // The host's gate wraps the final registry: every handler, however it
+    // registered, waits for the host's decision first.
+    let handlers = match config.host_hooks.host_call_gate.clone() {
+        Some(gate) => handlers.gated(&gate),
+        None => handlers,
+    };
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id.clone(),
         handlers,
@@ -752,7 +756,8 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         should_stop_before_turn: config.queued_steering_probe.clone(),
         steering_mode: config.steering_mode,
         follow_up_mode: config.follow_up_mode,
-        before_tool_call: config.tool_permission_gate.take(),
+        before_tool_call: config.host_hooks.before_tool_call.take(),
+        after_tool_call: config.host_hooks.after_tool_call.take(),
         ..Default::default()
     });
 

@@ -158,7 +158,7 @@ async fn a_cell_past_its_timeout_is_interrupted_and_the_turn_continues() {
     provider.push_text_turn("done");
 
     let engine = create_session(SessionEngineConfig {
-        tool_permission_gate: None,
+        host_hooks: pa_core::session_engine::host_hooks::SessionHostHooks::default(),
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,

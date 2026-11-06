@@ -2856,3 +2856,130 @@ fn acp_opted_in_client_rejects_a_subagent_tool_call() {
     assert_end_turn(&response);
     assert!(!marker.exists(), "the rejected subagent call ran");
 }
+
+/// `initialize` params whose prime-agent `_meta` lists the given host hooks.
+fn hook_initialize_params(meta: &Value) -> Value {
+    let mut params = initialize_params();
+    params["clientCapabilities"]["_meta"] = json!({ "ai.primeintellect.prime-agent": meta });
+    params
+}
+
+/// The `after_tool_call` host hook reaches the client with the executed
+/// result, and the client's replacement is what the session records and
+/// streams.
+#[test]
+fn acp_after_tool_call_hook_rewrites_the_tool_result() {
+    let script = json!({ "engine": "faux", "responses": [
+        { "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": "print('original output')" } },
+        ] },
+        { "text": "done" },
+    ] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({ "hooks": ["after_tool_call"] })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "run it" }] }),
+    );
+    let hook = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+    });
+    assert_eq!(hook["params"]["sessionId"], session_id.as_str());
+    assert_eq!(hook["params"]["hook"], "after_tool_call");
+    assert_eq!(hook["params"]["payload"]["toolName"], "python_repl");
+    assert!(
+        hook["params"]["payload"]["result"]
+            .to_string()
+            .contains("original output"),
+        "the hook sees the executed result: {hook}"
+    );
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": hook["id"],
+        "result": { "content": [{ "type": "text", "text": "rewritten by the host" }] },
+    }));
+    let (response, updates) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+    let streamed = updates
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        streamed.contains("rewritten by the host"),
+        "the replacement is the streamed result: {streamed}"
+    );
+    assert!(
+        !streamed.contains("original output"),
+        "the executed result was replaced: {streamed}"
+    );
+}
+
+/// The `host_call` hook gates kernel host calls before their handler runs:
+/// a refusal reaches the Python caller as the host's reason, and a host
+/// error refuses too (enforcement fails closed).
+#[test]
+fn acp_host_call_hook_refuses_a_kernel_host_call() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let marker = scratch.path().join("refusals");
+    let code = format!(
+        "import json\nerrors = []\nfor _ in range(2):\n    try:\n        await rlm.spawn('do the work', name='kid')\n        errors.append('ran')\n    except Exception as error:\n        errors.append(str(error))\nopen({:?}, 'w').write(json.dumps(errors))",
+        marker.display().to_string()
+    );
+    let script = json!({ "engine": "faux", "responses": [
+        { "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": code } },
+        ] },
+        { "text": "done" },
+    ] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({ "hooks": ["host_call"], "hostCallTypes": ["rlm.*"] })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn" }] }),
+    );
+    let first = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+    });
+    assert_eq!(first["params"]["hook"], "host_call");
+    // `rlm.spawn` reaches the host as its wire type, `rlm.run`.
+    assert_eq!(first["params"]["payload"]["type"], "rlm.run");
+    assert_eq!(first["params"]["payload"]["data"]["prompt"], "do the work");
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": first["id"],
+        "result": { "allow": false, "reason": "Leads delegate through their workers." },
+    }));
+    let second = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+    });
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": second["id"],
+        "error": { "code": -32603, "message": "guard data unreadable" },
+    }));
+    let (response, _) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+    let errors: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&marker).expect("the cell finished"))
+            .unwrap();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors[0].contains("Leads delegate through their workers."),
+        "the refusal reaches Python: {errors:?}"
+    );
+    assert!(
+        errors[1].contains("guard data unreadable") && errors[1].contains("refused"),
+        "a host error refuses: {errors:?}"
+    );
+}

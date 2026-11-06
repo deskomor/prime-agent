@@ -197,7 +197,7 @@ impl AgentSessionEngine {
             compaction_summary_sink: std::sync::Mutex::new(None),
             progress_notes: std::sync::Mutex::new(None),
             progress_note_emit: std::sync::Mutex::new(None),
-            tool_permission_gate: std::sync::Mutex::new(None),
+            host_hooks: std::sync::Mutex::default(),
             model_refusal_telemetry,
             semantic_identity: std::sync::Mutex::new(None),
         })
@@ -307,16 +307,16 @@ impl AgentSessionEngine {
             .expect("progress note emit lock") = Some(emit);
     }
 
-    /// Install the host's tool-permission gate for every later session build.
+    /// Install the host's hooks for every later session build.
     ///
     /// # Panics
     ///
     /// Panics when the gate slot's mutex is poisoned.
-    pub(crate) fn set_tool_permission_gate(&self, gate: pa_agent::agent_loop::BeforeToolCallFn) {
-        *self
-            .tool_permission_gate
-            .lock()
-            .expect("tool permission gate lock") = Some(gate);
+    pub(crate) fn set_host_hooks(
+        &self,
+        hooks: pa_core::session_engine::host_hooks::SessionHostHooks,
+    ) {
+        *self.host_hooks.lock().expect("host hooks lock") = hooks;
     }
 
     /// The stale-row guard's deferred durable write: the terminal row
@@ -1164,13 +1164,9 @@ impl AgentSessionEngine {
             .lock()
             .expect("late agent message sink lock")
             .clone();
-        let tool_permission_gate = self
-            .tool_permission_gate
-            .lock()
-            .expect("tool permission gate lock")
-            .clone();
+        let host_hooks = self.host_hooks.lock().expect("host hooks lock").clone();
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
-            tool_permission_gate,
+            host_hooks,
             on_late_sent_agent_message,
             semantic_edges,
             telemetry,

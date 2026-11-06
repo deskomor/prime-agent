@@ -175,7 +175,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
     provider.push_text_turn("boundary reached");
 
     let engine = create_session(SessionEngineConfig {
-        tool_permission_gate: None,
+        host_hooks: pa_core::session_engine::host_hooks::SessionHostHooks::default(),
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,

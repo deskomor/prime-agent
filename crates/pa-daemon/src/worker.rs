@@ -157,6 +157,8 @@ pub struct Worker {
     /// The host tool-permission broker (`set_tool_permission_mode`,
     /// `respond_tool_permission`).
     pub(crate) tool_permissions: Arc<crate::tool_permission::ToolPermissionBroker>,
+    /// The awaited host hooks (`set_host_hooks`, `respond_host_hook`).
+    pub(crate) host_hooks: Arc<crate::host_hooks::HostHookBroker>,
     /// Single-use peer-transport grants (worker memory only).
     pub(crate) peer_grants: PeerGrantStore,
     pub(crate) compaction: crate::compaction::CompactionManager,
@@ -726,8 +728,17 @@ impl Worker {
             }),
             crate::tool_permission::TOOL_PERMISSION_TIMEOUT,
         );
+        let hook_core = Arc::clone(&core);
+        let hook_events = events.clone();
+        let host_hooks = crate::host_hooks::HostHookBroker::new(Arc::new(move |event| {
+            emit_worker_event_with(&hook_core, &hook_events, event);
+        }));
         if let Some(concrete) = agent_engine.as_ref() {
-            concrete.set_tool_permission_gate(tool_permissions.gate());
+            concrete.set_host_hooks(pa_core::session_engine::host_hooks::SessionHostHooks {
+                before_tool_call: Some(tool_permissions.gate()),
+                after_tool_call: Some(host_hooks.after_tool_call()),
+                host_call_gate: Some(host_hooks.host_call_gate()),
+            });
             if let Some(children) = concrete.children.as_ref() {
                 let probe = Arc::clone(&tool_permissions);
                 children.set_tool_permission_probe(Arc::new(move || probe.asks()));
@@ -794,6 +805,7 @@ impl Worker {
             recovery,
             side_questions,
             tool_permissions,
+            host_hooks,
             peer_grants: PeerGrantStore::new(),
             compaction,
             tree_navigation,

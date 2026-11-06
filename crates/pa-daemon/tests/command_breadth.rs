@@ -548,6 +548,14 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         "request_tool_permission",
         r#"{"type": "request_tool_permission", "activeSessionId": "sess", "toolCallId": "c1", "toolName": "python_repl", "args": {"code": "1"}, "origin": {"rlmChildId": "kid"}}"#,
     ),
+    (
+        "set_host_hooks",
+        r#"{"type": "set_host_hooks", "activeSessionId": "sess", "hooks": ["host_call"], "hostCallTypes": ["rlm.*"], "timeoutMs": 5000}"#,
+    ),
+    (
+        "respond_host_hook",
+        r#"{"type": "respond_host_hook", "activeSessionId": "sess", "requestId": "h1", "result": {"allow": true}}"#,
+    ),
 ];
 
 /// The accept list is the TS list, in TS order, then the Rust-native supervisor/worker frames.
@@ -583,6 +591,8 @@ fn known_command_types_match_the_ts_list() {
                     | "set_tool_permission_mode"
                     | "respond_tool_permission"
                     | "request_tool_permission"
+                    | "set_host_hooks"
+                    | "respond_host_hook"
             ),
             "unexpected non-TS command type: {extra}"
         );

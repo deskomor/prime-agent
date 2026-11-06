@@ -777,6 +777,35 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Replace the session's enabled host hooks (`after_tool_call`,
+    /// `host_call`); an empty list turns them all off.
+    SetHostHooks {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default)]
+        hooks: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_call_types: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Answer one `host_hook_request` session event with its `result` or an
+    /// `error`.
+    RespondHostHook {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     /// An RLM child asks its parent session to decide one of its tool calls
     /// (`origin` names the child); the answer's `outcome` is a permission
     /// option kind, `cancelled`, or `timed_out`.
