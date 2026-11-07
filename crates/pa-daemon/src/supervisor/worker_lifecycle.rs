@@ -286,6 +286,8 @@ impl Supervisor {
             // The child's tool calls ask this parent session (an ask-mode
             // parent spawned it), and keep asking after a respawn.
             "toolPermissionParent",
+            // The child's host hooks run through this parent session.
+            "hostHooksParent",
             "systemPrompt",
             "appendSystemPrompt",
             "skills",

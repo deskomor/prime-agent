@@ -176,6 +176,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "respond_host_hook",
     "append_session_entry",
     "set_auto_refine",
+    "request_host_hook",
 ];
 
 /// Parsed client command envelope.
@@ -759,6 +760,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::RespondHostHook {
             active_session_id, ..
         }
+        | DaemonCommand::RequestHostHook {
+            active_session_id, ..
+        }
         | DaemonCommand::AppendSessionEntry {
             active_session_id, ..
         }
@@ -1042,6 +1046,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::RespondHostHook { .. } => "respond_host_hook",
         DaemonCommand::AppendSessionEntry { .. } => "append_session_entry",
         DaemonCommand::SetAutoRefine { .. } => "set_auto_refine",
+        DaemonCommand::RequestHostHook { .. } => "request_host_hook",
         DaemonCommand::GetModelCatalog { .. } => "get_model_catalog",
         DaemonCommand::GetAvailableModels { .. } => "get_available_models",
         DaemonCommand::GetQueue { .. } => "get_queue",

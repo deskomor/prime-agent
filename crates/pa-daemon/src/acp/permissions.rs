@@ -207,15 +207,20 @@ impl PermissionRelay {
             return None;
         }
         let id = self.next_request_id(RequestKind::Hook, daemon_session_id, request_id);
+        let mut params = json!({
+            "sessionId": acp_session_id,
+            "hook": hook,
+            "payload": event.get("payload").cloned().unwrap_or(Value::Null),
+        });
+        // A subagent's hook names the subagent it started in.
+        if let Some(origin) = event.get("origin").filter(|origin| !origin.is_null()) {
+            params["origin"] = origin.clone();
+        }
         Some(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": HOST_HOOK_METHOD,
-            "params": {
-                "sessionId": acp_session_id,
-                "hook": hook,
-                "payload": event.get("payload").cloned().unwrap_or(Value::Null),
-            },
+            "params": params,
         }))
     }
 

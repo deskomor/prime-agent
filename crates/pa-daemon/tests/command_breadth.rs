@@ -564,6 +564,10 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         "set_auto_refine",
         r#"{"type": "set_auto_refine", "activeSessionId": "sess", "enabled": false}"#,
     ),
+    (
+        "request_host_hook",
+        r#"{"type": "request_host_hook", "activeSessionId": "sess", "hook": "host_call", "payload": {"type": "rlm.run"}, "origin": {"rlmChildId": "kid"}}"#,
+    ),
 ];
 
 /// The accept list is the TS list, in TS order, then the Rust-native supervisor/worker frames.
@@ -603,6 +607,7 @@ fn known_command_types_match_the_ts_list() {
                     | "respond_host_hook"
                     | "append_session_entry"
                     | "set_auto_refine"
+                    | "request_host_hook"
             ),
             "unexpected non-TS command type: {extra}"
         );

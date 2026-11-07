@@ -16,6 +16,14 @@
 //!
 //! With no hooks enabled (the default) every hook point answers at once and
 //! the session behaves exactly as without a host.
+//!
+//! An RLM child of a hooked session runs the same hooks: its create config
+//! carries `hostHooksParent` (the parent session and its hook set), and its
+//! broker forwards each hook to the parent worker as `request_host_hook`,
+//! stamped with the child's `origin`. The parent asks its own client (or its
+//! own parent) and answers; a hook the parent has since turned off answers
+//! `off`, and the child runs as if the hook were absent. No answer settles
+//! by the hook's kind, so a child can never do what its parent may not.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -67,7 +75,20 @@ pub(crate) const HOST_HOOK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) type HostHookEmit = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// A client's answer: the hook's result, or why there is none.
-type HookAnswer = Result<Value, String>;
+pub(crate) type HookAnswer = Result<Value, String>;
+
+/// Sends one hook (`hook`, `payload`, `origin`) to the parent session and
+/// resolves to its answer; `None` when the parent has the hook off.
+pub(crate) type HostHookUpstream = Arc<
+    dyn Fn(
+            String,
+            Value,
+            Option<Value>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<HookAnswer>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// The hooks one session has on.
 #[derive(Clone)]
@@ -93,6 +114,8 @@ impl Default for HookConfig {
 struct BrokerState {
     config: HookConfig,
     pending: HashMap<String, oneshot::Sender<HookAnswer>>,
+    /// Set on an RLM child: its hooks go to the parent session.
+    upstream: Option<HostHookUpstream>,
 }
 
 /// The session's hook broker: the engine's hook points await it, the worker
@@ -162,6 +185,35 @@ impl HostHookBroker {
         Ok(())
     }
 
+    /// The hook set an RLM child inherits (`{hooks, hostCallTypes,
+    /// timeoutMs}`), or `None` when no hook is on.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the broker lock is poisoned.
+    pub(crate) fn inherited_config(&self) -> Option<Value> {
+        let state = self.state.lock().expect("host hook lock");
+        if state.config.enabled.is_empty() {
+            return None;
+        }
+        let mut hooks: Vec<&String> = state.config.enabled.iter().collect();
+        hooks.sort();
+        Some(json!({
+            "hooks": hooks,
+            "hostCallTypes": state.config.host_call_types,
+            "timeoutMs": u64::try_from(state.config.timeout.as_millis()).unwrap_or(u64::MAX),
+        }))
+    }
+
+    /// Run this session's hooks through its parent session (an RLM child).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the broker lock is poisoned.
+    pub(crate) fn set_upstream(&self, upstream: HostHookUpstream) {
+        self.state.lock().expect("host hook lock").upstream = Some(upstream);
+    }
+
     /// Answer one waiting hook; `false` when no hook waits with that id.
     ///
     /// # Panics
@@ -189,22 +241,56 @@ impl HostHookBroker {
         payload: Value,
         signal: Option<AbortSignal>,
     ) -> Option<HookAnswer> {
-        let (request_id, receiver, timeout) = {
+        self.call_from(hook, payload, signal, None).await
+    }
+
+    /// [`Self::call`] for a hook that started in `origin` (an RLM child's
+    /// identity; `None` for this session's own hook points). An RLM child
+    /// forwards it to its parent session instead of its own clients.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the broker lock is poisoned.
+    pub(crate) async fn call_from(
+        &self,
+        hook: &str,
+        payload: Value,
+        signal: Option<AbortSignal>,
+        origin: Option<Value>,
+    ) -> Option<HookAnswer> {
+        let route = {
             let mut state = self.state.lock().expect("host hook lock");
             if !state.config.enabled.contains(hook) {
                 return None;
             }
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let (sender, receiver) = oneshot::channel();
-            state.pending.insert(request_id.clone(), sender);
-            (request_id, receiver, state.config.timeout)
+            if let Some(upstream) = state.upstream.clone() {
+                Err(upstream)
+            } else {
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let (sender, receiver) = oneshot::channel();
+                state.pending.insert(request_id.clone(), sender);
+                Ok((request_id, receiver, state.config.timeout))
+            }
         };
-        (self.emit)(json!({
+        let (request_id, receiver, timeout) = match route {
+            Ok(local) => local,
+            Err(upstream) => {
+                return tokio::select! {
+                    answer = upstream(hook.to_string(), payload, origin) => answer,
+                    () = aborted(signal) => Some(Err("the turn was aborted".to_string())),
+                };
+            }
+        };
+        let mut request = json!({
             "type": "host_hook_request",
             "requestId": request_id,
             "hook": hook,
             "payload": payload,
-        }));
+        });
+        if let Some(origin) = origin {
+            request["origin"] = origin;
+        }
+        (self.emit)(request);
         let answer = tokio::select! {
             answer = receiver => answer.unwrap_or_else(|_| Err("the worker dropped the hook".to_string())),
             () = tokio::time::sleep(timeout) => Err(format!("no answer within {} ms", timeout.as_millis())),
@@ -534,5 +620,69 @@ mod tests {
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         broker.set_auto_refine_paused(true);
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn a_child_runs_its_hooks_through_the_parent() {
+        let (broker, events) = recording_broker();
+        broker
+            .set_hooks(
+                &[HOST_CALL.to_string(), TURN_END.to_string()],
+                Some(vec!["rlm.*".to_string()]),
+                None,
+            )
+            .unwrap();
+        let inherited = broker.inherited_config().unwrap();
+        assert_eq!(inherited["hooks"], json!([HOST_CALL, TURN_END]));
+        assert_eq!(inherited["hostCallTypes"], json!(["rlm.*"]));
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let answers = Arc::clone(&asked);
+        broker.set_upstream(Arc::new(move |hook, _payload, _origin| {
+            answers.lock().unwrap().push(hook.clone());
+            Box::pin(async move {
+                match hook.as_str() {
+                    HOST_CALL => Some(Err("parent unreachable".to_string())),
+                    // The parent turned the hook off.
+                    _ => None,
+                }
+            })
+        }));
+        // The enforcement gate refuses without a parent answer.
+        assert!(broker.host_call_gate()("rlm.spawn".to_string(), json!({}))
+            .await
+            .is_err());
+        // An optional hook the parent has off is no answer.
+        assert!(broker.optional(TURN_END, json!({})).await.is_none());
+        // Off in the child too: the parent is never asked.
+        assert!(broker.optional(CONTEXT, json!({})).await.is_none());
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "the child's own clients are not asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_hook_names_its_origin() {
+        let (broker, events) = recording_broker();
+        broker
+            .set_hooks(&[TURN_END.to_string()], None, None)
+            .unwrap();
+        let call = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move {
+                broker
+                    .call_from(
+                        TURN_END,
+                        json!({}),
+                        None,
+                        Some(json!({ "rlmChildId": "kid" })),
+                    )
+                    .await
+            }
+        });
+        let (id, event) = requested_id(&events).await;
+        assert_eq!(event["origin"]["rlmChildId"], "kid");
+        broker.resolve(&id, Ok(json!({ "messages": [] })));
+        assert_eq!(call.await.unwrap(), Some(Ok(json!({ "messages": [] }))));
     }
 }

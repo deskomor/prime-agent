@@ -57,6 +57,57 @@ impl Worker {
         })
     }
 
+    /// The upstream that sends this child's host hooks to its parent session
+    /// as `request_host_hook`, stamped with the child's identity. A failed
+    /// or unreadable answer is an error, which each hook settles by its kind
+    /// (the enforcement gate refuses).
+    fn host_hook_upstream(
+        &self,
+        parent_active_session_id: &str,
+        rlm_child_id: Option<&str>,
+        name: Option<&str>,
+        hook_timeout: std::time::Duration,
+    ) -> crate::host_hooks::HostHookUpstream {
+        let link = Arc::new(crate::supervisor_link::SupervisorLink::new(
+            self.config.supervisor_socket_path.clone(),
+        ));
+        let parent = parent_active_session_id.to_string();
+        let own_origin = json!({
+            "activeSessionId": self.config.active_session_id,
+            "rlmChildId": rlm_child_id,
+            "sessionName": name,
+        });
+        Arc::new(move |hook, payload, origin| {
+            let link = Arc::clone(&link);
+            let command = json!({
+                "type": "request_host_hook",
+                "activeSessionId": parent,
+                "hook": hook,
+                "payload": payload,
+                // A grandchild's hook keeps the origin it started with.
+                "origin": origin.unwrap_or_else(|| own_origin.clone()),
+            });
+            Box::pin(async move {
+                let answer = match link
+                    .request_success(command, hook_timeout + std::time::Duration::from_secs(60))
+                    .await
+                {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        return Some(Err(format!("the parent session did not answer ({error})")))
+                    }
+                };
+                if answer.get("off").and_then(Value::as_bool) == Some(true) {
+                    return None;
+                }
+                Some(match answer.get("error").and_then(Value::as_str) {
+                    Some(error) => Err(error.to_string()),
+                    None => Ok(answer.get("result").cloned().unwrap_or(Value::Null)),
+                })
+            })
+        })
+    }
+
     pub(super) async fn handle_create(&self, payload: &Value) -> DaemonResponse {
         // One create in flight at a time: a concurrent create joins this open and
         // answers with the created summary instead of racing a second init.
@@ -241,6 +292,56 @@ impl Worker {
         if let Some(parent) = payload.get("toolPermissionParent").and_then(Value::as_str) {
             self.tool_permissions
                 .set_upstream(self.tool_permission_upstream(parent, rlm_child_id.as_deref(), name));
+        }
+        // A child of a hooked session runs its parent's hooks through it (the
+        // durable create replays the key on a respawn).
+        if let Some(inherited) = payload.get("hostHooksParent") {
+            let parent = inherited
+                .get("activeSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let hooks: Vec<String> = inherited
+                .get("hooks")
+                .and_then(Value::as_array)
+                .map(|hooks| {
+                    hooks
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let host_call_types = inherited.get("hostCallTypes").and_then(|types| {
+                serde_json::from_value::<Option<Vec<String>>>(types.clone())
+                    .ok()
+                    .flatten()
+            });
+            let timeout = std::time::Duration::from_millis(
+                inherited
+                    .get("timeoutMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30_000),
+            );
+            if parent.is_empty()
+                || self
+                    .host_hooks
+                    .set_hooks(&hooks, host_call_types, Some(timeout))
+                    .is_err()
+            {
+                // An unreadable inheritance must not leave the child unguarded.
+                return response_failure(
+                    None,
+                    "create",
+                    "The parent session's host hooks could not be inherited",
+                    None,
+                );
+            }
+            self.host_hooks.set_upstream(self.host_hook_upstream(
+                parent,
+                rlm_child_id.as_deref(),
+                name,
+                timeout,
+            ));
         }
 
         // Set by the fresh-path arm when the name landed in its single rewrite:

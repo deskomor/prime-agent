@@ -54,6 +54,8 @@ pub(crate) fn client_route_timeout(command: &DaemonCommand) -> u64 {
             | DaemonCommand::NavigateTree { .. }
             // A child's permission request waits for the user's answer.
             | DaemonCommand::RequestToolPermission { .. }
+            // A child's host hook waits for the parent's client.
+            | DaemonCommand::RequestHostHook { .. }
     ) {
         WORKER_REQUEST_TIMEOUT_MS
     } else {

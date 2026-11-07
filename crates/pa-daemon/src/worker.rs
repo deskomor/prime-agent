@@ -752,6 +752,8 @@ impl Worker {
             if let Some(children) = concrete.children.as_ref() {
                 let probe = Arc::clone(&tool_permissions);
                 children.set_tool_permission_probe(Arc::new(move || probe.asks()));
+                let hooks = Arc::clone(&host_hooks);
+                children.set_host_hook_probe(Arc::new(move || hooks.inherited_config()));
             }
         }
         let side_questions = crate::side_question::SideQuestionManager::new(

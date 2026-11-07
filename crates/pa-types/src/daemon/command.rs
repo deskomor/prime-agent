@@ -845,6 +845,21 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// An RLM child runs one of its inherited host hooks through its parent
+    /// session (`origin` names the child); the answer is `{result}`,
+    /// `{error}`, or `{off: true}`.
+    RequestHostHook {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        hook: String,
+        #[serde(default)]
+        payload: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Value>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     GetModelCatalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

@@ -364,6 +364,10 @@ pub(crate) type ChildUpdateSink = std::sync::Arc<dyn Fn(Value) + Send + Sync>;
 /// Reads whether the parent session's tool calls wait for a host decision.
 pub(crate) type ToolPermissionProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Reads the host hooks the parent session has on (`{hooks, hostCallTypes,
+/// timeoutMs}`), or `None` when it has none.
+pub(crate) type HostHookProbe = std::sync::Arc<dyn Fn() -> Option<Value> + Send + Sync>;
+
 #[derive(Debug, Clone, Copy)]
 enum RetirementIntent {
     Delete { was_running: bool },
@@ -427,6 +431,9 @@ struct SupervisorChildSessionsInner {
     /// Whether this session's tool calls wait for a host decision: a child
     /// created while it does asks this session for its own calls.
     tool_permission_probe: std::sync::Mutex<Option<ToolPermissionProbe>>,
+    /// The host hooks this session has on: a child created while it has
+    /// any runs the same hooks through this session.
+    host_hook_probe: std::sync::Mutex<Option<HostHookProbe>>,
     /// The model-allowlist refusal telemetry: `spawn`/`create_session`
     /// refusals emit through the engine's shared lazily-built client.
     model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
@@ -485,6 +492,7 @@ impl SupervisorChildSessions {
                 running: tokio::sync::watch::Sender::new(false),
                 settle_notify: tokio::sync::Notify::new(),
                 tool_permission_probe: std::sync::Mutex::new(None),
+                host_hook_probe: std::sync::Mutex::new(None),
                 model_refusal_telemetry,
                 usage_sink: std::sync::Mutex::new(None),
                 delete_notifier: std::sync::Mutex::new(None),
@@ -513,6 +521,16 @@ impl SupervisorChildSessions {
         *self
             .inner
             .tool_permission_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
+    }
+
+    /// Wire the parent's host-hook state (children created while it has
+    /// hooks on inherit them, with this session answering).
+    pub(crate) fn set_host_hook_probe(&self, probe: HostHookProbe) {
+        *self
+            .inner
+            .host_hook_probe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }

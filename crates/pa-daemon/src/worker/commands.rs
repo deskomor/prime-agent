@@ -104,6 +104,7 @@ impl Worker {
             "request_tool_permission" => self.handle_request_tool_permission(payload).await,
             "set_host_hooks" => self.handle_set_host_hooks(payload),
             "respond_host_hook" => self.handle_respond_host_hook(payload),
+            "request_host_hook" => self.handle_request_host_hook(payload).await,
             "append_session_entry" => self.handle_append_session_entry(payload),
             "set_auto_refine" => self.handle_set_auto_refine(payload),
             "set_model" => self.handle_set_model(payload).await,
@@ -299,6 +300,40 @@ impl Worker {
                 "outcome": outcome.map_or("timed_out", crate::tool_permission::ToolPermissionOutcome::as_str),
             })),
         )
+    }
+
+    /// Run one of an RLM child's host hooks like this session's own: this
+    /// session's clients answer it (or its own parent does). The answer is
+    /// `{result}`, `{error}`, or `{off: true}` when this session no longer
+    /// has the hook on.
+    async fn handle_request_host_hook(&self, payload: &Value) -> DaemonResponse {
+        let Some(hook) = payload.get("hook").and_then(Value::as_str) else {
+            return response_failure(
+                None,
+                "request_host_hook",
+                "A host hook request needs a hook",
+                None,
+            );
+        };
+        let origin = payload
+            .get("origin")
+            .filter(|origin| !origin.is_null())
+            .cloned();
+        let answer = self
+            .host_hooks
+            .call_from(
+                hook,
+                payload.get("payload").cloned().unwrap_or(Value::Null),
+                None,
+                origin,
+            )
+            .await;
+        let data = match answer {
+            None => json!({ "off": true }),
+            Some(Ok(result)) => json!({ "result": result }),
+            Some(Err(error)) => json!({ "error": error }),
+        };
+        response_success(None, "request_host_hook", Some(data))
     }
 
     /// Replace the session's enabled host hooks (`hooks`, optional

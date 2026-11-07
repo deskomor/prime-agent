@@ -115,6 +115,17 @@ impl SupervisorChildSessionsInner {
         if parent_asks {
             config["toolPermissionParent"] = json!(self.parent_active_session_id);
         }
+        // A hooked parent's child runs the same hooks through it.
+        let inherited_hooks = self
+            .host_hook_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|probe| probe());
+        if let Some(mut inherited) = inherited_hooks {
+            inherited["activeSessionId"] = json!(self.parent_active_session_id);
+            config["hostHooksParent"] = inherited;
+        }
         if let Some(script) = &identity.child_script {
             config["script"] = json!(script);
             // The scripted engine rides the identity down the recursion (TS

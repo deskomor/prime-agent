@@ -3046,3 +3046,82 @@ fn acp_optional_hooks_and_session_extensions() {
     let (refused, _) = client.wait_response(unknown, TIMEOUT);
     assert_eq!(refused["error"]["code"], -32602, "{refused}");
 }
+
+/// A subagent runs its parent's hooks: its kernel host calls and tool
+/// results reach the parent's client, named by the subagent's origin, and
+/// the client's refusal stops the subagent like the parent.
+#[test]
+fn acp_hooks_cover_a_subagent() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let scratch = tempfile::TempDir::new().unwrap();
+    let marker = scratch.path().join("kid-spawn");
+    let code = format!(
+        "try:\n    await rlm.spawn('grandkid work', name='grandkid')\n    result = 'ran'\nexcept Exception as error:\n    result = str(error)\nopen({:?}, 'w').write(result)",
+        marker.display().to_string()
+    );
+    let parent = spawn_parent_script(spawn_cell());
+    let child_script = json!({ "engine": "faux", "responses": [
+        { "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": code } },
+        ] },
+        { "text": "kid done" },
+    ] });
+    let mut client = AcpChild::spawn_with_child_script(
+        &["--mode", "acp"],
+        &parent,
+        &child_script,
+        &kernel_python,
+    );
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({
+            "hooks": ["host_call", "after_tool_call"],
+            "hostCallTypes": ["rlm.*"],
+        })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let _prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "spawn the kid" }] }),
+    );
+    let mut parent_host_calls = 0;
+    let mut kid_host_call = None;
+    loop {
+        let hook = client.wait_frame(TIMEOUT, |frame| {
+            frame["method"] == "_ai.primeintellect.prime-agent/hook"
+        });
+        assert_eq!(hook["params"]["sessionId"], session_id.as_str());
+        let from_kid = hook["params"].get("origin").is_some();
+        let result = match (hook["params"]["hook"].as_str(), from_kid) {
+            (Some("host_call"), false) => {
+                parent_host_calls += 1;
+                json!({ "allow": true })
+            }
+            (Some("host_call"), true) => {
+                kid_host_call = Some(hook.clone());
+                json!({ "allow": false, "reason": "Subagents of a lead may not spawn." })
+            }
+            (Some("after_tool_call"), _) => json!({}),
+            other => panic!("unexpected hook {other:?}: {hook}"),
+        };
+        client.send(&json!({ "jsonrpc": "2.0", "id": hook["id"], "result": result }));
+        if from_kid && hook["params"]["hook"] == "after_tool_call" {
+            break;
+        }
+    }
+    assert!(parent_host_calls >= 1, "the parent's own spawn was gated");
+    let kid_host_call = kid_host_call.expect("the subagent's spawn reached the client");
+    assert_eq!(kid_host_call["params"]["payload"]["type"], "rlm.run");
+    assert!(
+        kid_host_call["params"]["origin"]["rlmChildId"].is_string(),
+        "the subagent's identity rides the hook: {kid_host_call}"
+    );
+    let result = std::fs::read_to_string(&marker).expect("the kid's cell finished");
+    assert!(
+        result.contains("Subagents of a lead may not spawn."),
+        "the refusal reached the subagent: {result}"
+    );
+}
