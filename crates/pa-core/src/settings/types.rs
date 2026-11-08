@@ -133,6 +133,10 @@ pub struct AutoRefineSettings {
     pub turn_interval: Option<u64>,
     pub compact: Option<bool>,
     pub cooldown_ms: Option<u64>,
+    /// Fork-only: the next approved auto-refine first rolls back local
+    /// refinements whose latest outcome verdict is `hurt` (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_hurt: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

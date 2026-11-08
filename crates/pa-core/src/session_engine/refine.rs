@@ -13,6 +13,10 @@ use crate::refinement::executor::{
     apply_refinement_plan, plan_refinement, review_auto_refine, AutoRefineReview,
     AutoRefineReviewContext, RefineOptions as CoreRefineOptions, RefinementPlan,
 };
+use crate::refinement::verdicts::{
+    append_global_verdicts, harmful_refinement_ids, load_global_verdicts, merge_verdicts,
+    RefinementVerdict, REFINEMENT_VERDICT_CUSTOM_TYPE,
+};
 use crate::refinement::{
     append_global_refinement, format_refinement_notice_body, load_global_refinement_history,
     load_harness_state, merge_harness_states, try_update_harness_state, HarnessScope,
@@ -199,6 +203,117 @@ pub fn session_refinement_history(entries: &[FileEntry]) -> Vec<RefinementResult
         .collect()
 }
 
+/// Outcome verdicts recorded in this session's JSONL entries, one per row.
+#[must_use]
+pub fn session_refinement_verdicts(entries: &[FileEntry]) -> Vec<RefinementVerdict> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::Custom { payload, .. }
+                if payload.custom_type == REFINEMENT_VERDICT_CUSTOM_TYPE =>
+            {
+                payload
+                    .data
+                    .as_ref()
+                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Merged global + in-session outcome verdicts, oldest first.
+#[must_use]
+pub fn load_refinement_verdicts(
+    session: &SessionManager,
+    global_harness_dir: &Path,
+) -> Vec<RefinementVerdict> {
+    merge_verdicts(
+        &load_global_verdicts(global_harness_dir),
+        &session.refinement_verdicts(),
+    )
+}
+
+/// Persist a review's verdicts: one session row each, and the global log
+/// too for verdicts on global refinements. Verdicts naming a refinement the
+/// history does not hold are dropped. Returns the verdicts kept.
+///
+/// # Errors
+///
+/// Returns an error when the global log or a session row cannot be written.
+pub fn record_refinement_verdicts(
+    session: &mut SessionManager,
+    global_harness_dir: &Path,
+    history: &[RefinementResult],
+    verdicts: &[RefinementVerdict],
+) -> anyhow::Result<Vec<RefinementVerdict>> {
+    let scope_of = |verdict: &RefinementVerdict| {
+        history
+            .iter()
+            .find(|item| item.id == verdict.refinement_id)
+            .map(|item| {
+                crate::refinement::infer_refinement_result_scope(item)
+                    .unwrap_or(HarnessScope::Local)
+            })
+    };
+    let kept: Vec<RefinementVerdict> = verdicts
+        .iter()
+        .filter(|verdict| scope_of(verdict).is_some())
+        .cloned()
+        .collect();
+    let global: Vec<RefinementVerdict> = kept
+        .iter()
+        .filter(|verdict| scope_of(verdict) == Some(HarnessScope::Global))
+        .cloned()
+        .collect();
+    append_global_verdicts(global_harness_dir, &global)?;
+    for verdict in &kept {
+        session.append_custom_entry(
+            REFINEMENT_VERDICT_CUSTOM_TYPE,
+            Some(serde_json::to_value(verdict)?),
+        )?;
+    }
+    Ok(kept)
+}
+
+/// Harmful refinements not rolled back yet, in first-seen order.
+#[must_use]
+pub fn pending_harmful_ids(
+    verdicts: &[RefinementVerdict],
+    history: &[RefinementResult],
+) -> Vec<String> {
+    harmful_refinement_ids(verdicts)
+        .into_iter()
+        .filter(|id| {
+            !history
+                .iter()
+                .any(|item| item.rollback_of.as_deref() == Some(id.as_str()))
+        })
+        .collect()
+}
+
+/// The `/refine review` report: the verdicts recorded, then one rollback
+/// notice per harmful refinement.
+#[must_use]
+pub fn refinement_review_report(recorded: &[RefinementVerdict], harmful: &[String]) -> String {
+    let mut lines = vec![if recorded.is_empty() {
+        "Refinement review recorded no verdicts.".to_string()
+    } else {
+        format!(
+            "Refinement review recorded {} verdict{}:\n{}",
+            recorded.len(),
+            if recorded.len() == 1 { "" } else { "s" },
+            crate::refinement::verdicts::verdicts_for_prompt(recorded)
+        )
+    }];
+    for id in harmful {
+        lines.push(format!(
+            "Refinement {id} looks harmful: /refine rollback {id}"
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Merged cross-session + in-session refinement history.
 #[must_use]
 pub fn load_refinement_history(
@@ -341,6 +456,7 @@ pub async fn execute_refinement_with_rows(
             .as_ref()
             .and_then(|settings| settings.settings().refine.as_ref())
             .and_then(|refine| refine.always_on_soft_limit),
+        verdicts: load_refinement_verdicts(session, global_harness_dir),
     };
     let requested_scope = if options.global {
         HarnessScope::Global
@@ -541,9 +657,48 @@ impl AgentSession {
         if !self.harness_refinements_enabled() {
             return Ok(None);
         }
+        let (review, history) = self
+            .run_refinement_review(
+                model,
+                api_key,
+                global_harness_dir,
+                AUTO_REFINE_COMPACT_REASON,
+                turns_since_last_review,
+            )
+            .await?;
+        // A branch move (or a replacement teardown's discard) bumped the version
+        // while the review's model call was in flight — the approval and its
+        // verdicts belong to the abandoned conversation.
+        if !self.compact_auto_refine_branch_version_unchanged(branch_version) {
+            return Ok(None);
+        }
+        // A verdict that cannot be stored never blocks the review's decision.
+        if let Err(error) = self
+            .record_review_verdicts(global_harness_dir, &history, &review.verdicts)
+            .await
+        {
+            tracing::warn!("refinement verdicts not recorded: {error:#}");
+        }
+        if !review.should_refine {
+            return Ok(None);
+        }
+        Ok(Some(review))
+    }
+
+    /// The review call itself: the conversation, the merged harness state,
+    /// the history and the recorded verdicts. Returns the review and the
+    /// merged history it judged. Nothing is recorded here.
+    async fn run_refinement_review(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        global_harness_dir: &Path,
+        reason: &str,
+        turns_since_last_review: u32,
+    ) -> anyhow::Result<(AutoRefineReview, Vec<RefinementResult>)> {
         // The review reads the same planning inputs the run plans
         // against, extracted under this lock from the retained rows.
-        let (parts, merged_state, history) = {
+        let (parts, merged_state, history, verdicts) = {
             let session = self.session_handle().lock().await;
             let local_state =
                 load_harness_state(&local_harness_state_dir(&session), HarnessScope::Local);
@@ -552,6 +707,7 @@ impl AgentSession {
                 session.refine_transcript_parts(),
                 merge_harness_states(&global_state, Some(&local_state)),
                 load_global_refinement_history(global_harness_dir),
+                load_refinement_verdicts(&session, global_harness_dir),
             )
         };
         // Refinement deliberately reviews historical messages; await the
@@ -570,25 +726,135 @@ impl AgentSession {
             &history,
             model,
             &AutoRefineReviewContext {
-                reason: AUTO_REFINE_COMPACT_REASON.to_string(),
+                reason: reason.to_string(),
                 turns_since_last_review,
+                verdicts,
             },
             review_call,
         )
         .await;
         let billed = billed.lock().expect("billed refiner call lock").take();
         self.record_model_usage(billed).await;
-        let review = review?;
-        if !review.should_refine {
-            return Ok(None);
+        Ok((review?, history))
+    }
+
+    async fn record_review_verdicts(
+        &self,
+        global_harness_dir: &Path,
+        history: &[RefinementResult],
+        verdicts: &[RefinementVerdict],
+    ) -> anyhow::Result<Vec<RefinementVerdict>> {
+        if verdicts.is_empty() {
+            return Ok(Vec::new());
         }
-        // A branch move (or a replacement teardown's discard) bumped the version
-        // while the review's model call was in flight — the approval belongs to
-        // the abandoned conversation, so the refinement run never starts.
-        if !self.compact_auto_refine_branch_version_unchanged(branch_version) {
-            return Ok(None);
+        let mut session = self.session_handle().lock().await;
+        record_refinement_verdicts(&mut session, global_harness_dir, history, verdicts)
+    }
+
+    /// `/refine review`: the review call with `shouldRefine` ignored. Records
+    /// its verdicts and returns the report text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when refinements are disabled, or the review call or
+    /// a verdict write fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the billed-call slot's mutex is poisoned.
+    pub async fn review_refinements(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        global_harness_dir: &Path,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.harness_refinements_enabled(),
+            "Harness refinements are disabled in /settings"
+        );
+        let (review, history) = self
+            .run_refinement_review(
+                model,
+                api_key,
+                global_harness_dir,
+                "manual /refine review",
+                0,
+            )
+            .await?;
+        let recorded = self
+            .record_review_verdicts(global_harness_dir, &history, &review.verdicts)
+            .await?;
+        let all = {
+            let session = self.session_handle().lock().await;
+            load_refinement_verdicts(&session, global_harness_dir)
+        };
+        Ok(refinement_review_report(
+            &recorded,
+            &pending_harmful_ids(&all, &history),
+        ))
+    }
+
+    /// `autoRefine.rollbackHurt` (default off).
+    fn rollback_hurt_enabled(&self) -> bool {
+        self.refinement_settings.as_ref().is_some_and(|settings| {
+            settings
+                .reopen()
+                .settings()
+                .auto_refine
+                .as_ref()
+                .and_then(|auto| auto.rollback_hurt)
+                == Some(true)
+        })
+    }
+
+    /// With `autoRefine.rollbackHurt` on, roll back each local refinement
+    /// whose latest verdict is `hurt` and that is not rolled back yet,
+    /// through the existing rollback path. A failed rollback is logged and
+    /// skipped so the approved refinement still runs.
+    async fn rollback_harmful_refinements(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<&String>,
+        global_harness_dir: &Path,
+    ) {
+        if !self.rollback_hurt_enabled() {
+            return;
         }
-        Ok(Some(review))
+        let (history, verdicts) = {
+            let session = self.session_handle().lock().await;
+            (
+                load_refinement_history(&session, global_harness_dir),
+                load_refinement_verdicts(&session, global_harness_dir),
+            )
+        };
+        for id in pending_harmful_ids(&verdicts, &history) {
+            let local = history
+                .iter()
+                .find(|item| item.id == id)
+                .and_then(crate::refinement::infer_refinement_result_scope)
+                .unwrap_or(HarnessScope::Local)
+                == HarnessScope::Local;
+            if !local {
+                continue;
+            }
+            let options = RefineOptions {
+                global: false,
+                instructions: None,
+                rollback_id: Some(id.clone()),
+            };
+            if let Err(error) = self
+                .refine(
+                    &options,
+                    RefinementSource::Auto,
+                    model,
+                    api_key.cloned(),
+                    global_harness_dir.to_path_buf(),
+                )
+                .await
+            {
+                tracing::warn!("auto rollback of harmful refinement {id} failed: {error:#}");
+            }
+        }
     }
 
     /// The serialized arm's compact-trigger round: the review, then only on
@@ -634,6 +900,8 @@ impl AgentSession {
         api_key: Option<String>,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<RefinementResult> {
+        self.rollback_harmful_refinements(model, api_key.as_ref(), &global_harness_dir)
+            .await;
         let options = RefineOptions {
             global: false,
             instructions: Some(auto_refine_instructions(AUTO_REFINE_COMPACT_REASON, review)),
@@ -883,6 +1151,7 @@ mod tests {
             turn_interval: Some(0),
             compact: Some(false),
             cooldown_ms: Some(5),
+            rollback_hurt: None,
         };
         assert_eq!(
             AutoRefineGates::from_settings(Some(&raw)),
@@ -901,6 +1170,7 @@ mod tests {
             should_refine: true,
             rationale: "reusable tactic".to_string(),
             instructions: Some("record it".to_string()),
+            verdicts: Vec::new(),
         };
         assert_eq!(
             auto_refine_instructions("compact", &review),
@@ -912,6 +1182,7 @@ Reviewer instructions: record it"
             should_refine: true,
             rationale: "reusable tactic".to_string(),
             instructions: None,
+            verdicts: Vec::new(),
         };
         assert_eq!(
             auto_refine_instructions("compact", &bare),
@@ -1093,6 +1364,132 @@ Reviewer instructions: record it"
             .collect();
         assert_eq!(custom_messages.len(), 2);
         assert_eq!(load_refinement_history(&session, &global_dir).len(), 1);
+    }
+
+    /// A recorded `hurt` verdict persists (session row; global log only for
+    /// global refinements), names a rollback, reaches the next refine
+    /// prompt, and clears once the refinement is rolled back.
+    #[tokio::test]
+    async fn hurt_verdicts_persist_and_reach_the_next_refine_prompt() {
+        use crate::refinement::verdicts::{parse_verdicts, verdicts_for_prompt};
+        let dir = TempDir::new().unwrap();
+        let mut session = persisted_session(&dir);
+        let global_dir = dir.path().join("harness");
+        let transcript = || RefinementTranscript {
+            messages: &[],
+            refinement_history: &[],
+        };
+        let create = |id: &str| {
+            format!(
+                r#"{{"summary":"s","rationale":"r","expectedOutcome":"e","edits":[{{"action":"create","kind":"memory","id":"{id}","title":"T","content":"C","reason":"turn 2"}}]}}"#
+            )
+        };
+        let global = execute_refinement(
+            &mut session,
+            transcript(),
+            &global_dir,
+            &test_model(),
+            &RefineOptions {
+                global: true,
+                ..RefineOptions::default()
+            },
+            RefinementSource::User,
+            seam(&create("g1")),
+            None,
+        )
+        .await
+        .unwrap();
+        let local = execute_refinement(
+            &mut session,
+            transcript(),
+            &global_dir,
+            &test_model(),
+            &RefineOptions::default(),
+            RefinementSource::User,
+            seam(&create("m1")),
+            None,
+        )
+        .await
+        .unwrap();
+        let raw = serde_json::json!([
+            {"refinementId": local.id, "editId": "m1", "verdict": "hurt", "evidence": "turn 4: skipped tests"},
+            {"refinementId": global.id, "verdict": "helped", "evidence": "turn 5"},
+            {"refinementId": "refine_unknown", "verdict": "hurt"},
+        ]);
+        let history = load_refinement_history(&session, &global_dir);
+        let kept = record_refinement_verdicts(
+            &mut session,
+            &global_dir,
+            &history,
+            &parse_verdicts(Some(&raw), "2026-11-08T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(
+            load_global_verdicts(&global_dir)
+                .iter()
+                .map(|verdict| verdict.refinement_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![global.id.as_str()]
+        );
+        let verdicts = load_refinement_verdicts(&session, &global_dir);
+        let harmful = pending_harmful_ids(&verdicts, &history);
+        assert_eq!(harmful, vec![local.id.clone()]);
+        assert!(
+            refinement_review_report(&kept, &harmful).ends_with(&format!(
+                "Refinement {0} looks harmful: /refine rollback {0}",
+                local.id
+            ))
+        );
+
+        let prompt = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = prompt.clone();
+        let capture: RefinerFn = Box::new(move |_model, _system, user_prompt| {
+            *seen.lock().unwrap() = user_prompt;
+            Box::pin(async move { Ok(text_assistant(r#"{"summary":"none","edits":[]}"#)) })
+        });
+        execute_refinement(
+            &mut session,
+            transcript(),
+            &global_dir,
+            &test_model(),
+            &RefineOptions::default(),
+            RefinementSource::User,
+            capture,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(prompt
+            .lock()
+            .unwrap()
+            .contains(&verdicts_for_prompt(&verdicts)));
+        assert!(prompt.lock().unwrap().contains(&format!(
+            "- {} (edit m1): hurt -- turn 4: skipped tests",
+            local.id
+        )));
+
+        let session_history = session.refinement_history();
+        execute_refinement(
+            &mut session,
+            RefinementTranscript {
+                messages: &[],
+                refinement_history: &session_history,
+            },
+            &global_dir,
+            &test_model(),
+            &RefineOptions {
+                rollback_id: Some(local.id.clone()),
+                ..RefineOptions::default()
+            },
+            RefinementSource::User,
+            seam("{}"),
+            None,
+        )
+        .await
+        .unwrap();
+        let history = load_refinement_history(&session, &global_dir);
+        assert!(pending_harmful_ids(&verdicts, &history).is_empty());
     }
 
     /// The failed rows stay live-indexed so the in-process history sees

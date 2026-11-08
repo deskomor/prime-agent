@@ -6,6 +6,7 @@ use super::planner::{
     RefinementProposal, AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS, AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
     REFINEMENT_MAX_OUTPUT_TOKENS, REFINEMENT_SYSTEM_PROMPT,
 };
+use super::verdicts::{judgeable_refinements, parse_verdicts, verdicts_section, RefinementVerdict};
 use super::{
     infer_refinement_result_scope, merge_refinement_history, HarnessScope, HarnessState,
     RefinementKind, RefinementResult, REFINEMENT_KINDS,
@@ -20,6 +21,8 @@ pub struct RefineOptions {
     pub rollback_id: Option<String>,
     /// `refine.alwaysOnSoftLimit`; `None` uses [`DEFAULT_ALWAYS_ON_SOFT_LIMIT`].
     pub always_on_soft_limit: Option<u64>,
+    /// Recorded outcome verdicts on past refinements, shown with the history.
+    pub verdicts: Vec<RefinementVerdict>,
 }
 
 /// Default soft limit, in characters, for always-on (prompt + memory) entries.
@@ -250,6 +253,7 @@ pub async fn plan_refinement(
                 "<refinement_history>\n{}\n</refinement_history>",
                 history_for_prompt(history)
             ),
+            verdicts_section(&options.verdicts, None),
             format!("<conversation>\n{conversation}\n</conversation>"),
             format!("<scope_policy>\n{scope_instruction}\n</scope_policy>"),
             format!(
@@ -355,11 +359,15 @@ pub struct AutoRefineReview {
     pub should_refine: bool,
     pub rationale: String,
     pub instructions: Option<String>,
+    /// Outcome verdicts the review recorded on past refinements.
+    pub verdicts: Vec<RefinementVerdict>,
 }
 
 pub struct AutoRefineReviewContext {
     pub reason: String,
     pub turns_since_last_review: u32,
+    /// Verdicts already recorded, so the review does not repeat them.
+    pub verdicts: Vec<RefinementVerdict>,
 }
 
 fn parse_auto_refine_review(text: &str) -> anyhow::Result<AutoRefineReview> {
@@ -376,6 +384,10 @@ fn parse_auto_refine_review(text: &str) -> anyhow::Result<AutoRefineReview> {
             .get("instructions")
             .and_then(|value| value.as_str())
             .map(std::string::ToString::to_string),
+        verdicts: parse_verdicts(
+            record.get("verdicts"),
+            &crate::session::manager::format_iso_now(),
+        ),
     })
 }
 
@@ -393,6 +405,7 @@ pub async fn review_auto_refine(
     review_call: RefinerFn,
 ) -> anyhow::Result<AutoRefineReview> {
     let conversation_text = conversation_text(messages, 40_000);
+    let judgeable = judgeable_refinements(history, messages);
     let build_prompt = |conversation: &str| -> String {
         [
             format!(
@@ -407,6 +420,7 @@ pub async fn review_auto_refine(
                 "<refinement_history>\n{}\n</refinement_history>",
                 history_for_prompt(history)
             ),
+            verdicts_section(&context.verdicts, Some(&judgeable)),
             format!("<conversation>\n{conversation}\n</conversation>"),
             "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.".to_string(),
         ]
@@ -488,6 +502,7 @@ mod tests {
             &AutoRefineReviewContext {
                 reason: "compact".to_string(),
                 turns_since_last_review: 0,
+                verdicts: Vec::new(),
             },
             review_call,
         )
@@ -561,6 +576,7 @@ mod tests {
         let ctx = AutoRefineReviewContext {
             reason: "checkpoint".to_string(),
             turns_since_last_review: 1,
+            verdicts: Vec::new(),
         };
         let review = review_auto_refine(&[], &state, &[], &model, &ctx, stopped(StopReason::Error));
         assert_eq!(
@@ -687,14 +703,25 @@ mod tests {
             &AutoRefineReviewContext {
                 reason: "checkpoint".to_string(),
                 turns_since_last_review: 4,
+                verdicts: Vec::new(),
             },
-            seam(r#"{"shouldRefine":true,"rationale":"pattern seen","instructions":"note the tactic"}"#),
+            seam(
+                r#"{"shouldRefine":true,"rationale":"pattern seen","instructions":"note the tactic","verdicts":[{"refinementId":"refine_a","verdict":"hurt","evidence":"turn 7"},{"refinementId":"refine_b","verdict":"maybe"}]}"#,
+            ),
         )
         .await
         .unwrap();
         assert!(review.should_refine);
         assert_eq!(review.rationale, "pattern seen");
         assert_eq!(review.instructions.as_deref(), Some("note the tactic"));
+        assert_eq!(
+            review
+                .verdicts
+                .iter()
+                .map(|verdict| (verdict.refinement_id.as_str(), verdict.verdict))
+                .collect::<Vec<_>>(),
+            vec![("refine_a", super::super::verdicts::Verdict::Hurt)]
+        );
         let rejected = review_auto_refine(
             &[],
             &state,
@@ -703,6 +730,7 @@ mod tests {
             &AutoRefineReviewContext {
                 reason: "checkpoint".to_string(),
                 turns_since_last_review: 1,
+                verdicts: Vec::new(),
             },
             seam(r#"{"shouldRefine":false}"#),
         )

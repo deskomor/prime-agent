@@ -308,18 +308,26 @@ impl SessionManager {
     }
 
     pub fn refinement_history(&self) -> Vec<crate::refinement::RefinementResult> {
-        let mut history = self.window.as_ref().map_or_else(Vec::new, |window| {
+        self.retained_metadata(crate::session_engine::refine::session_refinement_history)
+    }
+
+    /// Outcome verdicts recorded in this session, in file order.
+    pub fn refinement_verdicts(&self) -> Vec<crate::refinement::verdicts::RefinementVerdict> {
+        self.retained_metadata(crate::session_engine::refine::session_refinement_verdicts)
+    }
+
+    /// `pick` over the windowed older metadata rows, then the loaded rows.
+    fn retained_metadata<T>(&self, pick: impl Fn(&[FileEntry]) -> Vec<T>) -> Vec<T> {
+        let mut items = self.window.as_ref().map_or_else(Vec::new, |window| {
             let entries: Vec<FileEntry> = window
                 .metadata_entries()
                 .iter()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
-            crate::session_engine::refine::session_refinement_history(&entries)
+            pick(&entries)
         });
-        history.extend(crate::session_engine::refine::session_refinement_history(
-            &self.file_entries,
-        ));
-        history
+        items.extend(pick(&self.file_entries));
+        items
     }
 
     #[cfg(test)]

@@ -261,6 +261,21 @@ async fn execute_refine(
     execution: &mut SessionCommandExecution,
 ) -> Result<(), String> {
     let options = parse_refine_command_options(&command.args)?;
+    if options.review {
+        let report = engine
+            .session
+            .review_refinements(
+                params.model,
+                params.api_key.take(),
+                &params.global_harness_dir,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        execution.push_message(slash_command_result(
+            command, report, true, "info", None, true,
+        ));
+        return Ok(());
+    }
     let refine_options = RefineOptions {
         global: options.global,
         instructions: options.instructions,

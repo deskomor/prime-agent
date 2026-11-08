@@ -40,9 +40,12 @@ pub struct RefineCommandOptions {
     pub instructions: Option<String>,
     pub rollback_id: Option<String>,
     pub global: bool,
+    /// `/refine review`: judge past refinements, record verdicts, refine nothing.
+    pub review: bool,
 }
 
-/// Parse `/refine [--global] [instructions]` and `/refine rollback <id>`.
+/// Parse `/refine [--global] [instructions]`, `/refine rollback <id>` and
+/// `/refine review`.
 ///
 /// # Errors
 ///
@@ -53,6 +56,12 @@ pub fn parse_refine_command_options(args: &str) -> Result<RefineCommandOptions, 
     if rest.starts_with("--global") && matches!(rest.as_bytes().get(8), None | Some(b' ' | b'\t')) {
         global = true;
         rest = rest["--global".len()..].trim();
+    }
+    if rest == "review" {
+        return Ok(RefineCommandOptions {
+            review: true,
+            ..RefineCommandOptions::default()
+        });
     }
     if rest == "rollback" {
         return Err("Usage: /refine rollback <refinement-id>".to_string());
@@ -74,6 +83,7 @@ pub fn parse_refine_command_options(args: &str) -> Result<RefineCommandOptions, 
                 instructions: None,
                 rollback_id: Some(rollback_id),
                 global,
+                review: false,
             });
         }
     }
@@ -81,6 +91,7 @@ pub fn parse_refine_command_options(args: &str) -> Result<RefineCommandOptions, 
         instructions: (!rest.is_empty()).then(|| rest.to_string()),
         rollback_id: None,
         global,
+        review: false,
     })
 }
 
@@ -96,6 +107,7 @@ mod tests {
                 instructions: Some("do the thing".to_string()),
                 rollback_id: None,
                 global: false,
+                review: false,
             }
         );
         assert_eq!(
@@ -108,6 +120,7 @@ mod tests {
                 instructions: Some("tweak".to_string()),
                 rollback_id: None,
                 global: true,
+                review: false,
             }
         );
         assert_eq!(
@@ -116,6 +129,16 @@ mod tests {
                 instructions: None,
                 rollback_id: Some("ref_123".to_string()),
                 global: false,
+                review: false,
+            }
+        );
+        // `review` alone judges past refinements; longer text stays instructions.
+        assert!(parse_refine_command_options("review").unwrap().review);
+        assert_eq!(
+            parse_refine_command_options("review the retry loop").unwrap(),
+            RefineCommandOptions {
+                instructions: Some("review the retry loop".to_string()),
+                ..RefineCommandOptions::default()
             }
         );
         assert!(
