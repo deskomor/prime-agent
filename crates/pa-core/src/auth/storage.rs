@@ -41,6 +41,19 @@ pub trait AuthStorageBackend: Send + Sync {
 
 use crate::platform::lock_dir::LockDir as LockGuard;
 
+/// The target of `path` when it is a symlink (relative targets resolve
+/// against the link's directory), else `path` unchanged.
+fn follow_symlink(path: PathBuf) -> PathBuf {
+    let Ok(target) = fs::read_link(&path) else {
+        return path;
+    };
+    let target = match path.parent() {
+        Some(dir) if target.is_relative() => dir.join(target),
+        _ => target,
+    };
+    fs::canonicalize(&target).unwrap_or(target)
+}
+
 /// Staleness for the sync auth lock (TS proper-lockfile default: 10s).
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -49,9 +62,14 @@ pub struct FileAuthStorageBackend {
 }
 
 impl FileAuthStorageBackend {
+    /// A symlinked `auth.json` is followed: reads, the lock and the atomic
+    /// write all land on the link's target, so the link survives a token
+    /// refresh. An isolated agent dir (a benchmark rollout, say) can link to
+    /// the user's `auth.json` and share its refreshes instead of letting a
+    /// rotated refresh token go stale in a copy.
     pub fn new(auth_path: impl Into<PathBuf>) -> Self {
         FileAuthStorageBackend {
-            auth_path: auth_path.into(),
+            auth_path: follow_symlink(auth_path.into()),
         }
     }
 
@@ -287,6 +305,33 @@ pub fn parse_storage_data(content: Option<&str>) -> Result<AuthStorageData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_auth_file_is_written_through_and_stays_a_link() {
+        let shared = tempfile::tempdir().unwrap();
+        let isolated = tempfile::tempdir().unwrap();
+        let real = shared.path().join("auth.json");
+        fs::write(&real, r#"{"anthropic":{"type":"api_key","key":"old"}}"#).unwrap();
+        let link = isolated.path().join("auth.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        FileAuthStorageBackend::new(&link)
+            .with_lock(&mut |current| {
+                assert!(current.unwrap().contains("old"));
+                Ok((
+                    (),
+                    Some(r#"{"anthropic":{"type":"api_key","key":"new"}}"#.to_string()),
+                ))
+            })
+            .unwrap();
+
+        assert!(fs::read_to_string(&real).unwrap().contains("new"));
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 
     #[test]
     fn file_backend_round_trip_and_modes() {

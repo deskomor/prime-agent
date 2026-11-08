@@ -162,6 +162,24 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         "--json   Print JSON",
     ]),
     CommandSpec::new(
+        &["auth-gateway"],
+        "auth-gateway <serve|token>",
+        "Serve your logins as a local OpenAI chat-completions endpoint",
+    )
+    .description(
+        "For tools that only speak the OpenAI wire format, such as a benchmark judge. Listens on loopback only and needs the bearer token.",
+    ),
+    CommandSpec::new(
+        &["auth-gateway", "serve"],
+        "auth-gateway serve [--bind 127.0.0.1:4100]",
+        "Serve /v1/chat/completions over this agent dir's logins",
+    ),
+    CommandSpec::new(
+        &["auth-gateway", "token"],
+        "auth-gateway token",
+        "Print the gateway bearer token, creating it on first use",
+    ),
+    CommandSpec::new(
         &["mcp"],
         "mcp <add|list|get|remove>",
         "Manage user MCP servers",
