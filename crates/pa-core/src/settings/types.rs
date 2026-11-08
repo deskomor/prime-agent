@@ -117,6 +117,15 @@ pub struct BranchSummarySettings {
     pub skip_prompt: Option<bool>,
 }
 
+/// `/refine` settings (fork-only; TS ignores the key).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineSettings {
+    /// Soft limit, in characters, for always-on prompt + memory entries shown
+    /// to the refiner as `<always_on_budget>`.
+    pub always_on_soft_limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoRefineSettings {
@@ -280,6 +289,7 @@ pub struct Settings {
     pub theme: Option<String>,
     pub compaction: Option<CompactionSettings>,
     pub auto_refine: Option<AutoRefineSettings>,
+    pub refine: Option<RefineSettings>,
     /// Master switch for harness creation and context loading; unset preserves enabled behavior.
     pub harness_refinements: Option<bool>,
     pub agent_traces: Option<AgentTracesSettings>,

@@ -1,0 +1,1 @@
+- `/refine` now ranks harness components by cost, ties each edit to a moment in the conversation, treats "no change" as a good answer, and sees an always-on budget (`refine.alwaysOnSoftLimit`, default 6,000 characters).

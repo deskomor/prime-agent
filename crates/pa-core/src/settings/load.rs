@@ -26,6 +26,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "theme",
     "compaction",
     "autoRefine",
+    "refine",
     "harnessRefinements",
     "agentTraces",
     "factory",
@@ -186,5 +187,18 @@ mod tests {
         );
         let settings = from_value_lenient(&serde_json::json!({ "requestTiming": true }));
         assert_eq!(settings.request_timing, Some(true));
+    }
+
+    #[test]
+    fn refine_soft_limit_loads() {
+        let settings = from_value_lenient(&serde_json::json!({
+            "refine": { "alwaysOnSoftLimit": 1234 },
+        }));
+        assert_eq!(
+            settings
+                .refine
+                .and_then(|refine| refine.always_on_soft_limit),
+            Some(1234)
+        );
     }
 }

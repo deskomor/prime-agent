@@ -377,6 +377,9 @@ pub struct AppliedRefinementEdit {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A non-blocking problem with an applied edit (fork-only, optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 impl AppliedRefinementEdit {
@@ -404,6 +407,7 @@ impl AppliedRefinementEdit {
             applied: false,
             error: None,
             reason: edit.reason.clone(),
+            warning: None,
         }
     }
 }
@@ -848,6 +852,7 @@ mod tests {
                 applied: true,
                 error: None,
                 reason: None,
+                warning: None,
                 title: None,
                 content: None,
                 path: None,

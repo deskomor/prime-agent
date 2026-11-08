@@ -337,6 +337,10 @@ pub async fn execute_refinement_with_rows(
         global: options.global,
         instructions: options.instructions.clone(),
         rollback_id: options.rollback_id.clone(),
+        always_on_soft_limit: settings
+            .as_ref()
+            .and_then(|settings| settings.settings().refine.as_ref())
+            .and_then(|refine| refine.always_on_soft_limit),
     };
     let requested_scope = if options.global {
         HarnessScope::Global

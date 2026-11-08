@@ -18,6 +18,23 @@ pub struct RefineOptions {
     pub global: bool,
     pub instructions: Option<String>,
     pub rollback_id: Option<String>,
+    /// `refine.alwaysOnSoftLimit`; `None` uses [`DEFAULT_ALWAYS_ON_SOFT_LIMIT`].
+    pub always_on_soft_limit: Option<u64>,
+}
+
+/// Default soft limit, in characters, for always-on (prompt + memory) entries.
+pub const DEFAULT_ALWAYS_ON_SOFT_LIMIT: u64 = 6_000;
+
+/// Characters of always-on harness text: the titles and contents of prompt and
+/// memory entries, which ride every turn's `[harness-digest]`.
+#[must_use]
+pub fn always_on_chars(state: &HarnessState) -> usize {
+    [RefinementKind::Prompt, RefinementKind::Memory]
+        .iter()
+        .filter_map(|kind| state.entries.get(kind))
+        .flat_map(|entries| entries.values())
+        .map(|entry| entry.title.chars().count() + entry.content.chars().count())
+        .sum()
 }
 
 /// A planned refinement awaiting application.
@@ -235,6 +252,13 @@ pub async fn plan_refinement(
             ),
             format!("<conversation>\n{conversation}\n</conversation>"),
             format!("<scope_policy>\n{scope_instruction}\n</scope_policy>"),
+            format!(
+                "<always_on_budget used=\"{}\" soft_limit=\"{}\"/>",
+                always_on_chars(state),
+                options
+                    .always_on_soft_limit
+                    .unwrap_or(DEFAULT_ALWAYS_ON_SOFT_LIMIT)
+            ),
         ];
         if let Some(instructions) = &options.instructions {
             sections.push(format!(
@@ -242,7 +266,7 @@ pub async fn plan_refinement(
             ));
         }
         sections.push(
-            "Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale."
+            "Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale (KEEP_BASE)."
                 .to_string(),
         );
         sections.join("\n\n")
@@ -678,6 +702,61 @@ mod tests {
         assert!(!rejected.should_refine);
         assert_eq!(rejected.rationale, "No rationale provided.");
         assert_eq!(rejected.instructions, None);
+    }
+
+    #[tokio::test]
+    async fn plan_prompt_reports_the_always_on_budget() {
+        use super::super::planner::{apply_refinement_proposal, ApplyOptions, RefinementEdit};
+        let edit = |kind, id: &str, title: &str, content: &str| RefinementEdit {
+            action: Some(super::super::RefinementAction::Create),
+            kind: Some(kind),
+            id: Some(id.to_string()),
+            title: Some(title.to_string()),
+            content: Some(content.to_string()),
+            ..Default::default()
+        };
+        let mut state = super::super::empty_harness_state();
+        apply_refinement_proposal(
+            &mut state,
+            &RefinementProposal {
+                summary: "seed".to_string(),
+                rationale: String::new(),
+                expected_outcome: String::new(),
+                edits: vec![
+                    edit(RefinementKind::Memory, "m1", "Fact", "builds are green"),
+                    edit(RefinementKind::Prompt, "p1", "Rule", "be brief"),
+                ],
+            },
+            ApplyOptions {
+                id: "seed".to_string(),
+                rollback_of: None,
+                scope: Some(HarnessScope::Local),
+                baseline_state: None,
+                factory_enabled: false,
+            },
+        );
+        assert_eq!(always_on_chars(&state), 32);
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let recorder = std::sync::Arc::clone(&prompts);
+        let call: RefinerFn = Box::new(move |_model, _system, prompt| {
+            recorder.lock().unwrap().push(prompt);
+            Box::pin(async { Ok(text_message(r#"{"summary":"keep","edits":[]}"#)) })
+        });
+        plan_refinement(
+            &[],
+            &state,
+            &[],
+            &test_model(),
+            &RefineOptions {
+                always_on_soft_limit: Some(900),
+                ..RefineOptions::default()
+            },
+            call,
+        )
+        .await
+        .unwrap();
+        assert!(prompts.lock().unwrap()[0]
+            .contains(r#"<always_on_budget used="32" soft_limit="900"/>"#));
     }
 
     fn test_model() -> pa_types::ai::Model {
