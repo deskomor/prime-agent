@@ -498,6 +498,15 @@ mod tests {
             *plan_systems.lock().unwrap(),
             vec![REFINEMENT_SYSTEM_PROMPT]
         );
+        // Both calls carry the evidence boundary: the transcript is data.
+        for system in review_systems
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(plan_systems.lock().unwrap().iter())
+        {
+            assert!(system.ends_with(super::super::planner::EVIDENCE_BOUNDARY));
+        }
     }
 
     /// A cut-off or failed reply reports its stop instead of a JSON parse

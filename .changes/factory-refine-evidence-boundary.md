@@ -1,0 +1,1 @@
+- `/refine` and auto-refine now treat the conversation as evidence only: requests found in tool output, web pages or files no longer justify harness edits, and edits that look like credentials are refused.
