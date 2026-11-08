@@ -426,6 +426,7 @@ async fn parent_child_agent_message_round_trip_end_to_end() {
             cwd: None,
             spawned_by_request_id: None,
             factory: None,
+            harness_seed: None,
         })
         .await
         .expect("spawn the child");
@@ -757,6 +758,7 @@ async fn family_edges_never_cross_families_end_to_end() {
                 cwd: None,
                 spawned_by_request_id: None,
                 factory: None,
+                harness_seed: None,
             })
             .await
             .expect("spawn the child");
@@ -899,6 +901,7 @@ async fn family_edges_never_cross_families_end_to_end() {
             cwd: None,
             spawned_by_request_id: None,
             factory: None,
+            harness_seed: None,
         })
         .await
         .expect("spawn the grandchild");
@@ -1219,6 +1222,7 @@ async fn parent_renames_a_child_end_to_end() {
             cwd: None,
             spawned_by_request_id: None,
             factory: None,
+            harness_seed: None,
         })
         .await
         .expect("spawn the child");
@@ -1611,6 +1615,7 @@ async fn passivated_child_recent_messages_reads_its_file_end_to_end() {
             cwd: None,
             spawned_by_request_id: None,
             factory: None,
+            harness_seed: None,
         })
         .await
         .expect("spawn kid-a");
@@ -1782,6 +1787,7 @@ async fn family_members_read_each_others_transcripts_end_to_end() {
                     cwd: None,
                     spawned_by_request_id: None,
                     factory: None,
+                    harness_seed: None,
                 })
                 .await
                 .expect("spawn a kid");

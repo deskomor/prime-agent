@@ -42,10 +42,14 @@ pub struct RefineCommandOptions {
     pub global: bool,
     /// `/refine review`: judge past refinements, record verdicts, refine nothing.
     pub review: bool,
+    /// `/refine --probe`: test the proposal on a replayed task first.
+    pub probe: bool,
+    /// `--task "<text>"`: the task a probe replays.
+    pub task: Option<String>,
 }
 
-/// Parse `/refine [--global] [instructions]`, `/refine rollback <id>` and
-/// `/refine review`.
+/// Parse `/refine [--global] [--probe [--task "<text>"]] [instructions]`,
+/// `/refine rollback <id>` and `/refine review`.
 ///
 /// # Errors
 ///
@@ -53,9 +57,38 @@ pub struct RefineCommandOptions {
 pub fn parse_refine_command_options(args: &str) -> Result<RefineCommandOptions, String> {
     let mut rest = args.trim();
     let mut global = false;
-    if rest.starts_with("--global") && matches!(rest.as_bytes().get(8), None | Some(b' ' | b'\t')) {
-        global = true;
-        rest = rest["--global".len()..].trim();
+    let mut probe = false;
+    let mut task: Option<String> = None;
+    loop {
+        if let Some(tail) = leading_flag(rest, "--global") {
+            global = true;
+            rest = tail;
+        } else if let Some(tail) = leading_flag(rest, "--probe") {
+            probe = true;
+            rest = tail;
+        } else if let Some(tail) = leading_flag(rest, "--task") {
+            let (value, tail) = flag_value(tail)
+                .ok_or_else(|| "Usage: /refine --probe --task \"<task>\"".to_string())?;
+            task = Some(value);
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    if task.is_some() && !probe {
+        return Err("--task only applies with --probe".to_string());
+    }
+    if probe {
+        if rest == "review" || rest == "rollback" || rest.starts_with("rollback ") {
+            return Err("/refine --probe cannot be combined with review or rollback".to_string());
+        }
+        return Ok(RefineCommandOptions {
+            instructions: (!rest.is_empty()).then(|| rest.to_string()),
+            global,
+            probe,
+            task,
+            ..RefineCommandOptions::default()
+        });
     }
     if rest == "review" {
         return Ok(RefineCommandOptions {
@@ -83,7 +116,7 @@ pub fn parse_refine_command_options(args: &str) -> Result<RefineCommandOptions, 
                 instructions: None,
                 rollback_id: Some(rollback_id),
                 global,
-                review: false,
+                ..RefineCommandOptions::default()
             });
         }
     }
@@ -91,13 +124,50 @@ pub fn parse_refine_command_options(args: &str) -> Result<RefineCommandOptions, 
         instructions: (!rest.is_empty()).then(|| rest.to_string()),
         rollback_id: None,
         global,
-        review: false,
+        ..RefineCommandOptions::default()
     })
+}
+
+/// `rest` after a leading `flag` and its separator, if `rest` starts with it.
+fn leading_flag<'a>(rest: &'a str, flag: &str) -> Option<&'a str> {
+    let tail = rest.strip_prefix(flag)?;
+    (tail.is_empty() || tail.starts_with([' ', '\t'])).then(|| tail.trim_start())
+}
+
+/// One flag value: a double-quoted string or a bare word, and what follows.
+fn flag_value(rest: &str) -> Option<(String, &str)> {
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        let value = quoted[..end].trim().to_string();
+        return (!value.is_empty()).then(|| (value, quoted[end + 1..].trim_start()));
+    }
+    let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+    let value = &rest[..end];
+    (!value.is_empty() && !value.starts_with("--"))
+        .then(|| (value.to_string(), rest[end..].trim_start()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_options_parse_in_any_order_and_refuse_rollback() {
+        assert_eq!(
+            parse_refine_command_options(r#"--probe --global --task "fix the build" note retries"#)
+                .unwrap(),
+            RefineCommandOptions {
+                instructions: Some("note retries".to_string()),
+                global: true,
+                probe: true,
+                task: Some("fix the build".to_string()),
+                ..RefineCommandOptions::default()
+            }
+        );
+        assert!(parse_refine_command_options("--probe rollback refine_1").is_err());
+        assert!(parse_refine_command_options("--task x").is_err());
+        assert!(parse_refine_command_options("--probe --task").is_err());
+    }
 
     #[test]
     fn refine_options_parsing() {
@@ -107,7 +177,7 @@ mod tests {
                 instructions: Some("do the thing".to_string()),
                 rollback_id: None,
                 global: false,
-                review: false,
+                ..RefineCommandOptions::default()
             }
         );
         assert_eq!(
@@ -120,7 +190,7 @@ mod tests {
                 instructions: Some("tweak".to_string()),
                 rollback_id: None,
                 global: true,
-                review: false,
+                ..RefineCommandOptions::default()
             }
         );
         assert_eq!(
@@ -129,7 +199,7 @@ mod tests {
                 instructions: None,
                 rollback_id: Some("ref_123".to_string()),
                 global: false,
-                review: false,
+                ..RefineCommandOptions::default()
             }
         );
         // `review` alone judges past refinements; longer text stays instructions.

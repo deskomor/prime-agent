@@ -1299,6 +1299,7 @@ mod tests {
             cwd: None,
             spawned_by_request_id: None,
             factory: None,
+            harness_seed: None,
         });
         std::future::poll_fn(|context| {
             assert!(spawn.as_mut().poll(context).is_pending());

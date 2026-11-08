@@ -16,6 +16,7 @@ pub use storage::{
     FileSettingsStorage, InMemorySettingsStorage, SettingsScope, SettingsStorage, CONFIG_DIR_NAME,
 };
 pub use types::{
-    AutoRefineSettings, AutonomousSettings, CompactionSettings, QueueModeSetting, RefineSettings,
-    Settings, ThinkingLevelSetting, TransportSetting, UpdateChannel,
+    AutoRefineSettings, AutonomousSettings, CompactionSettings, QueueModeSetting,
+    RefineProbeSettings, RefineSettings, Settings, ThinkingLevelSetting, TransportSetting,
+    UpdateChannel,
 };

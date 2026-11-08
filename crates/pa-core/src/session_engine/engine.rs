@@ -850,6 +850,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // Keep the context descriptor even while disabled, so re-enabling can load it.
     session.harness_digest = Some(digest_context);
     session.refinement_settings = Some(refinement_settings);
+    session.probe_children.clone_from(&config.rlm_subagent_host);
     // A disabled startup has never delivered its filtered digest. Defer that
     // first delivery without re-arming digests already consumed in a live session.
     if !session.harness_refinements_enabled() {

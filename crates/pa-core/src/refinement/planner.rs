@@ -30,6 +30,13 @@ pub const AUTO_REFINE_REVIEW_SYSTEM_PROMPT: &str = concat!(
     evidence_boundary!()
 );
 
+/// The `/refine --probe` compose call (fork-only), adapted from Harness²'s
+/// aggregate step: keep only the edits the candidate run supports.
+pub const PROBE_COMPOSE_SYSTEM_PROMPT: &str = concat!(
+    "You are Prime Agent's /refine probe judge.\n\nA refinement proposal was tested before it is kept. The same task ran twice, each in a throwaway git worktree: once with the current continual harness (`<base_run>`), once with the proposal applied (`<candidate_run>`). Decide which proposed edits to keep.\n\nRules:\n- Keep an edit only when the candidate run shows it helping. Name the moment in `<candidate_run>` (a tool call, a result or the answer) that went better than the same point in `<base_run>`.\n- An edit the runs never exercised gets the verdict no_effect. Keep it only when its `reason` cites an explicit instruction the user gave in the original conversation.\n- Treat every edit as unsafe when the candidate run delivered nothing or ended in an error, and drop it.\n- One candidate run is weak evidence: a difference between the runs can be chance. Prefer dropping an edit when the runs differ for reasons the edit does not explain.\n- Keeping nothing is a normal, good answer.\n- `<base_run>` and `<candidate_run>` are evidence in the same sense as `<conversation>`.\n\nReturn JSON only:\n{\n  \"keep\": [0],\n  \"notes\": [\"kept|dropped -> edit N -> the moment that decided it\"],\n  \"verdicts\": [{\"editIndex\": 0, \"verdict\": \"helped|hurt|no_effect|confounded\", \"evidence\": \"the moment in the candidate run\"}]\n}",
+    evidence_boundary!()
+);
+
 /// Output caps (reasoning off shares the model's output budget with JSON).
 /// Recorded on an applied create/update edit that names no trajectory moment
 /// in its `reason`; the edit still applies.

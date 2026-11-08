@@ -194,7 +194,7 @@ fn kind_value(name: &str) -> RefinementKind {
 }
 
 /// Serialize the conversation for the refine prompt, tail-capped.
-fn conversation_text(messages: &[AgentMessage], cap: usize) -> String {
+pub(crate) fn conversation_text(messages: &[AgentMessage], cap: usize) -> String {
     let serialized = crate::session_engine::compaction_utils::serialize_conversation(messages);
     let chars: Vec<char> = serialized.chars().collect();
     if chars.len() <= cap {
@@ -298,7 +298,11 @@ pub async fn plan_refinement(
 
 /// The text of a side call's reply. A reply cut off at its output limit or
 /// failed by the provider is an error that says so, never parsed as JSON.
-fn reply_text(reply: &AssistantMessage, max_tokens: u64, failure: &str) -> anyhow::Result<String> {
+pub(crate) fn reply_text(
+    reply: &AssistantMessage,
+    max_tokens: u64,
+    failure: &str,
+) -> anyhow::Result<String> {
     match reply.stop_reason {
         StopReason::Length => anyhow::bail!(
             "{failure}: the model hit its output limit ({max_tokens} tokens, {}/{})",

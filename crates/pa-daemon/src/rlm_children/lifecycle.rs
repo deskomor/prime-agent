@@ -83,6 +83,9 @@ impl SupervisorChildSessionsInner {
         runtime_metadata: Option<Value>,
         identity: &ParentIdentity,
         launch_env: Option<std::collections::BTreeMap<String, String>>,
+        // `/refine --probe`: the harness state file the child's local
+        // harness store starts from.
+        harness_seed: Option<&str>,
     ) -> Result<CreatedChild> {
         let mut config = json!({
             "cwd": cwd,
@@ -104,6 +107,9 @@ impl SupervisorChildSessionsInner {
         }
         if let Some(request_id) = spawned_by_request_id {
             config["spawnedByRequestId"] = json!(request_id);
+        }
+        if let Some(seed) = harness_seed {
+            config["harnessSeed"] = json!(seed);
         }
         // An asking parent's child asks it too.
         let parent_asks = self
@@ -208,6 +214,7 @@ impl SupervisorChildSessionsInner {
                 runtime_metadata,
                 identity,
                 launch_env,
+                None,
             )
             .await?;
         // A failed prompt tears the just-created session down (TS kills the

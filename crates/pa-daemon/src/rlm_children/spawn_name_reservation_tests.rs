@@ -163,6 +163,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         cwd: None,
         spawned_by_request_id: None,
         factory: None,
+        harness_seed: None,
     }
 }
 

@@ -32,6 +32,7 @@ pub mod provider_failover;
 pub mod provider_park;
 pub mod provider_retry;
 pub mod refine;
+pub mod refine_probe;
 mod refinement_gate;
 pub mod request_timing;
 pub mod rlm_host;
@@ -194,6 +195,9 @@ pub struct AgentSession {
     /// The host's hooks the session's own seams call (prompt start,
     /// compaction, tree navigation); the default installs none.
     host_hooks: std::sync::RwLock<host_hooks::SessionHostHooks>,
+    /// The daemon's child-session host, which `/refine --probe` runs its
+    /// two test runs through; `None` outside a daemon-backed session.
+    probe_children: Option<std::sync::Arc<dyn rlm_host::RlmSubagentHost>>,
 }
 
 impl AgentSession {
@@ -266,6 +270,7 @@ impl AgentSession {
             agent_dir: None,
             compaction_flight: tokio::sync::Mutex::new(()),
             usage_store,
+            probe_children: None,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -532,6 +537,9 @@ mod slash_session_tests;
 
 #[cfg(test)]
 mod compaction_outcome_tests;
+
+#[cfg(test)]
+mod refine_probe_tests;
 
 #[cfg(test)]
 mod compaction_unblocked_tests;

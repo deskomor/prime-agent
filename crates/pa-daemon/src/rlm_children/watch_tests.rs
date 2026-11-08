@@ -431,6 +431,7 @@ async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
             cwd: None,
             spawned_by_request_id: None,
             factory: None,
+            harness_seed: None,
         })
         .await
         .expect("spawn must succeed against the fake supervisor")
@@ -454,6 +455,7 @@ async fn a_factory_child_settles_without_a_parent_notice() {
                 spec_id: "spec".to_string(),
                 state_id: "state".to_string(),
             }),
+            harness_seed: None,
         })
         .await
         .expect("spawn must succeed against the fake supervisor");

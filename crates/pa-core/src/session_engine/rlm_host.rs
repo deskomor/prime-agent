@@ -151,6 +151,9 @@ pub struct RlmSpawnRequest {
     /// The factory run that spawned the child; the daemon records it on
     /// the child's ledger spawn edge.
     pub factory: Option<RlmFactoryTag>,
+    /// Fork-only (`/refine --probe`): a JSON harness state file the child's
+    /// local harness store starts from.
+    pub harness_seed: Option<String>,
 }
 
 /// The factory executor's run tag on a spawned child (`rlm.spawn`'s
@@ -704,6 +707,7 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
         cwd,
         spawned_by_request_id: None,
         factory,
+        harness_seed: None,
     })
 }
 

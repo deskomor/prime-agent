@@ -235,6 +235,7 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         cwd: None,
         spawned_by_request_id: None,
         factory: None,
+        harness_seed: None,
     }
 }
 
@@ -811,4 +812,100 @@ async fn parallel_same_name_subagent_creates_admit_exactly_one() {
         retry["success"].as_bool().unwrap_or(false),
         "the freed name admits again: {retry}"
     );
+}
+
+/// A `/refine --probe` run: a child spawned with a harness seed starts from
+/// that harness (its first turn's digest names the seeded memory), and the
+/// probe reads its answer through collect.
+#[tokio::test]
+async fn a_seeded_child_runs_on_its_seeded_harness() {
+    use pa_core::refinement::{
+        empty_harness_state, save_harness_state, HarnessEntry, RefinementKind,
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let script = dir.path().join("faux.json");
+    std::fs::write(
+        &script,
+        json!({ "engine": "faux", "responses": [ { "text": "probe answer" } ] }).to_string(),
+    )
+    .expect("write script");
+    let children = children(&socket, &agent_dir, &script, 0);
+    children.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("faux/faux-1".to_string()),
+        cwd: Some(dir.path().to_string_lossy().to_string()),
+        session_id: Some("parent-session-uuid".to_string()),
+        session_file: Some(agent_dir.join("parent.jsonl").to_string_lossy().to_string()),
+        thinking: None,
+        child_script: Some(script.to_string_lossy().to_string()),
+    });
+    let marker = format!("PROBE_SEED_{}", uuid::Uuid::new_v4().simple());
+    let mut seed = empty_harness_state();
+    seed.entries
+        .get_mut(&RefinementKind::Memory)
+        .expect("memory kind")
+        .insert(
+            "m1".to_string(),
+            serde_json::from_value::<HarnessEntry>(json!({
+                "id": "m1", "kind": "memory", "title": marker, "content": "Run the tests",
+                "path": "", "reference": {}, "arguments": {}, "metadata": {},
+                "source": "probe", "version": 1, "created_at": "t", "updated_at": "t"
+            }))
+            .expect("entry"),
+        );
+    let seed_dir = dir.path().join("seed");
+    save_harness_state(&seed_dir, &seed).expect("seed");
+
+    // The child's own local store starts as the seed (checked while the
+    // child lives: a delete retires its artifacts).
+    let seeded = children
+        .spawn(RlmSpawnRequest {
+            harness_seed: Some(seed_dir.to_string_lossy().to_string()),
+            ..spawn_request("refine-probe-base", "fix the build")
+        })
+        .await
+        .expect("spawn");
+    let artifacts = Path::new(&seeded.session_dir)
+        .parent()
+        .expect("children root")
+        .join("session-artifacts");
+    let store = wait_until(Duration::from_secs(10), || {
+        std::fs::read_dir(&artifacts)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path().join("harness").join("harness_state.json"))
+            .find_map(|path| std::fs::read_to_string(path).ok())
+    });
+    assert!(store.contains(&marker), "{store}");
+    let _ = children.delete_subagent(seeded.rlm_child_id).await;
+
+    // The probe's own runner drives the child: spawn, collect until it
+    // settles, read its session, delete it.
+    let host: Arc<dyn RlmSubagentHost> = Arc::new(children);
+    let seed_path = seed_dir.clone();
+    let output = pa_core::session_engine::refine_probe::rlm_probe_runner(Arc::clone(&host))(
+        pa_core::session_engine::refine_probe::ProbeChildSpec {
+            label: "candidate",
+            cwd: dir.path().to_path_buf(),
+            harness_seed: seed_path,
+            task: "fix the build".to_string(),
+            model: "faux/faux-1".to_string(),
+            timeout: Duration::from_secs(30),
+        },
+    )
+    .await
+    .expect("probe run");
+    assert_eq!(output.error, None);
+    assert_eq!(output.answer.as_deref(), Some("probe answer"));
+    let transcript = serde_json::to_string(&output.messages).expect("messages");
+    assert!(transcript.contains("[task from parent]"), "{transcript}");
+
+    // The child is retired: the roster no longer lists it.
+    let roster = host.list_subagents().await.expect("roster");
+    assert!(roster.is_empty(), "{roster:?}");
 }

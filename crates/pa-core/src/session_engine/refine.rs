@@ -338,7 +338,7 @@ pub fn local_harness_state_dir(session: &SessionManager) -> PathBuf {
 }
 
 /// Strip display-only `local:`/`global:` prefixes from edit ids.
-fn strip_display_prefixes(plan: RefinementPlan) -> RefinementPlan {
+pub(crate) fn strip_display_prefixes(plan: RefinementPlan) -> RefinementPlan {
     let mut plan = plan;
     for edit in &mut plan.proposal.edits {
         if let Some(id) = &edit.id {
@@ -425,6 +425,65 @@ pub async fn execute_refinement_with_rows(
     refine_call: crate::refinement::executor::RefinerFn,
     agent_dir: Option<&Path>,
 ) -> anyhow::Result<(RefinementResult, Vec<String>)> {
+    let RefinementTranscript {
+        messages,
+        refinement_history,
+    } = transcript;
+    let prepared = prepare_refinement(
+        session,
+        refinement_history,
+        global_harness_dir,
+        options,
+        agent_dir,
+    )
+    .await?;
+    let plan = plan_refinement(
+        messages,
+        &prepared.planning_state,
+        &prepared.history,
+        model,
+        &prepared.core_options,
+        refine_call,
+    )
+    .await?;
+    apply_prepared_refinement(
+        session,
+        prepared,
+        strip_display_prefixes(plan),
+        global_harness_dir,
+        source,
+        agent_dir,
+        None,
+    )
+    .await
+}
+
+/// Everything a refinement plans against, read before the (slow) planning
+/// call: the settings, the core options, the merged planning state and
+/// history, and the baseline that rejects concurrent writes at apply time.
+pub(crate) struct PreparedRefinement {
+    settings: Option<crate::settings::SettingsManager>,
+    pub(crate) core_options: CoreRefineOptions,
+    requested_scope: HarnessScope,
+    local_harness_dir: PathBuf,
+    pub(crate) planning_state: crate::refinement::HarnessState,
+    pub(crate) history: Vec<RefinementResult>,
+    baseline_state: crate::refinement::HarnessState,
+}
+
+/// Read the planning inputs for one refinement.
+///
+/// # Errors
+///
+/// Returns an error when refinements are disabled, or a local refinement is
+/// requested on a session without a directory.
+pub(crate) async fn prepare_refinement(
+    session: &SessionManager,
+    refinement_history: &[RefinementResult],
+    global_harness_dir: &Path,
+    options: &RefineOptions,
+    agent_dir: Option<&Path>,
+) -> anyhow::Result<PreparedRefinement> {
     let settings = match agent_dir {
         Some(dir) => {
             let cwd = session.get_cwd().to_path_buf();
@@ -443,10 +502,6 @@ pub async fn execute_refinement_with_rows(
         }
         None => None,
     };
-    let RefinementTranscript {
-        messages,
-        refinement_history,
-    } = transcript;
     let local_harness_dir = local_harness_state_dir(session);
     let core_options = CoreRefineOptions {
         global: options.global,
@@ -477,7 +532,7 @@ pub async fn execute_refinement_with_rows(
     // Planning state: global, or merged global+local for local refinements.
     let global_state = load_harness_state(global_harness_dir, HarnessScope::Global);
     let planning_state = if requested_scope == HarnessScope::Global {
-        global_state.clone()
+        global_state
     } else {
         let local_state = load_harness_state(&local_harness_dir, HarnessScope::Local);
         merge_harness_states(&global_state, Some(&local_state))
@@ -497,22 +552,46 @@ pub async fn execute_refinement_with_rows(
         HarnessScope::Local => local_harness_dir.clone(),
     };
     let baseline_state = load_harness_state(&baseline_dir, baseline_scope);
+    Ok(PreparedRefinement {
+        settings,
+        core_options,
+        requested_scope,
+        local_harness_dir,
+        planning_state,
+        history,
+        baseline_state,
+    })
+}
 
-    let mut plan = plan_refinement(
-        messages,
-        &planning_state,
-        &history,
-        model,
-        &core_options,
-        refine_call,
-    )
-    .await?;
-    plan = strip_display_prefixes(plan);
-
+/// Apply a plan made from `prepared`, persist state and history, and append
+/// the audit, outcome and notice rows. `notice_suffix` is appended to the
+/// model-facing notice.
+///
+/// # Errors
+///
+/// Returns an error when applying or persisting the refined harness state
+/// fails, or when appending the audit, outcome, or notice entries fails.
+pub(crate) async fn apply_prepared_refinement(
+    session: &mut SessionManager,
+    prepared: PreparedRefinement,
+    plan: RefinementPlan,
+    global_harness_dir: &Path,
+    source: RefinementSource,
+    agent_dir: Option<&Path>,
+    notice_suffix: Option<&str>,
+) -> anyhow::Result<(RefinementResult, Vec<String>)> {
+    let PreparedRefinement {
+        settings,
+        core_options,
+        requested_scope,
+        local_harness_dir,
+        baseline_state,
+        ..
+    } = prepared;
     let target_scope = plan.rollback_scope.unwrap_or(requested_scope);
     let target_dir = match target_scope {
         HarnessScope::Global => global_harness_dir.to_path_buf(),
-        HarnessScope::Local => local_harness_dir.clone(),
+        HarnessScope::Local => local_harness_dir,
     };
     // The factory opt-in resolves HERE — immediately before the apply,
     // after the planning request — so a setting that changed during the
@@ -576,7 +655,11 @@ pub async fn execute_refinement_with_rows(
         anyhow::bail!("refinement outcome row not persisted: {error}");
     }
     if result.applied_edits.iter().any(|edit| edit.applied) {
-        let notice = create_refinement_notice_message(&result, source);
+        let mut notice = create_refinement_notice_message(&result, source);
+        if let (Some(suffix), UserContent::Text(text)) = (notice_suffix, &mut notice.content) {
+            text.push_str("\n\n");
+            text.push_str(suffix);
+        }
         let notice_id = session.append_custom_message(
             &notice.custom_type,
             notice.content.clone(),

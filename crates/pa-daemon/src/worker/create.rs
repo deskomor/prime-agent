@@ -543,6 +543,26 @@ impl Worker {
         if !store.path.as_os_str().is_empty() {
             self.engine.set_session_file(store.path.clone());
         }
+        // A `/refine --probe` run starts from the harness its parent seeded:
+        // `harnessSeed` names a harness directory whose state becomes this
+        // session's local store. Only a fresh store is seeded, so a respawn
+        // keeps what the run itself wrote.
+        if let Some(seed) = payload.get("harnessSeed").and_then(Value::as_str) {
+            let local =
+                crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
+                    .and_then(|dir| pa_core::refinement::get_local_harness_state_dir(Some(&dir)));
+            if let Some(local) = local {
+                if !pa_core::refinement::get_harness_state_path(&local).exists() {
+                    let state = pa_core::refinement::load_harness_state(
+                        std::path::Path::new(seed),
+                        pa_core::refinement::HarnessScope::Local,
+                    );
+                    if let Err(error) = pa_core::refinement::save_harness_state(&local, &state) {
+                        return response_failure(None, "create", &error.to_string(), None);
+                    }
+                }
+            }
+        }
 
         // The `models` patterns (else settings `enabledModels`) resolve once into
         // the scoped list, AFTER the store open (the saved-model restore's wait
@@ -1006,3 +1026,70 @@ fn append_creation_prefix(
 #[cfg(test)]
 #[path = "create_collapse_tests.rs"]
 mod create_collapse_tests;
+
+#[cfg(test)]
+mod harness_seed_tests {
+    /// A `/refine --probe` child starts from its seed: `harnessSeed` names a
+    /// harness directory whose state becomes the new session's local store.
+    #[tokio::test]
+    async fn a_harness_seed_becomes_the_new_sessions_local_store() {
+        use pa_core::refinement::{
+            empty_harness_state, get_local_harness_state_dir, load_harness_state,
+            save_harness_state, HarnessEntry, HarnessScope, RefinementKind,
+        };
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions dir");
+        let mut seed = empty_harness_state();
+        seed.entries
+            .get_mut(&RefinementKind::Memory)
+            .unwrap()
+            .insert(
+                "m1".to_string(),
+                serde_json::from_value::<HarnessEntry>(serde_json::json!({
+                    "id": "m1", "kind": "memory", "title": "Tests",
+                    "content": "Run the tests before answering", "path": "",
+                    "reference": {}, "arguments": {}, "metadata": {}, "source": "probe",
+                    "version": 1, "created_at": "t", "updated_at": "t"
+                }))
+                .expect("entry"),
+            );
+        let seed_dir = dir.path().join("seed");
+        save_harness_state(&seed_dir, &seed).expect("seed saved");
+        let worker = crate::worker::Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "probe-child".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(serde_json::json!({ "responses": [] })),
+            },
+            None,
+        );
+        let created = worker
+            .dispatch(
+                "create",
+                &serde_json::json!({
+                    "cwd": "/tmp",
+                    "sessionDir": sessions,
+                    "harnessSeed": seed_dir,
+                }),
+            )
+            .await;
+        assert!(created.success, "{created:?}");
+        let artifacts = {
+            let core = worker.core.lock().unwrap();
+            let store = core.store.as_ref().expect("persisted session");
+            crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
+        };
+        let local = load_harness_state(
+            &get_local_harness_state_dir(artifacts.as_deref()).expect("local harness dir"),
+            HarnessScope::Local,
+        );
+        assert!(local.entries[&RefinementKind::Memory].contains_key("m1"));
+    }
+}

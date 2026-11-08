@@ -124,6 +124,20 @@ pub struct RefineSettings {
     /// Soft limit, in characters, for always-on prompt + memory entries shown
     /// to the refiner as `<always_on_budget>`.
     pub always_on_soft_limit: Option<u64>,
+    /// `/refine --probe` (fork-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<RefineProbeSettings>,
+}
+
+/// `refine.probe`: test a refinement on a replayed task before keeping it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineProbeSettings {
+    /// Every manual `/refine` probes, as if `--probe` were given (default
+    /// false). Automatic refinements never probe.
+    pub enabled: Option<bool>,
+    /// Wall-clock budget for each of the two probe runs (default 900000).
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

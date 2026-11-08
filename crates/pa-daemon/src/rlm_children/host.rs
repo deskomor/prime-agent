@@ -156,6 +156,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         // process, so the spawn forwards the parent
                         // worker's env (filtered) instead.
                         Some(pa_types::daemon::launch_env::collect_process_launch_env()),
+                        request.harness_seed.as_deref(),
                     )
                     .await?;
                 let record = ChildRecord {
@@ -178,7 +179,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     live_observation: None,
                     direct_observation: Arc::new(Mutex::new(())),
                     notice_delivered: false,
-                    factory: request.factory.is_some(),
+                    // A factory child and a `/refine --probe` run (the one
+                    // spawn that seeds a harness) report through collect,
+                    // so no terminal notice wakes the parent.
+                    factory: request.factory.is_some() || request.harness_seed.is_some(),
                     prompt_admitted: false,
                     error: None,
                     closed_by_parent: false,

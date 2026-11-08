@@ -276,11 +276,52 @@ async fn execute_refine(
         ));
         return Ok(());
     }
+    let probe = options.probe
+        || (options.rollback_id.is_none() && engine.session.refine_probe_by_default());
     let refine_options = RefineOptions {
         global: options.global,
         instructions: options.instructions,
         rollback_id: options.rollback_id,
     };
+    if probe {
+        let outcome = match engine
+            .session
+            .refine_probed(
+                &refine_options,
+                &super::refine_probe::ProbeRequest { task: options.task },
+                params.model,
+                params.api_key.take(),
+                params.global_harness_dir.clone(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                execution.refinement_failed = Some(format!("{error:#}"));
+                return Err(format!("{error:#}"));
+            }
+        };
+        let applied = outcome
+            .result
+            .applied_edits
+            .iter()
+            .filter(|edit| edit.applied)
+            .count();
+        execution.refinement = Some(outcome.result);
+        execution.push_message(slash_command_result(
+            command,
+            format!(
+                "Refined continual harness state: {applied} edit{} applied.\n{}",
+                if applied == 1 { "" } else { "s" },
+                outcome.notice
+            ),
+            true,
+            "info",
+            None,
+            true,
+        ));
+        return Ok(());
+    }
     let result = match engine
         .session
         .refine(

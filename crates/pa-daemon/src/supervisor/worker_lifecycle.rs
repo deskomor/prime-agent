@@ -288,6 +288,9 @@ impl Supervisor {
             "toolPermissionParent",
             // The child's host hooks run through this parent session.
             "hostHooksParent",
+            // A `/refine --probe` run's seeded local harness (read once,
+            // at the first create; a respawn keeps the store it wrote).
+            "harnessSeed",
             "systemPrompt",
             "appendSystemPrompt",
             "skills",
