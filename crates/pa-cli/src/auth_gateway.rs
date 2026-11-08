@@ -531,7 +531,12 @@ fn build_completion(
         api_key: resolved.api_key,
         headers: resolved.headers,
         max_tokens,
-        temperature: body.get("temperature").and_then(Value::as_f64),
+        // Reasoning models refuse a set temperature (Anthropic thinking needs the
+        // default); judges send 0.0 out of habit.
+        temperature: body
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .filter(|_| !model.reasoning),
         session_id: Some(uuid::Uuid::new_v4().to_string()),
         transport: Some(pa_ai::types::Transport::Sse),
         ..Default::default()
