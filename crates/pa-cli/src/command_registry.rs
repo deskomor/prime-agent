@@ -189,7 +189,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     ),
     CommandSpec::new(
         &["harness", "export"],
-        "harness export --out <dir>",
+        "harness export --out <dir> [--add <project>:<kind>:<id>] [--omit <kind>:<id>]",
         "Write the harness tree, what was exported, and the recorded verdicts",
     ),
     CommandSpec::new(

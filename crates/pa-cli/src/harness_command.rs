@@ -2,10 +2,13 @@
 //! harness optimiser such as Harness² (fork-only).
 //!
 //! Sub-verbs:
-//!   - `export --out <dir>`: write `<dir>/tree` (prompt and memory entries as
+//!   - `export --out <dir> [--add <project>:<kind>:<id>]... [--omit
+//!     <kind>:<id>]...`: write `<dir>/tree` (prompt and memory entries as
 //!     marked markdown sections, folder skills), `<dir>/export.json` (what
 //!     was exported) and `<dir>/verdicts.json` (what `/refine review` and
-//!     probes have recorded, for the optimiser to read).
+//!     probes have recorded, for the optimiser to read). `--add` and `--omit`
+//!     write the tree as it would be with a project entry promoted or a
+//!     global entry gone, so an optimiser can test that change first.
 //!   - `plan --export <dir> --seed <tree> --tree <tree> --reason <text>
 //!     --out <file>`: diff the tree an optimiser ended with against the seed
 //!     it started from and write the difference as a refinement plan.
@@ -49,8 +52,14 @@ const SKILL_BACKUPS_DIR_NAME: &str = "skill-backups";
 pub fn run_harness_command(args: &[String]) -> i32 {
     let agent_dir = crate::config::get_agent_dir();
     let result = match args.first().map(String::as_str) {
-        Some("export") => flags(&args[1..], &["--out"], &[])
-            .and_then(|flags| export(&agent_dir, Path::new(&flags.value("--out")?))),
+        Some("export") => flags(&args[1..], &["--out", "--add", "--omit"], &[]).and_then(|flags| {
+            export(
+                &agent_dir,
+                Path::new(&flags.value("--out")?),
+                &flags.values("--add"),
+                &flags.values("--omit"),
+            )
+        }),
         Some("plan") => flags(
             &args[1..],
             &["--export", "--seed", "--tree", "--reason", "--out"],
@@ -134,6 +143,15 @@ impl Flags {
             .find(|(flag, _)| flag == name)
             .and_then(|(_, value)| value.clone())
             .ok_or_else(|| format!("{name} is required"))
+    }
+
+    /// Every value of a flag that may repeat.
+    fn values(&self, name: &str) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|(flag, _)| flag == name)
+            .filter_map(|(_, value)| value.clone())
+            .collect()
     }
 
     fn has(&self, name: &str) -> bool {
@@ -290,7 +308,7 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, text + "\n").map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn export(agent_dir: &Path, out: &Path) -> Result<Value, String> {
+fn export(agent_dir: &Path, out: &Path, add: &[String], omit: &[String]) -> Result<Value, String> {
     let io = |error: std::io::Error| format!("{}: {error}", out.display());
     let tree_dir = out.join("tree");
     if tree_dir.exists() {
@@ -298,7 +316,48 @@ fn export(agent_dir: &Path, out: &Path) -> Result<Value, String> {
     }
     std::fs::create_dir_all(&tree_dir).map_err(io)?;
     let global_dir = get_global_harness_state_dir(agent_dir);
-    let state = load_harness_state(&global_dir, HarnessScope::Global);
+    let mut state = load_harness_state(&global_dir, HarnessScope::Global);
+    let kind_of = |name: &str| {
+        serde_json::from_value::<RefinementKind>(json!(name))
+            .map_err(|_| format!("unknown entry kind {name:?}"))
+    };
+    for spec in add {
+        let mut parts = spec.splitn(3, ':');
+        let (Some(key), Some(kind), Some(id)) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(format!("--add takes <project>:<kind>:<id>, got {spec:?}"));
+        };
+        plain_name("project", key)?;
+        let kind = kind_of(kind)?;
+        let project = agent_dir
+            .join(pa_core::refinement::project::PROJECTS_DIR_NAME)
+            .join(key)
+            .join(pa_core::refinement::HARNESS_STATE_DIR_NAME);
+        let entry = load_harness_state(&project, HarnessScope::Local)
+            .entries
+            .get(&kind)
+            .and_then(|entries| entries.get(id))
+            .cloned()
+            .ok_or_else(|| format!("project {key} has no {kind:?} entry {id:?}"))?;
+        state
+            .entries
+            .entry(kind)
+            .or_default()
+            .insert(id.to_string(), entry);
+    }
+    for spec in omit {
+        let Some((kind, id)) = spec.split_once(':') else {
+            return Err(format!("--omit takes <kind>:<id>, got {spec:?}"));
+        };
+        let kind = kind_of(kind)?;
+        if state
+            .entries
+            .get_mut(&kind)
+            .and_then(|entries| entries.remove(id))
+            .is_none()
+        {
+            return Err(format!("the global harness has no {kind:?} entry {id:?}"));
+        }
+    }
     for (file, text) in tree::export_sections(&state) {
         let path = tree_dir.join(file);
         if let Some(parent) = path.parent() {
@@ -719,7 +778,7 @@ mod tests {
         assert_eq!(seeded["edits"][0]["applied"], true);
 
         let out = dir.path().join("export");
-        export(&agent, &out).unwrap();
+        export(&agent, &out, &[], &[]).unwrap();
         let seed = out.join("tree");
         assert_eq!(read(&out.join("export.json"))["skills"], json!(["review"]));
         // Unchanged, the export plans nothing.
@@ -825,7 +884,7 @@ mod tests {
         append_global_verdicts(&project, &[probe]).unwrap();
 
         let out = dir.path().join("export");
-        export(&agent, &out).unwrap();
+        export(&agent, &out, &[], &[]).unwrap();
         let offered = read(&out.join("verdicts.json"))["toPromote"].clone();
         assert_eq!(
             (
@@ -835,6 +894,23 @@ mod tests {
             ),
             (json!("repo-abc123"), json!("p1"), json!("Run make lint."))
         );
+
+        // The cycle can first see the harness as it would be with the entry promoted.
+        let variant = dir.path().join("variant");
+        export(
+            &agent,
+            &variant,
+            &["repo-abc123:memory:lint".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(variant.join("tree").join(tree::MEMORY_FILE)).unwrap(),
+            "\n## Lint\n<!-- h2:id=lint -->\nRun make lint.\n<!-- /h2 -->\n"
+        );
+        assert!(!get_global_harness_state_dir(&agent)
+            .join("harness_state.json")
+            .exists());
 
         // The cycle tested it on more tasks and it held up.
         let applied = import(
@@ -878,7 +954,7 @@ mod tests {
             load_global_verdicts(&project).last().unwrap().evidence,
             "harness2 cycle 2: +0.3 on 4 tasks"
         );
-        export(&agent, &out).unwrap();
+        export(&agent, &out, &[], &[]).unwrap();
         assert_eq!(read(&out.join("verdicts.json"))["toPromote"], json!([]));
     }
 
