@@ -545,8 +545,9 @@ impl Worker {
         }
         // A `/refine --probe` run starts from the harness its parent seeded:
         // `harnessSeed` names a harness directory whose state becomes this
-        // session's local store. Only a fresh store is seeded, so a respawn
-        // keeps what the run itself wrote.
+        // session's local store. The session is pinned to that store of its
+        // own, so it neither reads nor writes its project's. Only a fresh
+        // store is seeded, so a respawn keeps what the run itself wrote.
         if let Some(seed) = payload.get("harnessSeed").and_then(Value::as_str) {
             let local =
                 crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
@@ -557,7 +558,16 @@ impl Worker {
                         std::path::Path::new(seed),
                         pa_core::refinement::HarnessScope::Local,
                     );
-                    if let Err(error) = pa_core::refinement::save_harness_state(&local, &state) {
+                    let pinned =
+                        pa_core::refinement::save_harness_state(&local, &state).and_then(|_| {
+                            Ok(std::fs::write(
+                                local.join(
+                                    pa_core::refinement::project::SESSION_STORE_MARKER_FILE_NAME,
+                                ),
+                                "",
+                            )?)
+                        });
+                    if let Err(error) = pinned {
                         return response_failure(None, "create", &error.to_string(), None);
                     }
                 }
@@ -1086,10 +1096,18 @@ mod harness_seed_tests {
             let store = core.store.as_ref().expect("persisted session");
             crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
         };
-        let local = load_harness_state(
-            &get_local_harness_state_dir(artifacts.as_deref()).expect("local harness dir"),
-            HarnessScope::Local,
+        // The seed is the session's own store, and the session is pinned to it: its
+        // local scope resolves there, not to the project store its cwd belongs to.
+        let own = get_local_harness_state_dir(artifacts.as_deref()).expect("own harness dir");
+        assert_eq!(
+            pa_core::refinement::project::resolve_local_harness_state_dir(
+                &dir.path().join("agent"),
+                std::path::Path::new("/tmp"),
+                artifacts.as_deref(),
+            ),
+            Some(own.clone())
         );
+        let local = load_harness_state(&own, HarnessScope::Local);
         assert!(local.entries[&RefinementKind::Memory].contains_key("m1"));
     }
 }

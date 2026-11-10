@@ -123,6 +123,9 @@ pub fn get_global_harness_state_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join(HARNESS_STATE_DIR_NAME)
 }
 
+/// A session's OWN harness dir, under its artifact dir. The `local` scope
+/// lives in the project store instead ([`project::resolve_local_harness_state_dir`]);
+/// only a session pinned to its own store reads and writes this one.
 #[must_use]
 pub fn get_local_harness_state_dir(session_artifact_dir: Option<&Path>) -> Option<PathBuf> {
     session_artifact_dir.map(|dir| dir.join(HARNESS_STATE_DIR_NAME))
@@ -459,6 +462,16 @@ pub fn append_global_refinement(
 /// Load the global refinement history; malformed lines are skipped.
 #[must_use]
 pub fn load_global_refinement_history(harness_state_dir: &Path) -> Vec<RefinementResult> {
+    load_refinement_history_log(harness_state_dir, HarnessScope::Global)
+}
+
+/// Load a store's refinement history log; a row without a scope gets
+/// `scope`. Malformed lines are skipped.
+#[must_use]
+pub fn load_refinement_history_log(
+    harness_state_dir: &Path,
+    scope: HarnessScope,
+) -> Vec<RefinementResult> {
     let history_path = get_refinement_history_path(harness_state_dir);
     let Ok(content) = std::fs::read_to_string(&history_path) else {
         return Vec::new();
@@ -471,7 +484,7 @@ pub fn load_global_refinement_history(harness_state_dir: &Path) -> Vec<Refinemen
         }
         if let Ok(mut result) = serde_json::from_str::<RefinementResult>(trimmed) {
             if result.scope.is_none() {
-                result.scope = Some(HarnessScope::Global);
+                result.scope = Some(scope);
             }
             results.push(result);
         }
@@ -578,6 +591,7 @@ fn scope_prefix(scope: HarnessScope, id: &str) -> String {
 pub mod executor;
 pub mod planner;
 pub mod probe;
+pub mod project;
 pub mod ranking;
 pub mod verdicts;
 

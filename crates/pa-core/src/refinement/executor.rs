@@ -426,7 +426,7 @@ pub async fn review_auto_refine(
             ),
             verdicts_section(&context.verdicts, Some(&judgeable)),
             format!("<conversation>\n{conversation}\n</conversation>"),
-            "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.".to_string(),
+            "Return shouldRefine=true when the trajectory contains evidence useful to later work in this project. Local harness edits are shared by every session of the project: prefer them for project facts and project-specific lessons, and leave current task progress, temporary blockers and current-run coordination in the conversation. Ask for global refinement only for durable lessons that hold across projects.".to_string(),
         ]
         .join("\n\n")
     };

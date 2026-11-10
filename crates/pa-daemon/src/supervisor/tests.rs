@@ -855,18 +855,20 @@ async fn saved_session_rows_count_the_sessions_stored_factory_specs() {
     session.rewrite().unwrap();
     let info = crate::session_store::read_session_info(&path).unwrap();
     let shells = std::collections::HashMap::new();
-    let specs = super::sessions::stored_factory_specs(vec![info.clone()])
+    let specs = super::sessions::stored_factory_specs(root.join("agent"), vec![info.clone()])
         .await
         .unwrap();
     assert!(saved_session_row(&info, &shells, &specs)
         .get("factorySpecs")
         .is_none());
-    let harness = pa_core::refinement::get_local_harness_state_dir(
+    let harness = pa_core::refinement::project::resolve_local_harness_state_dir(
+        &root.join("agent"),
+        std::path::Path::new("/tmp"),
         crate::scheduled_jobs::session_artifact_dir(&path, &info.id).as_deref(),
     )
     .unwrap();
     crate::test_support::write_factory_specs(&harness, &["a", "b"]);
-    let specs = super::sessions::stored_factory_specs(vec![info.clone()])
+    let specs = super::sessions::stored_factory_specs(root.join("agent"), vec![info.clone()])
         .await
         .unwrap();
     assert_eq!(
@@ -878,7 +880,7 @@ async fn saved_session_rows_count_the_sessions_stored_factory_specs() {
         let state_path = pa_core::refinement::get_harness_state_path(&harness);
         let specs = crate::test_support::assert_async_file_read(
             &state_path,
-            super::sessions::stored_factory_specs(vec![info.clone()]),
+            super::sessions::stored_factory_specs(root.join("agent"), vec![info.clone()]),
         )
         .await
         .expect("asynchronous factory spec read");
@@ -899,12 +901,17 @@ async fn a_saved_session_listing_reads_each_sessions_harness_store_once() {
     let sessions = root.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let mut counters = Vec::new();
+    // One project per session: sessions of one project share a local store.
     for specs in [&["a"][..], &["a", "b"][..]] {
-        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let cwd = root.join(format!("project-{}", specs.len()));
+        let mut session =
+            crate::session_store::SessionFile::create(&cwd.to_string_lossy(), None, 0);
         let path = sessions.join(format!("{}.jsonl", session.session_id()));
         session.set_path(path.clone());
         session.rewrite().unwrap();
-        let harness = pa_core::refinement::get_local_harness_state_dir(
+        let harness = pa_core::refinement::project::resolve_local_harness_state_dir(
+            &root.join("agent"),
+            &cwd,
             crate::scheduled_jobs::session_artifact_dir(&path, session.session_id()).as_deref(),
         )
         .unwrap();
@@ -978,7 +985,9 @@ async fn a_saved_session_listing_skips_stored_factory_specs_while_the_factory_is
     let path = sessions.join(format!("{}.jsonl", session.session_id()));
     session.set_path(path.clone());
     session.rewrite().unwrap();
-    let harness = pa_core::refinement::get_local_harness_state_dir(
+    let harness = pa_core::refinement::project::resolve_local_harness_state_dir(
+        &root.join("agent"),
+        std::path::Path::new("/tmp"),
         crate::scheduled_jobs::session_artifact_dir(&path, session.session_id()).as_deref(),
     )
     .unwrap();

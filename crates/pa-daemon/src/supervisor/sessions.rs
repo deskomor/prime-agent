@@ -230,7 +230,7 @@ impl Supervisor {
                     return true;
                 }
                 if factory_lane {
-                    count_factory_specs(info, &mut factory_specs);
+                    count_factory_specs(&agent_dir, info, &mut factory_specs);
                 }
                 let row = saved_session_row(info, &persistent_shells, &factory_specs);
                 let mut item = json!({
@@ -351,7 +351,7 @@ impl Supervisor {
             .filter(|info| !scope_current || info.cwd == cwd)
             .collect();
         if factory_lane {
-            match stored_factory_specs(merged.clone()).await {
+            match stored_factory_specs(self.options.agent_dir.clone(), merged.clone()).await {
                 Ok(specs) => factory_specs.extend(specs),
                 Err(error) => {
                     return vec![response_line(&response_failure(
@@ -867,14 +867,20 @@ fn offline_summary(worker_id: &str) -> Value {
 }
 
 /// Read one session's stored factory specs (its local harness store's factory entries) into a
-/// listing's map: a listing reads each store once, and only sessions holding specs get an entry.
+/// listing's map: a listing reads a store once per session, and only sessions holding specs get
+/// an entry.
 fn count_factory_specs(
+    agent_dir: &std::path::Path,
     info: &crate::session_store::SessionInfo,
     factory_specs: &mut std::collections::HashMap<String, usize>,
 ) {
-    let specs = crate::scheduled_jobs::session_artifact_dir(&info.path, &info.id)
-        .map_or(0, |dir| {
-            crate::factory_activity::stored_factory_spec_count(&dir)
+    let specs =
+        crate::scheduled_jobs::session_artifact_dir(&info.path, &info.id).map_or(0, |dir| {
+            crate::factory_activity::stored_factory_spec_count(
+                agent_dir,
+                std::path::Path::new(&info.cwd),
+                &dir,
+            )
         });
     if specs > 0 {
         factory_specs.insert(info.id.clone(), specs);
@@ -883,12 +889,13 @@ fn count_factory_specs(
 
 /// The sessions' stored factory specs, read off the async executor.
 pub(super) async fn stored_factory_specs(
+    agent_dir: std::path::PathBuf,
     infos: Vec<crate::session_store::SessionInfo>,
 ) -> Result<std::collections::HashMap<String, usize>> {
     tokio::task::spawn_blocking(move || {
         let mut factory_specs = std::collections::HashMap::new();
         for info in &infos {
-            count_factory_specs(info, &mut factory_specs);
+            count_factory_specs(&agent_dir, info, &mut factory_specs);
         }
         factory_specs
     })

@@ -413,7 +413,10 @@ impl AgentSession {
                 )
                 .await?,
                 session.get_cwd().to_path_buf(),
-                load_harness_state(&local_harness_state_dir(&session), HarnessScope::Local),
+                load_harness_state(
+                    &local_harness_state_dir(&session, &global_harness_dir),
+                    HarnessScope::Local,
+                ),
             )
         };
         // The git check runs before any model spend.

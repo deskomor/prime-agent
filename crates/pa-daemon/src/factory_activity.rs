@@ -29,11 +29,20 @@ pub(crate) fn factory_lane_enabled(agent_dir: &Path) -> bool {
     .get_factory_enabled()
 }
 
-/// A session's own stored factory specs: the factory entries of its local harness store, read
-/// from disk without a kernel. The global store and the runtime's shared library machines are
-/// every session's, so they never count.
-pub(crate) fn stored_factory_spec_count(session_artifact_dir: &Path) -> usize {
-    pa_core::refinement::get_local_harness_state_dir(Some(session_artifact_dir)).map_or(0, |dir| {
+/// A session's stored factory specs: the factory entries of its local harness store (its
+/// project's, or its own when pinned), read from disk without a kernel. The global store and
+/// the runtime's shared library machines are every session's, so they never count.
+pub(crate) fn stored_factory_spec_count(
+    agent_dir: &Path,
+    cwd: &Path,
+    session_artifact_dir: &Path,
+) -> usize {
+    pa_core::refinement::project::resolve_local_harness_state_dir(
+        agent_dir,
+        cwd,
+        Some(session_artifact_dir),
+    )
+    .map_or(0, |dir| {
         pa_core::refinement::load_harness_state(&dir, pa_core::refinement::HarnessScope::Local)
             .entries[&pa_core::refinement::RefinementKind::Factory]
             .len()
@@ -125,19 +134,25 @@ impl Worker {
 
     /// This session's stored factory specs; an in-memory session has none.
     async fn stored_factory_specs(&self) -> anyhow::Result<usize> {
-        let artifacts = {
+        let (artifacts, cwd) = {
             let core = self
                 .core
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            core.store.as_ref().and_then(|store| {
-                crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
-            })
+            (
+                core.store.as_ref().and_then(|store| {
+                    crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
+                }),
+                core.cwd.clone(),
+            )
         };
+        let agent_dir = self.config.agent_dir.clone();
         // Harness files may live on slow storage. Keep reads and JSON parsing
         // off the async executor used by the worker's dispatch loop.
         tokio::task::spawn_blocking(move || {
-            artifacts.as_deref().map_or(0, stored_factory_spec_count)
+            artifacts.as_deref().map_or(0, |artifacts| {
+                stored_factory_spec_count(&agent_dir, Path::new(&cwd), artifacts)
+            })
         })
         .await
         .map_err(|error| anyhow::anyhow!("factory spec reader failed: {error}"))
@@ -184,8 +199,12 @@ mod tests {
             crate::scheduled_jobs::session_artifact_dir(&store.path, store.session_id())
         };
         crate::test_support::write_factory_specs(
-            &pa_core::refinement::get_local_harness_state_dir(artifacts.as_deref())
-                .expect("local harness dir"),
+            &pa_core::refinement::project::resolve_local_harness_state_dir(
+                &agent_dir,
+                std::path::Path::new("/tmp"),
+                artifacts.as_deref(),
+            )
+            .expect("local harness dir"),
             &["a", "b"],
         );
         crate::test_support::write_factory_specs(
@@ -205,8 +224,12 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            let harness = pa_core::refinement::get_local_harness_state_dir(artifacts.as_deref())
-                .expect("local harness dir");
+            let harness = pa_core::refinement::project::resolve_local_harness_state_dir(
+                &agent_dir,
+                std::path::Path::new("/tmp"),
+                artifacts.as_deref(),
+            )
+            .expect("local harness dir");
             let state_path = pa_core::refinement::get_harness_state_path(&harness);
             let payload = serde_json::json!({ "action": "graph" });
             let slow_graph = crate::test_support::assert_async_file_read(

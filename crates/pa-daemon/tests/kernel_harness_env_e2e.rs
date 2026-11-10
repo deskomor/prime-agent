@@ -1,6 +1,6 @@
 //! Kernel harness-env e2e: a persisted session's kernel must carry the session's RLM
 //! session + local-harness dirs in its env (TS `_rlmKernelEnv`), so kernel-side
-//! `rlm.harness` writes land in the session-local store. Skips (with a note)
+//! `rlm.harness` writes land in the session's local store: its project's. Skips (with a note)
 //! without a live kernel install.
 #![cfg(unix)]
 
@@ -219,7 +219,7 @@ fn read_state(path: &Path) -> Value {
 }
 
 #[test]
-fn persistent_session_kernel_writes_the_session_local_harness_store() {
+fn persistent_session_kernel_writes_the_project_harness_store() {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
@@ -281,9 +281,19 @@ fn persistent_session_kernel_writes_the_session_local_harness_store() {
         cell_receipt["error"].as_str().unwrap_or_default()
     );
 
-    // The session-local store is the artifact dir's harness file.
+    // The local store is the project's: the one folder under the agent dir's
+    // `projects/`, not the session's artifact dir.
     let artifact_dir = dir.path().join("session-artifacts").join(session_id);
-    let local_state_file = artifact_dir.join("harness").join("harness_state.json");
+    assert!(!artifact_dir
+        .join("harness")
+        .join("harness_state.json")
+        .exists());
+    let projects: Vec<PathBuf> = std::fs::read_dir(agent_dir.join("projects"))
+        .expect("projects dir")
+        .map(|entry| entry.expect("project entry").path())
+        .collect();
+    assert_eq!(projects.len(), 1, "{projects:?}");
+    let local_state_file = projects[0].join("harness").join("harness_state.json");
     assert_stored_memory(
         &read_state(&local_state_file),
         "kernel-local-memory",

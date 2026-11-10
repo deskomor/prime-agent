@@ -392,8 +392,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 .as_deref()
                 .and_then(super::harness_digest::session_artifact_dir_for_log)
         });
-    let local_harness_dir =
-        crate::refinement::get_local_harness_state_dir(session_artifact_dir.as_deref());
+    let local_harness_dir = crate::refinement::project::resolve_local_harness_state_dir(
+        &config.agent_dir,
+        &cwd,
+        session_artifact_dir.as_deref(),
+    );
     // The only sessions whose `refine.*` host requests register and the
     // compact-trigger auto-refine may run for.
     let auto_refine_allowed = config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some();
