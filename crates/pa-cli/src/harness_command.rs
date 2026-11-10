@@ -11,7 +11,14 @@
 //!     it started from and write the difference as a refinement plan.
 //!   - `import --plan <file> [--dry-run]`: apply a plan as ONE global
 //!     refinement, through the same validation and history as `/refine`, so
-//!     `/refine rollback <id>` undoes its entries.
+//!     `/refine rollback <id>` undoes its entries. A plan may also name
+//!     project entries to promote to global or delete (`projects`) and
+//!     verdicts to record on earlier refinements (`verdicts`).
+//!   - `stage --plan <file> --cycle <name>`, `pending`, `resolve --cycle
+//!     <name> --as <applied|dismissed>`: a plan waiting for the user's
+//!     approval lives in `<global store>/pending/<name>.json`; `pending`
+//!     lists them and `resolve` files one away once it was imported or
+//!     turned down.
 //!   - `path [--cwd <dir>]`: print the global store and the project store of
 //!     a working directory.
 //!
@@ -24,6 +31,7 @@ use pa_core::refinement::executor::{
     always_on_chars, apply_refinement_plan, generate_refinement_id, RefineOptions, RefinementPlan,
     DEFAULT_ALWAYS_ON_SOFT_LIMIT,
 };
+use pa_core::refinement::planner::{RefinementEdit, RefinementProposal};
 use pa_core::refinement::verdicts::{
     append_global_verdicts, latest_verdicts, load_global_verdicts, RefinementVerdict, Verdict,
 };
@@ -34,7 +42,8 @@ use pa_core::refinement::{
 };
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: prime-agent harness <export --out <dir> | plan --export <dir> --seed <tree> --tree <tree> --reason <text> --out <file> | import --plan <file> [--dry-run] | path [--cwd <dir>]>";
+const USAGE: &str = "usage: prime-agent harness <export --out <dir> | plan --export <dir> --seed <tree> --tree <tree> --reason <text> --out <file> | import --plan <file> [--dry-run] | stage --plan <file> --cycle <name> | pending | resolve --cycle <name> --as <applied|dismissed> | path [--cwd <dir>]>";
+const PENDING_DIR_NAME: &str = "pending";
 const SKILL_BACKUPS_DIR_NAME: &str = "skill-backups";
 
 pub fn run_harness_command(args: &[String]) -> i32 {
@@ -68,6 +77,27 @@ pub fn run_harness_command(args: &[String]) -> i32 {
             let text = std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
             let cwd = std::env::current_dir().unwrap_or_default();
             import(&agent_dir, &cwd, &text, flags.has("--dry-run"))
+        }),
+        Some("stage") => flags(&args[1..], &["--plan", "--cycle"], &[]).and_then(|flags| {
+            pending(
+                &agent_dir,
+                Pending::Stage {
+                    plan: PathBuf::from(flags.value("--plan")?),
+                    cycle: flags.value("--cycle")?,
+                },
+            )
+        }),
+        Some("pending") => {
+            flags(&args[1..], &[], &[]).and_then(|_| pending(&agent_dir, Pending::List))
+        }
+        Some("resolve") => flags(&args[1..], &["--cycle", "--as"], &[]).and_then(|flags| {
+            pending(
+                &agent_dir,
+                Pending::Resolve {
+                    cycle: flags.value("--cycle")?,
+                    outcome: flags.value("--as")?,
+                },
+            )
         }),
         Some("path") => flags(&args[1..], &["--cwd"], &[]).map(|flags| {
             let cwd = flags
@@ -182,6 +212,77 @@ fn probe_kept(harness_dir: &Path, scope: HarnessScope) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// A name from a plan or the command line that becomes a path segment.
+fn plain_name(what: &str, name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.starts_with('.')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!("{what} name {name:?} is not a plain folder name"));
+    }
+    Ok(())
+}
+
+/// What to do with the plans waiting for approval.
+enum Pending {
+    Stage { plan: PathBuf, cycle: String },
+    List,
+    Resolve { cycle: String, outcome: String },
+}
+
+fn pending(agent_dir: &Path, action: Pending) -> Result<Value, String> {
+    let dir = get_global_harness_state_dir(agent_dir).join(PENDING_DIR_NAME);
+    let io = |error: std::io::Error| format!("{}: {error}", dir.display());
+    let file = |cycle: &str| plain_name("cycle", cycle).map(|()| dir.join(format!("{cycle}.json")));
+    match action {
+        Pending::Stage { plan, cycle } => {
+            let target = file(&cycle)?;
+            let text = std::fs::read_to_string(&plan)
+                .map_err(|error| format!("{}: {error}", plan.display()))?;
+            serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(&dir).map_err(io)?;
+            std::fs::write(&target, text).map_err(io)?;
+            Ok(json!({ "cycle": cycle, "path": target }))
+        }
+        Pending::List => {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            paths.sort();
+            let plans: Vec<Value> = paths
+                .iter()
+                .filter_map(|path| {
+                    let plan: Value =
+                        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+                    Some(json!({
+                        "cycle": path.file_stem()?.to_string_lossy(),
+                        "path": path,
+                        "plan": plan,
+                    }))
+                })
+                .collect();
+            Ok(json!({ "pending": plans }))
+        }
+        Pending::Resolve { cycle, outcome } => {
+            if outcome != "applied" && outcome != "dismissed" {
+                return Err(format!("--as takes applied or dismissed, got {outcome:?}"));
+            }
+            let source = file(&cycle)?;
+            let target = dir.join(&outcome).join(format!("{cycle}.json"));
+            std::fs::create_dir_all(dir.join(&outcome)).map_err(io)?;
+            std::fs::rename(&source, &target)
+                .map_err(|error| format!("{}: {error}", source.display()))?;
+            Ok(json!({ "cycle": cycle, "as": outcome, "path": target }))
+        }
+    }
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -330,20 +431,108 @@ fn import(agent_dir: &Path, cwd: &Path, plan_text: &str, dry_run: bool) -> Resul
         .and_then(|refine| refine.always_on_soft_limit)
         .unwrap_or(DEFAULT_ALWAYS_ON_SOFT_LIMIT);
     let plan_value: Value = serde_json::from_str(plan_text).map_err(|error| error.to_string())?;
-    let proposal = pa_core::refinement::planner::parse_proposal(plan_text)?;
+    let mut proposal = pa_core::refinement::planner::parse_proposal(plan_text)?;
+    let reason = plan_value["reason"]
+        .as_str()
+        .unwrap_or(&proposal.summary)
+        .to_string();
+    let global_dir = get_global_harness_state_dir(agent_dir);
+    let project_dir = |key: &str| {
+        agent_dir
+            .join(pa_core::refinement::project::PROJECTS_DIR_NAME)
+            .join(key)
+            .join(pa_core::refinement::HARNESS_STATE_DIR_NAME)
+    };
+    // Project entries: a promoted one joins the global refinement and leaves
+    // its project store; a deleted one only leaves. Checked before any write.
+    let global_before = load_harness_state(&global_dir, HarnessScope::Global);
+    let mut project_plans: Vec<(String, RefinementProposal)> = Vec::new();
+    for project in plan_value["projects"].as_array().into_iter().flatten() {
+        let key = project["project"].as_str().unwrap_or_default();
+        plain_name("project", key)?;
+        let state = load_harness_state(&project_dir(key), HarnessScope::Local);
+        let mut leaving = Vec::new();
+        for (list, promoted) in [("promote", true), ("delete", false)] {
+            for item in project[list].as_array().into_iter().flatten() {
+                let kind: RefinementKind = serde_json::from_value(item["kind"].clone())
+                    .map_err(|error| format!("project {key}: {error}"))?;
+                let id = item["id"].as_str().unwrap_or_default();
+                let entry = state
+                    .entries
+                    .get(&kind)
+                    .and_then(|entries| entries.get(id))
+                    .ok_or_else(|| format!("project {key} has no {kind:?} entry {id:?}"))?;
+                if promoted {
+                    let known = global_before
+                        .entries
+                        .get(&kind)
+                        .is_some_and(|entries| entries.contains_key(id));
+                    let mut metadata = entry.metadata.clone();
+                    metadata.insert("promotedFrom".to_string(), json!(key));
+                    proposal.edits.push(RefinementEdit {
+                        action: Some(if known {
+                            RefinementAction::Update
+                        } else {
+                            RefinementAction::Create
+                        }),
+                        kind: Some(kind),
+                        id: Some(id.to_string()),
+                        title: Some(entry.title.clone()),
+                        content: Some(entry.content.clone()),
+                        path: (!entry.path.is_empty()).then(|| entry.path.clone()),
+                        reference: Some(entry.reference.clone()),
+                        arguments: Some(entry.arguments.clone()),
+                        metadata: Some(metadata),
+                        reason: Some(format!("promoted from project {key}: {reason}")),
+                    });
+                }
+                leaving.push(RefinementEdit {
+                    action: Some(RefinementAction::Delete),
+                    kind: Some(kind),
+                    id: Some(id.to_string()),
+                    reason: Some(if promoted {
+                        format!("promoted to global: {reason}")
+                    } else {
+                        reason.clone()
+                    }),
+                    ..RefinementEdit::default()
+                });
+            }
+        }
+        if !leaving.is_empty() {
+            project_plans.push((
+                key.to_string(),
+                RefinementProposal {
+                    summary: format!("harness2: {reason}"),
+                    rationale:
+                        "Offline harness adaptation tested these project entries on more tasks."
+                            .to_string(),
+                    expected_outcome: String::new(),
+                    edits: leaving,
+                },
+            ));
+        }
+    }
+    // Verdicts on earlier refinements, each for the global log or one project's.
+    let mut verdicts: Vec<(PathBuf, RefinementVerdict)> = Vec::new();
+    for item in plan_value["verdicts"].as_array().into_iter().flatten() {
+        let dir = match item["project"].as_str() {
+            Some(key) => {
+                plain_name("project", key)?;
+                project_dir(key)
+            }
+            None => global_dir.clone(),
+        };
+        let mut verdict: RefinementVerdict =
+            serde_json::from_value(item.clone()).map_err(|error| format!("verdict: {error}"))?;
+        verdict.created_at = pa_core::session::manager::format_iso_now();
+        verdicts.push((dir, verdict));
+    }
     // Skills are checked whole before anything is written.
     let mut skills: Vec<(bool, String, Option<PathBuf>)> = Vec::new();
     for skill in plan_value["skills"].as_array().into_iter().flatten() {
         let name = skill["name"].as_str().unwrap_or_default().to_string();
-        // The name must stay inside `<agent dir>/skills`.
-        if name.is_empty()
-            || name.starts_with('.')
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err(format!("skill name {name:?} is not a plain folder name"));
-        }
+        plain_name("skill", &name)?;
         match skill["action"].as_str() {
             Some("write") => {
                 let source = PathBuf::from(skill["source"].as_str().unwrap_or_default());
@@ -380,14 +569,16 @@ fn import(agent_dir: &Path, cwd: &Path, plan_text: &str, dry_run: bool) -> Resul
         global: true,
         ..RefineOptions::default()
     };
-    let global_dir = get_global_harness_state_dir(agent_dir);
     let make_plan = || RefinementPlan {
         proposal: proposal.clone(),
         id: id.clone(),
         rollback_of: None,
         rollback_scope: None,
     };
-    let (result, chars) = if dry_run {
+    let global_edits = !proposal.edits.is_empty();
+    // Nothing to apply globally (a plan of verdicts or project deletes only)
+    // leaves no global refinement behind.
+    let (result, chars) = if dry_run || !global_edits {
         let mut state = load_harness_state(&global_dir, HarnessScope::Global);
         let result = apply_refinement_plan(&mut state, make_plan(), &options, None, false);
         (result, always_on_chars(&state))
@@ -402,11 +593,8 @@ fn import(agent_dir: &Path, cwd: &Path, plan_text: &str, dry_run: bool) -> Resul
         append_global_refinement(&global_dir, &result).map_err(|error| format!("{error:#}"))?;
         // The optimiser's own evidence: one verdict per applied edit, so
         // `/refine review` and the refiner see the offline result.
-        let evidence = format!(
-            "harness2 {}",
-            plan_value["reason"].as_str().unwrap_or(&proposal.summary)
-        );
-        let verdicts: Vec<RefinementVerdict> = result
+        let evidence = format!("harness2 {reason}");
+        let helped: Vec<RefinementVerdict> = result
             .applied_edits
             .iter()
             .filter(|edit| edit.applied)
@@ -418,9 +606,47 @@ fn import(agent_dir: &Path, cwd: &Path, plan_text: &str, dry_run: bool) -> Resul
                 created_at: pa_core::session::manager::format_iso_now(),
             })
             .collect();
-        append_global_verdicts(&global_dir, &verdicts).map_err(|error| format!("{error:#}"))?;
+        append_global_verdicts(&global_dir, &helped).map_err(|error| format!("{error:#}"))?;
         (result, chars)
     };
+    let mut project_rows = Vec::new();
+    for (key, leaving) in project_plans {
+        let dir = project_dir(&key);
+        let plan = RefinementPlan {
+            proposal: leaving,
+            id: generate_refinement_id(),
+            rollback_of: None,
+            rollback_scope: None,
+        };
+        let local = RefineOptions::default();
+        let result = if dry_run {
+            let mut state = load_harness_state(&dir, HarnessScope::Local);
+            apply_refinement_plan(&mut state, plan, &local, None, false)
+        } else {
+            let (mut result, state_path) =
+                update_harness_state(&dir, HarnessScope::Local, |state| {
+                    apply_refinement_plan(state, plan, &local, None, false)
+                })
+                .map_err(|error| format!("{error:#}"))?;
+            result.harness_state_path = state_path.to_string_lossy().to_string();
+            append_global_refinement(&dir, &result).map_err(|error| format!("{error:#}"))?;
+            result
+        };
+        project_rows.push(json!({
+            "project": key,
+            "refinementId": result.id,
+            "edits": result.applied_edits.iter().map(|edit| json!({
+                "action": edit.action, "kind": edit.kind, "id": edit.id,
+                "applied": edit.applied, "error": edit.error,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    if !dry_run {
+        for (dir, verdict) in &verdicts {
+            append_global_verdicts(dir, std::slice::from_ref(verdict))
+                .map_err(|error| format!("{error:#}"))?;
+        }
+    }
     let mut skill_rows = Vec::new();
     for (write, name, source) in &skills {
         let target = agent_dir.join(tree::SKILLS_DIR).join(name);
@@ -445,8 +671,10 @@ fn import(agent_dir: &Path, cwd: &Path, plan_text: &str, dry_run: bool) -> Resul
     }
     let over = chars as u64 > soft_limit;
     Ok(json!({
-        "refinementId": id,
+        "refinementId": global_edits.then_some(id),
         "dryRun": dry_run,
+        "projects": project_rows,
+        "verdicts": verdicts.len(),
         "summary": result.summary,
         "edits": result.applied_edits.iter().map(|edit| json!({
             "action": edit.action, "kind": edit.kind, "id": edit.id,
@@ -565,5 +793,134 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("not a plain folder name"), "{error}");
         assert!(!get_global_harness_state_dir(&agent).exists());
+    }
+
+    #[test]
+    fn a_probe_kept_project_entry_is_offered_then_promoted_to_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = agent.join("projects/repo-abc123/harness");
+        // A project refinement that a probe kept.
+        let plan = RefinementPlan {
+            proposal: pa_core::refinement::planner::parse_proposal(
+                r#"{"summary":"lint","edits":[{"action":"create","kind":"memory","id":"lint","title":"Lint","content":"Run make lint.","reason":"r"}]}"#,
+            )
+            .unwrap(),
+            id: "p1".to_string(),
+            rollback_of: None,
+            rollback_scope: None,
+        };
+        let (result, _) = update_harness_state(&project, HarnessScope::Local, |state| {
+            apply_refinement_plan(state, plan, &RefineOptions::default(), None, false)
+        })
+        .unwrap();
+        append_global_refinement(&project, &result).unwrap();
+        let probe = RefinementVerdict {
+            refinement_id: "p1".to_string(),
+            edit_id: Some("lint".to_string()),
+            verdict: Verdict::Helped,
+            evidence: "probe: kept [0], dropped [] of 1 proposed edits".to_string(),
+            created_at: String::new(),
+        };
+        append_global_verdicts(&project, &[probe]).unwrap();
+
+        let out = dir.path().join("export");
+        export(&agent, &out).unwrap();
+        let offered = read(&out.join("verdicts.json"))["toPromote"].clone();
+        assert_eq!(
+            (
+                offered[0]["project"].clone(),
+                offered[0]["refinements"][0]["refinementId"].clone(),
+                offered[0]["refinements"][0]["entries"][0]["content"].clone()
+            ),
+            (json!("repo-abc123"), json!("p1"), json!("Run make lint."))
+        );
+
+        // The cycle tested it on more tasks and it held up.
+        let applied = import(
+            &agent,
+            dir.path(),
+            &json!({
+                "summary": "harness2: cycle 2", "reason": "cycle 2: +0.3 on 4 tasks", "edits": [],
+                "projects": [{ "project": "repo-abc123", "promote": [{ "kind": "memory", "id": "lint" }] }],
+                "verdicts": [{
+                    "project": "repo-abc123", "refinementId": "p1", "editId": "lint",
+                    "verdict": "helped", "evidence": "harness2 cycle 2: +0.3 on 4 tasks",
+                }],
+            })
+            .to_string(),
+            false,
+        )
+        .unwrap();
+        let global = get_global_harness_state_dir(&agent);
+        let promoted = &load_harness_state(&global, HarnessScope::Global).entries
+            [&RefinementKind::Memory]["lint"];
+        assert_eq!(
+            (
+                promoted.content.as_str(),
+                promoted.metadata["promotedFrom"].clone()
+            ),
+            ("Run make lint.", json!("repo-abc123"))
+        );
+        assert!(
+            load_harness_state(&project, HarnessScope::Local).entries[&RefinementKind::Memory]
+                .is_empty()
+        );
+        // The project's own history can undo its half, and its log holds the offline verdict.
+        assert_eq!(
+            load_refinement_history_log(&project, HarnessScope::Local)
+                .last()
+                .unwrap()
+                .id,
+            applied["projects"][0]["refinementId"].as_str().unwrap()
+        );
+        assert_eq!(
+            load_global_verdicts(&project).last().unwrap().evidence,
+            "harness2 cycle 2: +0.3 on 4 tasks"
+        );
+        export(&agent, &out).unwrap();
+        assert_eq!(read(&out.join("verdicts.json"))["toPromote"], json!([]));
+    }
+
+    #[test]
+    fn a_staged_plan_waits_until_it_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let plan = dir.path().join("plan.json");
+        std::fs::write(&plan, r#"{"summary":"harness2: cycle 1","edits":[]}"#).unwrap();
+        let stage = |cycle: &str| {
+            pending(
+                &agent,
+                Pending::Stage {
+                    plan: plan.clone(),
+                    cycle: cycle.to_string(),
+                },
+            )
+        };
+        stage("2026-11-10-a").unwrap();
+        stage("2026-11-10-b").unwrap();
+        assert!(stage("../escape")
+            .unwrap_err()
+            .contains("not a plain folder name"));
+
+        pending(
+            &agent,
+            Pending::Resolve {
+                cycle: "2026-11-10-a".to_string(),
+                outcome: "dismissed".to_string(),
+            },
+        )
+        .unwrap();
+        let waiting = pending(&agent, Pending::List).unwrap();
+        let global = get_global_harness_state_dir(&agent);
+        assert_eq!(
+            waiting,
+            json!({ "pending": [{
+                "cycle": "2026-11-10-b",
+                "path": global.join("pending/2026-11-10-b.json"),
+                "plan": { "summary": "harness2: cycle 1", "edits": [] },
+            }] })
+        );
+        assert!(global.join("pending/dismissed/2026-11-10-a.json").is_file());
     }
 }

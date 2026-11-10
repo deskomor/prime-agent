@@ -1,0 +1,1 @@
+- `prime-agent harness import` can now promote project entries to the global harness, delete project entries and record verdicts on earlier refinements, and `prime-agent harness stage|pending|resolve` keep a plan in `<agent dir>/harness/pending/` until it is approved or turned down.

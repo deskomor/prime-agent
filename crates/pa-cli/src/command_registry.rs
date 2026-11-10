@@ -181,7 +181,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     ),
     CommandSpec::new(
         &["harness"],
-        "harness <export|plan|import|path>",
+        "harness <export|plan|import|stage|pending|resolve|path>",
         "Move the global harness to and from a file tree",
     )
     .description(
@@ -201,6 +201,21 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         &["harness", "import"],
         "harness import --plan <file> [--dry-run]",
         "Apply a plan as one global refinement",
+    ),
+    CommandSpec::new(
+        &["harness", "stage"],
+        "harness stage --plan <file> --cycle <name>",
+        "Keep a plan for approval instead of applying it",
+    ),
+    CommandSpec::new(
+        &["harness", "pending"],
+        "harness pending",
+        "List the plans waiting for approval",
+    ),
+    CommandSpec::new(
+        &["harness", "resolve"],
+        "harness resolve --cycle <name> --as <applied|dismissed>",
+        "File a waiting plan away once it was imported or turned down",
     ),
     CommandSpec::new(
         &["harness", "path"],
