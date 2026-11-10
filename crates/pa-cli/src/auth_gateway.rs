@@ -1,4 +1,4 @@
-//! `prime-agent auth-gateway`: a loopback OpenAI chat-completions endpoint over
+//! `prime-agent auth-gateway`: a loopback `OpenAI` chat-completions endpoint over
 //! this agent dir's logins (fork-only).
 //!
 //! A benchmark judge, or any tool that only speaks the `OpenAI` wire format,
@@ -431,7 +431,6 @@ async fn chat_completions(body: &[u8], backend: &dyn Backend) -> Response {
     if reply.stop_reason == StopReason::Error || reply.stop_reason == StopReason::Aborted {
         let message = reply
             .error_message
-            .clone()
             .unwrap_or_else(|| "the provider returned an error".to_string());
         return Response::error(502, "upstream_error", &message);
     }
