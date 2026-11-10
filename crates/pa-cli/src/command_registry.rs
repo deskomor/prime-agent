@@ -180,6 +180,34 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         "Print the gateway bearer token, creating it on first use",
     ),
     CommandSpec::new(
+        &["harness"],
+        "harness <export|plan|import|path>",
+        "Move the global harness to and from a file tree",
+    )
+    .description(
+        "For an offline harness optimiser. Export the prompt and memory entries and folder skills as files, turn an optimised tree into a plan, and import the plan as one global refinement that `/refine rollback` can undo.",
+    ),
+    CommandSpec::new(
+        &["harness", "export"],
+        "harness export --out <dir>",
+        "Write the harness tree, what was exported, and the recorded verdicts",
+    ),
+    CommandSpec::new(
+        &["harness", "plan"],
+        "harness plan --export <dir> --seed <tree> --tree <tree> --reason <text> --out <file>",
+        "Write the difference between two trees as a refinement plan",
+    ),
+    CommandSpec::new(
+        &["harness", "import"],
+        "harness import --plan <file> [--dry-run]",
+        "Apply a plan as one global refinement",
+    ),
+    CommandSpec::new(
+        &["harness", "path"],
+        "harness path [--cwd <dir>]",
+        "Print the global harness store and a folder's project store",
+    ),
+    CommandSpec::new(
         &["mcp"],
         "mcp <add|list|get|remove>",
         "Manage user MCP servers",

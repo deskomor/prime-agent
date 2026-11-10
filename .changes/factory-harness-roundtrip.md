@@ -1,0 +1,1 @@
+- Added `prime-agent harness export|plan|import|path`: the global harness (prompt and memory entries, folder skills) can go out as a file tree for an offline harness optimiser and come back as one global refinement that `/refine rollback` undoes. Replaced or deleted skill folders are backed up under the harness store, not rolled back.

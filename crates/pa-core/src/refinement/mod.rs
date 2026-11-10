@@ -593,6 +593,7 @@ pub mod planner;
 pub mod probe;
 pub mod project;
 pub mod ranking;
+pub mod tree;
 pub mod verdicts;
 
 // Export the compact-text helper for the digest formatter.
