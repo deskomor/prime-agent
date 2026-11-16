@@ -96,6 +96,13 @@ impl Worker {
         // the in-flight turn's fetch cancels now, not at its next event.
         self.engine.abort_in_flight_turn();
         self.work_notify.notify_one();
+        self.host_hooks
+            .bounded_shutdown(json!({
+                "type": "session_shutdown",
+                "reason": "quit",
+                "daemonShutdown": daemon_wide,
+            }))
+            .await;
         // The settle + teardown must happen before the exit this reply unlocks:
         // `std::process` exit runs no destructors, so an undisposed kernel
         // would be orphaned (the #235 leak class).

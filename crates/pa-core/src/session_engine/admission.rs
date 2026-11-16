@@ -80,12 +80,37 @@ impl AgentSession {
         images: Vec<pa_agent::types::ImageContent>,
         options: PromptOptions,
     ) -> anyhow::Result<PromptOutcome> {
+        let busy = self.agent.state().await.is_streaming;
+        let host_inventory = if !busy && self.classify_session_command(text).is_none() {
+            let prepared = self
+                .host_resources
+                .write()
+                .expect("host resources lock")
+                .prepared_inventory
+                .take();
+            let hooks = self.host_hooks.read().expect("host hooks lock").clone();
+            match prepared.filter(|inventory| {
+                hooks
+                    .contract_v1
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                    && inventory.owner.as_ref().is_some_and(|(epoch, expected)| {
+                        std::sync::Arc::ptr_eq(epoch, &hooks.contract_epoch)
+                            && epoch.load(std::sync::atomic::Ordering::SeqCst) == *expected
+                    })
+            }) {
+                Some(inventory) => inventory,
+                None => self.refresh_host_resources().await,
+            }
+        } else {
+            super::host_resources::HostResourceInventory::default()
+        };
+        let skills = self.effective_skills();
         let expand = options.expand_prompt_templates.unwrap_or(true);
         // TS `_finishSubmissionNormalization` order: skill commands expand first, prompt templates
         // second; both are gated by the same policy flag.
         let (normalized, used_skill) = if expand {
-            let (skill_expanded, used_skill) =
-                crate::skills::expand_skill_command(text, &self.skills);
+            let (skill_expanded, used_skill) = crate::skills::expand_skill_command(text, &skills);
             let normalized =
                 crate::skills::expand_prompt_template(&skill_expanded, &self.prompt_templates);
             (normalized, used_skill)
@@ -97,8 +122,6 @@ impl AgentSession {
             return Ok(PromptOutcome::SessionCommand(command));
         }
 
-        let state = self.agent.state().await;
-        let busy = state.is_streaming;
         // The `skill_use_count` session counter counts at the admission
         // seam: an admitted user turn whose text IS a skill block counts
         // once. A pre-expanded block (the daemon emits the accepted row
@@ -106,7 +129,7 @@ impl AgentSession {
         // skill identity.
         let skill_used = used_skill.is_some()
             || pa_types::skill_blocks::parse_skill_block(&normalized)
-                .is_some_and(|block| self.skills.iter().any(|skill| skill.name == block.name));
+                .is_some_and(|block| skills.iter().any(|skill| skill.name == block.name));
         if skill_used {
             if let Some(telemetry) = &self.skill_telemetry {
                 telemetry.note_skill_used();
@@ -135,10 +158,30 @@ impl AgentSession {
             // downgrading the images to placeholders.
             self.apply_image_model_routing(&images, &options.batch)
                 .await?;
-            // The host's `before_agent_start` runs before the prompt row
-            // exists: its answer appends to this run's system prompt.
+            let inventory = host_inventory
+                .owner
+                .as_ref()
+                .filter(|(epoch, expected)| {
+                    epoch.load(std::sync::atomic::Ordering::SeqCst) == *expected
+                        && self
+                            .host_hook(|hooks| hooks.contract_v1.clone())
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                })
+                .map_or("", |_| host_inventory.prompt.as_str());
+            // The host's `before_agent_start` sees native and discovered skill inventory.
             if let Some(hook) = self.host_hook(|hooks| hooks.before_agent_start.clone()) {
-                let system_prompt = self.agent.state().await.system_prompt;
+                let owner = self
+                    .host_hook(|hooks| hooks.contract_v1.clone())
+                    .filter(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                    .and_then(|_| {
+                        self.host_hook(|hooks| Some(std::sync::Arc::clone(&hooks.contract_epoch)))
+                    })
+                    .map(|epoch| {
+                        let expected = epoch.load(std::sync::atomic::Ordering::SeqCst);
+                        (epoch, expected)
+                    });
+                let native_prompt = self.agent.state().await.system_prompt;
+                let system_prompt = format!("{native_prompt}{inventory}");
                 let answer = hook(serde_json::json!({
                     "prompt": normalized,
                     "systemPrompt": system_prompt,
@@ -151,7 +194,32 @@ impl AgentSession {
                     .and_then(serde_json::Value::as_str)
                     .filter(|text| !text.trim().is_empty())
                     .map(str::to_string);
-                self.agent.set_system_prompt_suffix(append).await;
+                let replacement = owner
+                    .is_some()
+                    .then_some(answer.as_ref())
+                    .flatten()
+                    .and_then(|answer| answer.get("systemPrompt"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let append = if replacement.is_none() {
+                    let combined = match append {
+                        Some(append) if inventory.is_empty() => append,
+                        Some(append) => format!("{inventory}\n\n{append}"),
+                        None => inventory.to_string(),
+                    };
+                    (!combined.trim().is_empty()).then_some(combined)
+                } else {
+                    None
+                };
+                self.agent.set_host_prompt(replacement, append, owner).await;
+            } else if host_inventory.owner.is_some() {
+                self.agent
+                    .set_host_prompt(
+                        None,
+                        (!inventory.trim().is_empty()).then(|| inventory.to_string()),
+                        host_inventory.owner,
+                    )
+                    .await;
             }
             // The turn's prompt messages: the deferred first-turn harness
             // digest rides first when one is due, streamed ahead of the user
@@ -169,7 +237,7 @@ impl AgentSession {
             for row in &options.batch {
                 let row_text = if expand {
                     let (skill_expanded, _) =
-                        crate::skills::expand_skill_command(&row.text, &self.skills);
+                        crate::skills::expand_skill_command(&row.text, &skills);
                     crate::skills::expand_prompt_template(&skill_expanded, &self.prompt_templates)
                 } else {
                     row.text.clone()

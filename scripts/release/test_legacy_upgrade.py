@@ -168,7 +168,7 @@ def exercise(installer: Path, archive: Path, previous: Path | None, root: Path, 
         if previous:
             steps.append(execute(["sh", str(installer), previous_version], env))
             probe = execute([str(public), "--version"], env)
-            assert probe["stdout"].strip() == previous_version, probe
+            assert probe["stdout"].partition("\n")[0].strip() == previous_version, probe
             steps.append(probe)
             old_target = os.readlink(active)
             old_binary_hash = digest(active.resolve())
@@ -184,7 +184,7 @@ def exercise(installer: Path, archive: Path, previous: Path | None, root: Path, 
         update_command = [str(public), "update"] if entrypoint == "cli" else ["sh", str(installer), version]
         steps.append(execute(update_command, env))
         probe = execute([str(public), "--version"], env)
-        assert probe["stdout"].strip() == version, probe
+        assert probe["stdout"].partition("\n")[0].strip() == version, probe
         steps.append(probe)
         steps.append(execute([str(public), "--help"], env))
         assert digest(active.resolve()) == digest(public.resolve()), "Public command does not resolve to activated executable"
@@ -205,7 +205,7 @@ def exercise(installer: Path, archive: Path, previous: Path | None, root: Path, 
             steps.append(execute([str(public), "update"], env))
             probe = execute([str(public), "--version"], env)
             steps.append(probe)
-            if probe["stdout"].strip() != next_version:
+            if probe["stdout"].partition("\n")[0].strip() != next_version:
                 raise RuntimeError(json.dumps({"error": "Second update did not advance the original public command", "expected_version": next_version, "steps": steps}))
             for relative, contents in witnesses.items():
                 assert (state / relative).read_text() == contents, f"Second update changed user state: {relative}"

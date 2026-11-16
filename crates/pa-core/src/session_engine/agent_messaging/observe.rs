@@ -2,6 +2,7 @@
 //! observe summary and preview types, the controller trait, the limit
 //! clamps, and the host-handler registration.
 use super::{host_handler, json, AgentFamilyRelationship, Future, HostRequestHandlers, Value};
+use crate::kernel::shared::{family_session_allowed, family_session_scope_active};
 
 /// The family lifecycle status every observation row carries: `running`
 /// while the agent has work in flight, `idle` for a resident-but-quiet
@@ -349,6 +350,41 @@ fn preview_value(preview: &AgentObserveMessagePreview) -> Value {
     })
 }
 
+/// Resolve only inside the authorized roster, then pass a durable ID to the controller.
+async fn scoped_observe_target<C: AgentObserveController>(
+    controller: &C,
+    target: &str,
+) -> anyhow::Result<String> {
+    if !family_session_scope_active() {
+        return Ok(target.to_string());
+    }
+    let list = controller.list_agents().await?;
+    let mut agents: Vec<_> = std::iter::once(list.current)
+        .chain(list.agents)
+        .filter(|agent| family_session_allowed(&agent.session_id))
+        .collect();
+    if let Some(index) = agents
+        .iter()
+        .position(|agent| agent.active_session_id.as_deref() == Some(target))
+    {
+        return Ok(agents.swap_remove(index).session_id);
+    }
+    let normalize = |id: &str| id.replace('-', "").to_lowercase();
+    let suffix = normalize(target);
+    agents.retain(|agent| {
+        let id_matches = |id: &str| !suffix.is_empty() && normalize(id).ends_with(&suffix);
+        id_matches(&agent.session_id)
+            || agent.active_session_id.as_deref().is_some_and(id_matches)
+            || agent.session_name.as_deref() == Some(target)
+            || agent.rlm_child_id.as_deref() == Some(target)
+    });
+    match agents.as_slice() {
+        [agent] => Ok(agent.session_id.clone()),
+        [] => anyhow::bail!("agent {target} is not reachable"),
+        _ => anyhow::bail!("agent selector {target} is ambiguous"),
+    }
+}
+
 /// Register `agent_observe.*` handlers onto a handler map.
 pub fn register_agent_observe_host_handlers<C: AgentObserveController + 'static>(
     controller: std::sync::Arc<C>,
@@ -361,7 +397,8 @@ pub fn register_agent_observe_host_handlers<C: AgentObserveController + 'static>
             move |_payload| {
                 let controller = controller.clone();
                 Box::pin(async move {
-                    let list = controller.list_agents().await?;
+                    let mut list = controller.list_agents().await?;
+                    list.agents.retain(|agent| family_session_allowed(&agent.session_id));
                     Ok(json!({
                         "current": list.current.to_value(),
                         "agents": list.agents.iter().map(AgentObserveSummary::to_value).collect::<Vec<_>>(),
@@ -380,7 +417,8 @@ pub fn register_agent_observe_host_handlers<C: AgentObserveController + 'static>
                     let Some(target) = payload.data.get("target").and_then(Value::as_str) else {
                         return Err(anyhow::anyhow!("agent_observe.get target must be a string"));
                     };
-                    let Some(agent) = controller.get_agent(target).await? else {
+                    let target = scoped_observe_target(controller.as_ref(), target).await?;
+                    let Some(agent) = controller.get_agent(&target).await? else {
                         anyhow::bail!("agent {target} is not reachable");
                     };
                     Ok(json!({ "agent": agent.to_value() }))
@@ -406,13 +444,10 @@ pub fn register_agent_observe_host_handlers<C: AgentObserveController + 'static>
                         serde_json::from_value(payload.data.clone()).map_err(|error| {
                             anyhow::anyhow!("agent_observe.session_messages is invalid: {error}")
                         })?;
+                    let target =
+                        scoped_observe_target(controller.as_ref(), &request.target).await?;
                     controller
-                        .session_messages(
-                            &request.target,
-                            request.start,
-                            request.limit,
-                            request.roles,
-                        )
+                        .session_messages(&target, request.start, request.limit, request.roles)
                         .await
                 })
             }
@@ -437,9 +472,10 @@ pub fn register_agent_observe_host_handlers<C: AgentObserveController + 'static>
                         .or_else(|| payload.data.get("maxChars")),
                     "agent_observe.recent max_chars",
                 )?;
+                let target = scoped_observe_target(controller.as_ref(), target).await?;
                 let recent = controller
                     .recent_messages(
-                        target,
+                        &target,
                         normalize_observe_limit(limit)?,
                         normalize_observe_max_chars(max_chars)?,
                     )

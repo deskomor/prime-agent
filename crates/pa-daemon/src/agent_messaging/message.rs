@@ -112,6 +112,9 @@ impl AgentMessageController for LinkAgentMessageController {
             }) {
                 let child = children.swap_remove(position);
                 let mut member = child_member(&child, name);
+                if !session_id.is_empty() {
+                    member.session_id = session_id.to_string();
+                }
                 // A worker replacement keeps the durable ids but swaps the live one: the member
                 // keys on the row's CURRENT live id so role-addressed sends hit the live worker.
                 if active_session_id != child.active_session_id {
@@ -125,6 +128,7 @@ impl AgentMessageController for LinkAgentMessageController {
             if row_is_parent(&session, &identity) {
                 parent_member = Some(AgentFamilyMember {
                     relationship: AgentFamilyRelationship::Parent,
+                    session_id: session_id.to_string(),
                     id: active_session_id,
                     name,
                     aliases: (!session_id.is_empty())
@@ -149,6 +153,7 @@ impl AgentMessageController for LinkAgentMessageController {
                 }
                 child_members.push(AgentFamilyMember {
                     relationship: AgentFamilyRelationship::Child,
+                    session_id: session_id.to_string(),
                     id: active_session_id,
                     name,
                     aliases,
@@ -163,6 +168,7 @@ impl AgentMessageController for LinkAgentMessageController {
             }
             siblings.push(AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Sibling,
+                session_id: session_id.to_string(),
                 id: active_session_id,
                 name,
                 // The persisted session id also addresses a sibling.
@@ -394,6 +400,7 @@ fn child_member(
     }
     AgentFamilyMember {
         relationship: AgentFamilyRelationship::Child,
+        session_id: child.session_id.clone().unwrap_or_default(),
         id: child.active_session_id.clone(),
         name: name.or_else(|| (!child.session_name.is_empty()).then(|| child.session_name.clone())),
         aliases,

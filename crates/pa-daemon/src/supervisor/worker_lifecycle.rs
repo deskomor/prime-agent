@@ -109,6 +109,39 @@ impl Supervisor {
         owner_client_id: Option<String>,
         family_seed_owner: RosterFamilySeedOwner,
     ) -> Result<(Arc<ResidentWorker>, Value)> {
+        let mut owned_create = create.clone();
+        let inherited_owner = if let DaemonCommand::Create { config, .. } = &owned_create {
+            config
+                .as_ref()
+                .and_then(|config| config.get("hostHooksParent"))
+                .and_then(|hooks| hooks.get("hostOwnerToken"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let _owner_admission = if inherited_owner.is_some() {
+            Some(self.host_owner_admission.lock().await)
+        } else {
+            None
+        };
+        if let Some(token) = inherited_owner
+            .as_deref()
+            .filter(|owner| owner.starts_with("supervisor:"))
+        {
+            if !self.active_host_owners.lock().unwrap().contains(token) {
+                if let DaemonCommand::Create {
+                    config: Some(config),
+                    ..
+                } = &mut owned_create
+                {
+                    if let Some(config) = config.as_object_mut() {
+                        config.remove("hostHooksParent");
+                    }
+                }
+            }
+        }
+        let create = &owned_create;
         let DaemonCommand::Create {
             session_path,
             continue_recent,
@@ -288,6 +321,10 @@ impl Supervisor {
             "toolPermissionParent",
             // The child's host hooks run through this parent session.
             "hostHooksParent",
+            // Host-authorized Studio MCP servers are rebound to the child by create.
+            "studioHostContractVersion",
+            "studioMcpServers",
+            "studioMcpParentSessionId",
             // A `/refine --probe` run's seeded local harness (read once,
             // at the first create; a respawn keeps the store it wrote).
             "harnessSeed",

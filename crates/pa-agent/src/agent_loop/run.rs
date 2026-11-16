@@ -95,11 +95,15 @@ pub(crate) async fn run_loop(
                 .collect::<Vec<ToolCall>>();
 
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
+            let mut tool_execution = config.tool_execution;
+            let mut tool_exchanges = Vec::new();
             has_more_tool_calls = false;
             if !tool_calls.is_empty() {
                 let executed_tool_batch =
                     execute_tool_calls(current_context, &message, config, signal, emit).await?;
                 tool_results.extend(executed_tool_batch.messages);
+                tool_execution = executed_tool_batch.tool_execution;
+                tool_exchanges = executed_tool_batch.exchanges;
                 has_more_tool_calls = !executed_tool_batch.terminate;
 
                 for result in &tool_results {
@@ -125,6 +129,8 @@ pub(crate) async fn run_loop(
             last_turn = Some(ShouldStopAfterTurnContext {
                 message: message.clone(),
                 tool_results: tool_results.clone(),
+                tool_execution,
+                tool_exchanges,
                 context: clone_context(current_context),
                 new_messages: new_messages.clone(),
             });

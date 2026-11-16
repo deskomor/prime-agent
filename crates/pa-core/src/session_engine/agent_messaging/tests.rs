@@ -211,33 +211,38 @@ fn family() -> Vec<AgentFamilyMember> {
     vec![
         AgentFamilyMember {
             relationship: AgentFamilyRelationship::Parent,
+            session_id: "parent-1".to_string(),
             id: "parent-1".to_string(),
             name: None,
             aliases: Vec::new(),
         },
         AgentFamilyMember {
             relationship: AgentFamilyRelationship::Sibling,
+            session_id: "sib-1".to_string(),
             id: "sib-1".to_string(),
             name: Some("scout".to_string()),
             aliases: Vec::new(),
         },
         AgentFamilyMember {
             relationship: AgentFamilyRelationship::Sibling,
+            session_id: "sib-2".to_string(),
             id: "sib-2".to_string(),
             name: None,
             aliases: Vec::new(),
         },
         AgentFamilyMember {
             relationship: AgentFamilyRelationship::Child,
+            session_id: "sess-kid1".to_string(),
             id: "kid-1".to_string(),
             name: Some("dual".to_string()),
             aliases: vec!["sub-kid1".to_string(), "sess-kid1".to_string()],
         },
         AgentFamilyMember {
             relationship: AgentFamilyRelationship::Child,
+            session_id: "kid-2".to_string(),
             id: "kid-2".to_string(),
             name: Some("dual".to_string()),
-            aliases: Vec::new(),
+            aliases: vec!["sub-kid2".to_string()],
         },
     ]
 }
@@ -413,6 +418,7 @@ async fn broadcast_without_family_is_empty_and_failures_settle() {
         ) -> impl std::future::Future<Output = anyhow::Result<Vec<AgentFamilyMember>>> {
             std::future::ready(Ok(vec![AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Sibling,
+                session_id: "sib-1".to_string(),
                 id: "sib-1".to_string(),
                 name: None,
                 aliases: Vec::new(),
@@ -601,4 +607,61 @@ async fn observe_recent_returns_the_ts_envelope() {
     assert_eq!(response["maxChars"], 90);
     assert_eq!(response["truncated"], true);
     assert_eq!(response["messages"].as_array().map(Vec::len), Some(3));
+}
+
+#[tokio::test]
+async fn host_scope_filters_message_family_before_selector_and_broadcast() {
+    let mut handlers = HostRequestHandlers::new();
+    register_agent_message_host_handlers(
+        std::sync::Arc::new(RecordingMessageController),
+        &mut handlers,
+    );
+    let gate: crate::session_engine::host_hooks::HostCallGateFn =
+        std::sync::Arc::new(|_, _| Box::pin(async { Ok(Some(vec!["sess-kid1".to_string()])) }));
+    let handlers = handlers.gated(&gate);
+    let send = handlers.get("agent_message.send").unwrap();
+    // Only the authorized child remains, so the duplicate name is unambiguous.
+    let reply = send_request(
+        send,
+        json!({"receiver_role": "child", "receiver_name": "dual", "message": "hi"}),
+    )
+    .unwrap();
+    assert_eq!(reply["target"]["activeSessionId"], "kid-1");
+    let reply = send_request(send, json!({"target": "all", "message": "hi"})).unwrap();
+    assert_eq!(reply["receipts"].as_array().unwrap().len(), 1);
+    let error = send_request(send, json!({"receiver_role": "child", "receiver_name": "sub-kid2", "message": "hi", "scope": {"sessionIds": ["kid-2"]}})).unwrap_err();
+    assert!(error.to_string().contains("No child matches"));
+}
+
+#[tokio::test]
+async fn host_scope_limits_observe_roster_and_alias_reads() {
+    let mut handlers = HostRequestHandlers::new();
+    register_agent_observe_host_handlers(
+        std::sync::Arc::new(StaticObserveController),
+        &mut handlers,
+    );
+    let gate: crate::session_engine::host_hooks::HostCallGateFn = std::sync::Arc::new(|_, data| {
+        Box::pin(async move {
+            Ok(Some(if data.get("authorize") == Some(&Value::Bool(true)) {
+                vec!["sess-kid-1".to_string()]
+            } else {
+                Vec::new()
+            }))
+        })
+    });
+    let handlers = handlers.gated(&gate);
+    let list = handlers.get("agent_observe.list").unwrap();
+    assert_eq!(send_request(list, json!({})).unwrap()["agents"], json!([]));
+    assert_eq!(
+        send_request(list, json!({"authorize": true})).unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let recent = handlers.get("agent_observe.recent").unwrap();
+    assert!(send_request(recent, json!({"target": "sub-kid-1", "authorize": true})).is_ok());
+    for target in ["kid-1", "sess-kid-1", "sub-kid-1"] {
+        assert!(send_request(recent, json!({"target": target})).is_err());
+    }
 }

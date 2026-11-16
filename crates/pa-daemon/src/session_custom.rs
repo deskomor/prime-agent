@@ -14,7 +14,7 @@ const SESSION_ACTION_RECOVERY_FORMAT_VERSION: u64 = 1;
 impl Worker {
     /// `append_custom_message { message }`: append the custom row durably, then
     /// broadcast its `message_start`/`message_end` pair.
-    pub(crate) fn handle_append_custom_message(&self, payload: &Value) -> DaemonResponse {
+    pub(crate) async fn handle_append_custom_message(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("append_custom_message") {
             return response;
         }
@@ -26,8 +26,61 @@ impl Worker {
                 None,
             );
         };
-        self.emit_custom_row(&message);
-        response_success(None, "append_custom_message", None)
+        if let Err(error) =
+            serde_json::from_value::<pa_types::session::CustomMessage>(message.clone())
+        {
+            return response_failure(None, "append_custom_message", &error.to_string(), None);
+        }
+        let entry_id = {
+            let mut core = self.core.lock().unwrap();
+            let Some(store) = core.store.as_mut() else {
+                return response_failure(
+                    None,
+                    "append_custom_message",
+                    "Session is still initializing",
+                    None,
+                );
+            };
+            let mut fields = message.clone();
+            fields
+                .as_object_mut()
+                .expect("validated custom message")
+                .remove("role");
+            fields
+                .as_object_mut()
+                .expect("validated custom message")
+                .remove("timestamp");
+            match store.persist_entry("custom_message", fields) {
+                Ok(entry_id) => entry_id,
+                Err(error) => {
+                    return response_failure(
+                        None,
+                        "append_custom_message",
+                        &error.to_string(),
+                        None,
+                    )
+                }
+            }
+        };
+        let mut injection = message.clone();
+        injection["entryId"] = json!(entry_id);
+        if let Err(error) = self.engine.inject_host_custom_message(injection).await {
+            return response_failure(
+                None,
+                "append_custom_message",
+                &format!(
+                    "Message persisted as {entry_id}, but live context injection failed: {error}"
+                ),
+                None,
+            );
+        }
+        let mut core = self.core.lock().unwrap();
+        crate::worker::broadcast_custom_row_locked(&mut core, &self.events, &message);
+        response_success(
+            None,
+            "append_custom_message",
+            Some(json!({ "entryId": entry_id })),
+        )
     }
 
     /// `append_session_entry { customType, data }`: append one durable custom
@@ -477,6 +530,104 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // The faux model registry is process-global; serialize the real-engine fixture.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn custom_append_finishes_while_host_hook_awaits_its_answer() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::TempDir::new().unwrap();
+        let worker = Arc::new(Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "custom-session".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: None,
+                script: Some(json!({"engine":"faux", "responses":["ack"]})),
+            },
+            None,
+        ));
+        let created = worker
+            .dispatch("create", &json!({"noSession":true, "cwd":"/tmp"}))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        // Build and mirror the real engine handles before locking its outer slot.
+        let _definitions = worker.engine.host_tool_definitions().await;
+        let engine = worker
+            .agent_engine
+            .as_ref()
+            .expect("faux uses the real engine");
+        let outer_engine = engine.session.lock().await;
+        assert!(outer_engine.is_some(), "real session must be built");
+        let installed = worker
+            .dispatch(
+                "set_host_hooks",
+                &json!({
+                    "hooks":[crate::host_hooks::TURN_END], "hostContractVersion":1,
+                }),
+            )
+            .await;
+        assert!(installed.success, "hook registration failed: {installed:?}");
+        let mut frames = worker.events.subscribe();
+        let hook = tokio::spawn({
+            let worker = Arc::clone(&worker);
+            async move {
+                worker
+                    .host_hooks
+                    .call_from(crate::host_hooks::TURN_END, json!({}), None, None)
+                    .await
+            }
+        });
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = frames.recv().await.unwrap();
+                let outbound: Value = serde_json::from_slice(&frame.payload).unwrap();
+                if outbound["event"]["type"] == "host_hook_request" {
+                    break outbound["event"]["requestId"].as_str().unwrap().to_string();
+                }
+            }
+        })
+        .await
+        .expect("hook must reach its pending boundary");
+        let appended = tokio::time::timeout(std::time::Duration::from_secs(5), worker.dispatch(
+            "append_custom_message", &json!({"message":{"customType":"during-hook", "content":"persisted before answer"}}),
+        )).await.expect("host write must not wait for the hook answer");
+        assert!(appended.success, "host write failed: {appended:?}");
+        let data = appended.data.unwrap();
+        let entry_id = data["entryId"].as_str().unwrap();
+        {
+            let core = worker.core.lock().unwrap();
+            let store = core.store.as_ref().unwrap();
+            assert_eq!(store.entry(entry_id).unwrap().type_, "custom_message");
+            assert_eq!(
+                store
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.id == entry_id)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            !hook.is_finished(),
+            "write must finish before the hook is answered"
+        );
+        let answered = worker
+            .dispatch(
+                "respond_host_hook",
+                &json!({"requestId":request_id, "result":{}}),
+            )
+            .await;
+        assert!(answered.success, "hook answer failed: {answered:?}");
+        assert_eq!(hook.await.unwrap(), Some(Ok(json!({}))));
+        drop(outer_engine);
+    }
+
     #[tokio::test]
     async fn append_custom_message_records_the_row() {
         let worker = created_worker().await;
@@ -495,6 +646,16 @@ mod tests {
             )
             .await;
         assert!(response.success, "failed: {response:?}");
+        let entry_id = response.data.as_ref().unwrap()["entryId"].as_str().unwrap();
+        assert!(worker
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .entry(entry_id)
+            .is_some());
         let rows = custom_entries(&worker);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "notice");

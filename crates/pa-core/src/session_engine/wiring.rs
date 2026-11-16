@@ -127,12 +127,20 @@ impl AgentSession {
     where
         M: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let Some(hook) = self.host_hook(|hooks| hooks.context.clone()) else {
-            return messages;
-        };
-        super::host_hooks::project_messages(&hook, purpose, &messages, entry_ids)
+        let hooks = self.host_hooks.read().expect("host hooks lock").clone();
+        hooks
+            .project_context(purpose, &messages, entry_ids)
             .await
-            .unwrap_or(messages)
+            .map_or(messages, |projection| projection.messages)
+    }
+
+    /// The exact latest context representation a provider or budget consumer applied.
+    #[must_use]
+    pub fn context_projection_snapshot(&self, purpose: &str) -> Option<serde_json::Value> {
+        self.host_hooks
+            .read()
+            .expect("host hooks lock")
+            .projection_snapshot(purpose)
     }
 
     /// Bind the telemetry handle the `skill_use_count` counter counts

@@ -53,6 +53,7 @@ pub mod turn_boundary;
 
 mod admission;
 mod compaction_arms;
+mod host_resources;
 mod wiring;
 
 use std::sync::Arc;
@@ -155,6 +156,7 @@ pub struct AgentSession {
     pending_next_turn_rows: std::sync::Arc<std::sync::Mutex<Vec<pa_types::session::CustomMessage>>>,
     /// The skill inventory `/skill:<name>` submissions expand against.
     skills: Vec<crate::skills::Skill>,
+    host_resources: std::sync::RwLock<host_resources::HostResourceSkills>,
     /// The telemetry handle for the `skill_use_count` counter the prompt
     /// path owns (`None` in sessions without telemetry).
     skill_telemetry: Option<std::sync::Arc<telemetry::SessionTelemetry>>,
@@ -262,6 +264,7 @@ impl AgentSession {
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             host_hooks: std::sync::RwLock::default(),
             skills: Vec::new(),
+            host_resources: std::sync::RwLock::default(),
             skill_telemetry: None,
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),

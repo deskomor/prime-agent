@@ -81,6 +81,7 @@ impl Worker {
             }
             return response_failure(None, "set_model", &refusal.to_string(), None);
         }
+        let previous_model = self.engine.model_metadata();
         let engine = std::sync::Arc::clone(&self.engine);
         let core = std::sync::Arc::clone(&self.core);
         let agent_dir = self.config.agent_dir.clone();
@@ -129,6 +130,13 @@ impl Worker {
         // The switched model reaches the roster surfaces immediately (TS
         // schedules a roster flush after the switch).
         self.push_roster_delta();
+        self.host_hooks.lifecycle_hook()(serde_json::json!({
+            "type": "model_select",
+            "model": model,
+            "previousModel": previous_model,
+            "source": "set",
+        }))
+        .await;
         response_success(
             None,
             "set_model",

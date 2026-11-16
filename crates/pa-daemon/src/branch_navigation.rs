@@ -366,6 +366,22 @@ impl TreeNavigation {
         if let Some(summary_entry) = summary_entry {
             data["summaryEntry"] = summary_entry;
         }
+        if let Some(hooks) = self.host_hooks.get() {
+            let leaf_id = {
+                let core = self.core.lock().unwrap();
+                core.store
+                    .as_ref()
+                    .and_then(|store| store.leaf_id().map(str::to_string))
+            };
+            hooks.lifecycle_hook()(json!({
+                "type": "session_tree",
+                "oldLeafId": old_leaf,
+                "newLeafId": leaf_id,
+                "summaryEntry": data.get("summaryEntry"),
+                "fromExtension": false,
+            }))
+            .await;
+        }
         response_success(None, "navigate_tree", Some(data))
     }
 

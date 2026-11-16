@@ -742,7 +742,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             std::sync::Arc::clone(&request_timing_wiring),
             match config.host_hooks.context.clone() {
                 // The host's `context` hook projects the provider request.
-                Some(hook) => super::host_hooks::provider_projection(hook, wiring.session.clone()),
+                Some(_) => super::host_hooks::provider_projection(
+                    config.host_hooks.clone(),
+                    wiring.session.clone(),
+                ),
                 None => super::request_timing::pass_through_transform(),
             },
         )),
@@ -750,12 +753,14 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             let steering = config.queued_steering_probe.take();
             let boundary = config.should_stop_after_turn.take();
             let turn_end = config.host_hooks.turn_end.clone();
+            let contract_v1 = config.host_hooks.contract_v1.clone();
             let turn_end_agent = std::sync::Arc::clone(&turn_end_agent);
             let next_turn_rows = std::sync::Arc::clone(&boot_notice_rows);
             Some(std::sync::Arc::new(move |context| {
                 let steering = steering.clone();
                 let boundary = boundary.clone();
                 let turn_end = turn_end.clone();
+                let contract_v1 = contract_v1.clone();
                 let turn_end_agent = std::sync::Arc::clone(&turn_end_agent);
                 let next_turn_rows = std::sync::Arc::clone(&next_turn_rows);
                 Box::pin(async move {
@@ -763,18 +768,29 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                     // call after a tool batch (steered into this run), or the
                     // next admitted prompt after a final answer.
                     if let Some(hook) = turn_end {
-                        let rows = hook(serde_json::json!({
+                        let answer = hook(serde_json::json!({
                             "message": pa_agent::types::Message::Assistant(
                                 context.message.clone()
                             ),
                             "toolResults": context.tool_results,
+                            "toolExecution": context.tool_execution,
+                            "exchanges": context.tool_exchanges,
                         }))
-                        .await
-                        .map(|answer| super::host_hooks::hidden_messages(&answer))
-                        .unwrap_or_default();
+                        .await;
+                        let resume = contract_v1
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                            && answer.as_ref().is_some_and(|answer| {
+                                answer.get("continue").and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                            });
+                        let rows = answer
+                            .as_ref()
+                            .map(super::host_hooks::hidden_messages)
+                            .unwrap_or_default();
                         let agent = turn_end_agent.get().and_then(std::sync::Weak::upgrade);
                         match agent {
-                            Some(agent) if !context.tool_results.is_empty() => {
+                            Some(agent) if !context.tool_results.is_empty() || resume => {
                                 for row in rows {
                                     if let Some(message) = super::session_message_to_loop(
                                         &super::SessionAgentMessage::Custom(row),
@@ -930,6 +946,34 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             })
             .await;
     }
+    if let Some(hook) = config.host_hooks.lifecycle.clone() {
+        let lifecycle = Arc::new(std::sync::Mutex::new(0_u64));
+        agent.subscribe(move |event, _signal| {
+            let hook = Arc::clone(&hook);
+            let lifecycle = Arc::clone(&lifecycle);
+            Box::pin(async move {
+                let payload = match event {
+                    pa_agent::types::AgentEvent::AgentStart => {
+                        *lifecycle.lock().unwrap() = 0;
+                        Some(serde_json::json!({"type":"agent_start"}))
+                    },
+                    pa_agent::types::AgentEvent::TurnStart => {
+                        let mut state = lifecycle.lock().unwrap();
+                        let index = *state;
+                        *state += 1;
+                        Some(serde_json::json!({"type":"turn_start","turnIndex":index}))
+                    },
+                    pa_agent::types::AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => Some(serde_json::json!({"type":"tool_execution_start","toolCallId":tool_call_id,"toolName":tool_name,"args":args})),
+                    pa_agent::types::AgentEvent::AgentEnd { messages } => Some(serde_json::json!({"type":"agent_end","messages":messages})),
+                    _ => None,
+                };
+                if let Some(payload) = payload {
+                    let _ = hook(payload).await;
+                }
+                Ok(())
+            })
+        }).await;
+    }
     // The host's `message_end` hears every finished message (awaited, its
     // answer ignored).
     if let Some(hook) = config.host_hooks.message_end.clone() {
@@ -1075,7 +1119,13 @@ impl SessionEngine {
     /// turn's own expansion is idempotent over the block. The
     /// `skill_use_count` counter counts at the admission, not here.
     pub fn expand_skill_submission(&self, text: &str) -> String {
-        crate::skills::expand_skill_command(text, &self.skills).0
+        crate::skills::expand_skill_command(text, &self.session.effective_skills()).0
+    }
+
+    /// Discover host skills before recording an expanded accepted row. The next
+    /// admission consumes the same inventory without another host callback.
+    pub async fn prepare_host_resources_for_submission(&self) {
+        self.session.prepare_host_resources_for_submission().await;
     }
 
     /// Record one late (fire-and-forget) `agent_message.send` receipt (TS

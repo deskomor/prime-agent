@@ -173,6 +173,23 @@ impl AcpChild {
         }
     }
 
+    fn assert_no_response(&self, id: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(remaining) {
+                Ok(line) => {
+                    let frame: Value = serde_json::from_str(&line).expect("valid JSON line");
+                    assert_ne!(frame.get("id").and_then(Value::as_u64), Some(id), "{frame}");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("ACP server closed stdout")
+                }
+            }
+        }
+    }
+
     /// Read frames until one matches — the predicate readiness signal,
     /// never a timer. The frames before it are dropped.
     fn wait_frame(
@@ -2864,6 +2881,108 @@ fn hook_initialize_params(meta: &Value) -> Value {
     params
 }
 
+/// Root startup callbacks can read and write the admitted session while a
+/// prompt waits for the actual startup hook to finish.
+#[test]
+fn acp_session_start_allows_snapshot_and_write_reentry() {
+    let script = json!({ "engine": "faux", "responses": [{ "text": "done" }] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({
+            "hostContract": { "version": 1 },
+            "hooks": ["session_start"],
+        })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let startup = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+            && frame["params"]["hook"] == "session_start"
+    });
+    assert_eq!(startup["params"]["sessionId"], session_id);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "hello" }] }),
+    );
+    let pause = client.request(
+        "_ai.primeintellect.prime-agent/set_auto_refine",
+        &json!({ "sessionId": session_id, "enabled": false }),
+    );
+    let (paused, _) = client.wait_response(pause, Duration::from_secs(10));
+    assert!(paused.get("error").is_none(), "{paused}");
+    let append = client.request(
+        "_ai.primeintellect.prime-agent/append_session_entry",
+        &json!({ "sessionId": session_id, "customType": "startup-fixture", "data": { "ready": true } }),
+    );
+    let (appended, _) = client.wait_response(append, Duration::from_secs(10));
+    assert!(appended["result"]["entryId"].is_string(), "{appended}");
+    let snapshot = client.request(
+        "_ai.primeintellect.prime-agent/session_snapshot",
+        &json!({ "sessionId": session_id }),
+    );
+    let (snapshot, _) = client.wait_response(snapshot, Duration::from_secs(10));
+    assert_eq!(snapshot["result"]["autoRefineEnabled"], false);
+    assert_eq!(snapshot["result"]["context"]["messages"], json!([]));
+    assert!(snapshot["result"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["customType"] == "startup-fixture" && entry["data"] == json!({ "ready": true })
+        }));
+    client.assert_no_response(prompt, Duration::from_millis(200));
+    client.send(&json!({ "jsonrpc": "2.0", "id": startup["id"], "result": {} }));
+    let (response, _) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+}
+
+/// Closing during startup releases the old gate without opening the
+/// replacement session's gate when the old hook eventually answers.
+#[test]
+fn acp_close_during_session_start_keeps_replacement_startup_separate() {
+    let script = json!({ "engine": "faux", "responses": [{ "text": "done" }] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({
+            "hostContract": { "version": 1 },
+            "hooks": ["session_start"],
+        })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let first = new_session(&mut client);
+    let old_startup = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+            && frame["params"]["hook"] == "session_start"
+    });
+    let close = client.request("session/close", &json!({ "sessionId": first }));
+    let (closed, _) = client.wait_response(close, Duration::from_secs(10));
+    assert!(closed.get("error").is_none(), "{closed}");
+    let replacement = new_session(&mut client);
+    assert_ne!(replacement, first);
+    let startup = client.wait_frame(TIMEOUT, |frame| {
+        frame["method"] == "_ai.primeintellect.prime-agent/hook"
+            && frame["params"]["hook"] == "session_start"
+    });
+    assert_eq!(startup["params"]["sessionId"], replacement);
+    client.send(&json!({ "jsonrpc": "2.0", "id": old_startup["id"], "result": {} }));
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": replacement, "prompt": [{ "type": "text", "text": "hello" }] }),
+    );
+    let snapshot = client.request(
+        "_ai.primeintellect.prime-agent/session_snapshot",
+        &json!({ "sessionId": replacement }),
+    );
+    let (snapshot, _) = client.wait_response(snapshot, Duration::from_secs(10));
+    assert_eq!(snapshot["result"]["context"]["messages"], json!([]));
+    client.assert_no_response(prompt, Duration::from_millis(200));
+    client.send(&json!({ "jsonrpc": "2.0", "id": startup["id"], "result": {} }));
+    let (response, _) = client.wait_response(prompt, TIMEOUT);
+    assert_end_turn(&response);
+}
+
 /// The `after_tool_call` host hook reaches the client with the executed
 /// result, and the client's replacement is what the session records and
 /// streams.
@@ -3045,6 +3164,112 @@ fn acp_optional_hooks_and_session_extensions() {
     );
     let (refused, _) = client.wait_response(unknown, TIMEOUT);
     assert_eq!(refused["error"]["code"], -32602, "{refused}");
+}
+
+/// Host-authorized Studio MCP servers survive the supervisor's child create
+/// payload and report the executing child's native identity over real stdio.
+#[test]
+fn acp_studio_mcp_reaches_spawned_child_kernel_with_its_native_binding() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let scratch = tempfile::TempDir::new().unwrap();
+    let root_receipt = scratch.path().join("root-mcp.json");
+    let child_receipt = scratch.path().join("child-mcp.json");
+    let fixture_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../pa-daemon/tests/fixtures");
+    assert!(fixture_dir.join("mcp_echo_server.py").is_file());
+    // Reuse the echo fixture's protocol and result encoding; echo the server's
+    // own stamped environment instead of an argument supplied by the caller.
+    let server_code = format!(
+        "import os, sys\nsys.path.insert(0, {:?})\nimport mcp_echo_server as fixture\necho = fixture.echo_result\nfixture.echo_result = lambda arguments: echo({{'message': os.environ['PRIME_STUDIO_NATIVE_SESSION']}})\nfixture.main()",
+        fixture_dir.to_string_lossy()
+    );
+    let mcp_cell = |receipt: &std::path::Path| {
+        format!(
+            "import json, traceback\ntry:\n    tools = await mcp.list_tools('studio_factory')\n    assert [tool['name'] for tool in tools] == ['echo'], tools\n    binding = json.loads(await mcp.call_tool('studio_factory', 'echo', {{'message': 'binding'}}))\n    open({receipt:?}, 'w').write(json.dumps({{'binding': binding}}))\nexcept Exception:\n    open({receipt:?}, 'w').write(json.dumps({{'error': traceback.format_exc()}}))\n    raise",
+            receipt = receipt.to_string_lossy()
+        )
+    };
+    let parent = spawn_parent_script(&format!("{}\n{}", mcp_cell(&root_receipt), spawn_cell()));
+    let child_script = json!({ "engine": "faux", "responses": [
+        { "content": [
+            { "type": "toolCall", "name": "python_repl", "arguments": { "code": mcp_cell(&child_receipt) } },
+        ] },
+        { "text": "child MCP complete" },
+    ] });
+    let mut client = AcpChild::spawn_with_child_script(
+        &["--mode", "acp"],
+        &parent,
+        &child_script,
+        &kernel_python,
+    );
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({ "hostContract": { "version": 1 } })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request(
+        "session/new",
+        &json!({ "mcpServers": [{
+            "name": "studio_factory",
+            "command": kernel_python.to_string_lossy(),
+            "args": ["-c", server_code],
+            "env": [],
+            "_meta": { "ai.primeintellect.prime-agent": { "inheritStudioMcp": true } },
+        }] }),
+    );
+    let (admitted, _) = client.wait_response(new, TIMEOUT);
+    let session_id = admitted["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Studio MCP session admission: {admitted}"))
+        .to_string();
+    let _ = assert_prompt_ends_turn(&mut client, &session_id, "spawn the kid");
+    let root: Value =
+        serde_json::from_str(&std::fs::read_to_string(&root_receipt).expect("root MCP receipt"))
+            .unwrap();
+    assert!(root.get("error").is_none(), "root MCP failed: {root}");
+    let child: Value =
+        serde_json::from_str(&std::fs::read_to_string(&child_receipt).expect("child MCP receipt"))
+            .unwrap();
+    assert!(child.get("error").is_none(), "child MCP failed: {child}");
+    let root_binding = &root["binding"];
+    let child_binding = &child["binding"];
+    assert_ne!(child_binding["sessionId"], root_binding["sessionId"]);
+    assert_ne!(
+        child_binding["activeSessionId"],
+        root_binding["activeSessionId"]
+    );
+    assert_ne!(child_binding["sessionFile"], root_binding["sessionFile"]);
+    assert_eq!(child_binding["parentSessionId"], root_binding["sessionId"]);
+    for binding in [root_binding, child_binding] {
+        let snapshot = client.request(
+            "_ai.primeintellect.prime-agent/session_snapshot",
+            &json!({
+                "sessionId": session_id,
+                "targetActiveSessionId": binding["activeSessionId"],
+            }),
+        );
+        let (snapshot, _) = client.wait_response(snapshot, TIMEOUT);
+        let actual = &snapshot["result"];
+        assert_eq!(
+            json!({
+                "sessionId": binding["sessionId"],
+                "activeSessionId": binding["activeSessionId"],
+                "sessionFile": binding["sessionFile"],
+                "cwd": binding["cwd"],
+            }),
+            json!({
+                "sessionId": actual["sessionId"],
+                "activeSessionId": actual["activeSessionId"],
+                "sessionFile": actual["sessionFile"],
+                "cwd": actual["cwd"],
+            }),
+            "stdio binding matches the native session: {snapshot}"
+        );
+        assert!(std::path::Path::new(binding["sessionFile"].as_str().unwrap()).is_file());
+        assert!(std::path::Path::new(binding["cwd"].as_str().unwrap()).is_dir());
+    }
 }
 
 /// A subagent runs its parent's hooks: its kernel host calls and tool

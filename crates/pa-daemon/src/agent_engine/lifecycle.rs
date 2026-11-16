@@ -143,6 +143,8 @@ impl AgentSessionEngine {
             goal_backoff_wake_job_id: std::sync::Mutex::new(None),
             stale_goal_terminal_pending: std::sync::Mutex::new(None),
             turn_agent: std::sync::Mutex::new(None),
+            host_tool_inventory: std::sync::Mutex::new(None),
+            host_active_tools: tokio::sync::Mutex::new(None),
             queue_modes,
             autonomous_boundary: std::sync::Mutex::new(None),
             background_bash_probe: std::sync::Mutex::new(None),
@@ -241,9 +243,12 @@ impl AgentSessionEngine {
             return text.to_string();
         }
         let expanded = self.runtime.block_on(async {
-            let guard = self.session.lock().await;
-            match guard.as_deref() {
-                Some(engine) => engine.expand_skill_submission(text),
+            let engine = self.session.lock().await.clone();
+            match engine {
+                Some(engine) => {
+                    engine.prepare_host_resources_for_submission().await;
+                    engine.expand_skill_submission(text)
+                }
                 None => text.to_string(),
             }
         });
@@ -434,8 +439,26 @@ impl AgentSessionEngine {
             // request into this recorder.
             children.set_semantic_edges(built.session.semantic_edges());
         }
-        *self.turn_agent.lock().expect("turn agent lock") =
-            Some(std::sync::Arc::clone(built.session.agent()));
+        let agent = std::sync::Arc::clone(built.session.agent());
+        let inventory = agent.state().await.tools;
+        let host_selection = self.host_active_tools.lock().await;
+        if let Some(names) = host_selection.as_ref() {
+            agent
+                .set_tools(
+                    inventory
+                        .iter()
+                        .filter(|tool| names.iter().any(|name| name == tool.name()))
+                        .cloned()
+                        .collect(),
+                )
+                .await;
+        }
+        *self
+            .host_tool_inventory
+            .lock()
+            .expect("host tool inventory lock") = Some(inventory);
+        *self.turn_agent.lock().expect("turn agent lock") = Some(agent);
+        drop(host_selection);
         {
             let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
             if let Some(handles) = handles {
@@ -778,7 +801,13 @@ impl AgentSessionEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
         *self.progress_notes.lock().expect("progress notes lock") = None;
+        let host_selection = self.host_active_tools.lock().await;
         *self.turn_agent.lock().expect("turn agent lock") = None;
+        *self
+            .host_tool_inventory
+            .lock()
+            .expect("host tool inventory lock") = None;
+        drop(host_selection);
         *self
             .autonomous_boundary
             .lock()
@@ -945,7 +974,7 @@ impl AgentSessionEngine {
 
     /// Kernel host-request handlers for messaging and observation,
     /// routed through the supervisor link. `None` outside a daemon worker.
-    fn extra_host_handlers(&self) -> Option<HostRequestHandlers> {
+    pub(crate) fn extra_host_handlers(&self) -> Option<HostRequestHandlers> {
         let config = self.config.supervisor_link.as_ref()?;
         let sender = Arc::new(LinkAgentMessageController::new(
             Arc::clone(&self.link),

@@ -244,6 +244,16 @@ impl AgentSession {
                 "notice": notice_landed,
             }),
         );
+        if let (CompactOutcome::Ran(run), Some(hook)) =
+            (&outcome, self.host_hook(|hooks| hooks.lifecycle.clone()))
+        {
+            hook(serde_json::json!({
+                "type": "session_compact",
+                "compactionEntry": run.entry,
+                "fromExtension": false,
+            }))
+            .await;
+        }
         Ok(outcome)
     }
 

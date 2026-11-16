@@ -265,6 +265,28 @@ pub struct HostRequestPayload {
     pub data: Value,
 }
 
+tokio::task_local! {
+    static FAMILY_SESSION_SCOPE: Option<Vec<String>>;
+}
+
+/// Whether a durable family member belongs to this host-authorized request.
+/// Requests without a host scope keep the stock family behavior.
+pub(crate) fn family_session_allowed(session_id: &str) -> bool {
+    FAMILY_SESSION_SCOPE
+        .try_with(|scope| {
+            scope
+                .as_ref()
+                .is_none_or(|ids| ids.iter().any(|id| id == session_id))
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) fn family_session_scope_active() -> bool {
+    FAMILY_SESSION_SCOPE
+        .try_with(Option::is_some)
+        .unwrap_or(false)
+}
+
 pub type HostHandlerFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
 pub type HostHandlerFn = Arc<dyn Fn(HostRequestPayload) -> HostHandlerFuture + Send + Sync>;
 
@@ -340,8 +362,14 @@ impl HostRequestHandlers {
                     let handler = Arc::clone(&handler);
                     let request_type = gated_type.clone();
                     Box::pin(async move {
-                        gate(request_type, payload.data.clone()).await?;
-                        handler(payload).await
+                        let scope = gate(request_type.clone(), payload.data.clone()).await?;
+                        if request_type.starts_with("agent_message.")
+                            || request_type.starts_with("agent_observe.")
+                        {
+                            FAMILY_SESSION_SCOPE.scope(scope, handler(payload)).await
+                        } else {
+                            handler(payload).await
+                        }
                     }) as HostHandlerFuture
                 });
                 (request_type.clone(), gated)

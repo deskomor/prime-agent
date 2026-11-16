@@ -49,7 +49,7 @@ def main() -> int:
                     report["steps"].append(execute(command, env))
                     probe = execute([str(prefix / "bin/prime-agent"), "--version"], env)
                     report["steps"].append(probe)
-                    if probe["stdout"].strip() != version:
+                    if probe["stdout"].partition("\n")[0].strip() != version:
                         raise ValueError("Installed launcher did not report channel version")
                     report["steps"].append(execute([str(prefix / "bin/prime-agent"), "--help"], env))
                     for name, content in witnesses.items():

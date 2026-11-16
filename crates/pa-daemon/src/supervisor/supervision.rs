@@ -69,6 +69,12 @@ fn apply_worker_env(
     }
     command.envs(internal_launch_env);
     command.env_remove("RLM_DEPTH");
+    // Studio session bindings belong to a session's MCP manager, never the daemon.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("PRIME_STUDIO_NATIVE_") {
+            command.env_remove(key);
+        }
+    }
 }
 
 impl SpawnedWorker {

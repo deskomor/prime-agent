@@ -320,11 +320,24 @@ fn packaged_binary_reports_manifest_version() {
         .output()
         .expect("run packaged binary");
     assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "9.8.7-test",
+        lines.next(),
+        Some("9.8.7-test"),
         "the packaged manifest version must win"
     );
+    let build = pa_daemon::protocol::build_identity();
+    let dirty = build["dirty"]
+        .as_bool()
+        .map(|dirty| dirty.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let expected = format!(
+        "build: {} dirty: {dirty}",
+        build["commit"].as_str().unwrap_or("unknown")
+    );
+    assert_eq!(lines.next(), Some(expected.as_str()));
+    assert_eq!(lines.next(), None);
 }
 
 /// A missing sidecar (broken install) surfaces the actionable failure, not a raw uv/pip error.
@@ -401,7 +414,10 @@ fn hostile_child_assertions(staged: &Path) {
         .expect("run packaged binary");
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default(),
         HOSTILE_STAGED_VERSION,
         "the hostile PI_PACKAGE_DIR must not win: {}",
         String::from_utf8_lossy(&output.stderr)

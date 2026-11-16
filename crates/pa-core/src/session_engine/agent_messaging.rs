@@ -5,7 +5,7 @@ use std::future::Future;
 
 use serde_json::{json, Value};
 
-use crate::kernel::shared::{host_handler, HostRequestHandlers};
+use crate::kernel::shared::{family_session_allowed, host_handler, HostRequestHandlers};
 
 pub const AGENT_MESSAGE_CUSTOM_TYPE: &str = "agent_message";
 /// The queue-strip preview label for a delivered agent message
@@ -104,6 +104,8 @@ pub struct AgentMessageReceipt {
 #[derive(Debug, Clone)]
 pub struct AgentFamilyMember {
     pub relationship: AgentFamilyRelationship,
+    /// Durable session identity used for host scope authorization, never an alias.
+    pub session_id: String,
     /// The target selector the controller can deliver to: the session id for
     /// local family members, the active session id for peers on another worker.
     pub id: String,
@@ -425,7 +427,7 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                     }
                     let family = controller.family().await?;
                     let mut receipts = Vec::with_capacity(family.len());
-                    for member in family {
+                    for member in family.into_iter().filter(|member| family_session_allowed(&member.session_id)) {
                         let result = controller
                             .send_agent_message(AgentMessageSendInput {
                                 target: member.id.clone(),
@@ -486,6 +488,7 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                 let family = controller.family().await?;
                 let matches: Vec<AgentFamilyMember> = family
                     .into_iter()
+                    .filter(|member| family_session_allowed(&member.session_id))
                     .filter(|member| {
                         member.relationship == role
                             && (role == AgentFamilyRelationship::Parent

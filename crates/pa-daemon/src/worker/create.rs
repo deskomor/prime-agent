@@ -72,11 +72,10 @@ impl Worker {
             self.config.supervisor_socket_path.clone(),
         ));
         let parent = parent_active_session_id.to_string();
-        let own_origin = json!({
-            "activeSessionId": self.config.active_session_id,
-            "rlmChildId": rlm_child_id,
-            "sessionName": name,
-        });
+        let core = Arc::clone(&self.core);
+        let active_session_id = self.config.active_session_id.clone();
+        let rlm_child_id = rlm_child_id.map(str::to_string);
+        let name = name.map(str::to_string);
         Arc::new(move |hook, payload, origin| {
             let link = Arc::clone(&link);
             let command = json!({
@@ -85,7 +84,22 @@ impl Worker {
                 "hook": hook,
                 "payload": payload,
                 // A grandchild's hook keeps the origin it started with.
-                "origin": origin.unwrap_or_else(|| own_origin.clone()),
+                "origin": origin.unwrap_or_else(|| {
+                    let core = core.lock().unwrap();
+                    json!({
+                        "activeSessionId": active_session_id,
+                        "sessionId": core.store.as_ref().map(SessionFile::session_id),
+                        "sessionFile": core.store.as_ref().map(|store| store.path.to_string_lossy()),
+                        "cwd": core.cwd,
+                        "parentSessionId": core.parent_session_id,
+                        "parentActiveSessionId": core.parent_active_session_id,
+                        "generation": core.generation,
+                        "eventSequence": core.last_event_sequence,
+                        "admissionIds": core.running_admission_ids,
+                        "rlmChildId": rlm_child_id,
+                        "sessionName": name,
+                    })
+                }),
             });
             Box::pin(async move {
                 let answer = match link
@@ -135,6 +149,21 @@ impl Worker {
                 Err(error) => return response_failure(None, "create", &error.to_string(), None),
             },
             None => None,
+        };
+        let studio_servers: Vec<pa_core::mcp::AcpMcpServerConfig> = match payload
+            .get("studioMcpServers")
+            .filter(|_| {
+                payload
+                    .get("studioHostContractVersion")
+                    .and_then(Value::as_u64)
+                    == Some(1)
+            })
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(servers) => servers.unwrap_or_default(),
+            Err(error) => return response_failure(None, "create", &error.to_string(), None),
         };
         let no_session = payload
             .get("noSession")
@@ -296,6 +325,9 @@ impl Worker {
         // A child of a hooked session runs its parent's hooks through it (the
         // durable create replays the key on a respawn).
         if let Some(inherited) = payload.get("hostHooksParent") {
+            self.host_hooks.set_contract(
+                inherited.get("hostContractVersion").and_then(Value::as_u64) == Some(1),
+            );
             let parent = inherited
                 .get("activeSessionId")
                 .and_then(Value::as_str)
@@ -336,6 +368,12 @@ impl Worker {
                     None,
                 );
             }
+            let owner = inherited
+                .get("hostOwnerToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            *self.host_hook_owner.lock().await = owner.clone();
+            self.host_hooks.set_owner_token(owner);
             self.host_hooks.set_upstream(self.host_hook_upstream(
                 parent,
                 rlm_child_id.as_deref(),
@@ -343,6 +381,11 @@ impl Worker {
                 timeout,
             ));
         }
+
+        let host_start_pause = payload
+            .get("hostHooksParent")
+            .filter(|_| self.host_hooks.lifecycle_enabled("session_start"))
+            .map(|_| self.hold_queued_work_pause("host-session-start"));
 
         // Set by the fresh-path arm when the name landed in its single rewrite:
         // the shared name persist must not append a second `session_info` line.
@@ -704,6 +747,37 @@ impl Worker {
         // record only once the disclosure is durable (a requested record with no
         // disclosure row is vacuously durable; no requested record adds no key).
         let mut interrupted_compaction_persisted = interrupted_compaction_requested;
+        // MCP admission precedes the created flag: a failed admission is not
+        // an idempotently successful create on the next request.
+        if !studio_servers.is_empty() {
+            let binding = json!({
+                "sessionId": store.session_id(),
+                "activeSessionId": self.config.active_session_id,
+                "sessionFile": store.path.to_string_lossy(),
+                "cwd": cwd,
+                "parentSessionId": payload.get("studioMcpParentSessionId"),
+            });
+            let servers = bind_studio_mcp_servers(studio_servers, &binding);
+            let manager = self
+                .engine
+                .acp_mcp_manager()
+                .unwrap_or_else(|| Arc::clone(&self.acp_mcp));
+            let owner = format!("studio-native:{}", self.config.active_session_id);
+            if let Err(error) = manager
+                .lock()
+                .unwrap()
+                .replace_acp_servers(&servers, &owner)
+            {
+                return response_failure(None, "create", &error.to_string(), None);
+            }
+            if let Some(children) = self
+                .agent_engine
+                .as_ref()
+                .and_then(|engine| engine.children.as_ref())
+            {
+                children.set_studio_mcp_servers(servers);
+            }
+        }
         // The core lock stays inside this block: everything after it may await,
         // and a std MutexGuard must never ride an await point.
         let (summary, rlm_depth) = {
@@ -878,6 +952,19 @@ impl Worker {
             data["interruptedCompactionPersisted"] =
                 serde_json::json!(interrupted_compaction_persisted);
         }
+        if let Some(start_pause) = host_start_pause {
+            let hooks = Arc::clone(&self.host_hooks);
+            // Create must return before callback reads can pass supervisor route readiness.
+            // Queued input, including restored lanes, stays paused until the real hook settles.
+            tokio::spawn(async move {
+                let _pause = start_pause;
+                hooks.lifecycle_hook()(json!({
+                    "type": "session_start",
+                    "reason": "startup",
+                }))
+                .await;
+            });
+        }
         // A resumed create just rebuilt the store from the session
         // file: return the load's freed heap to the OS.
         pa_types::memory_release::trim_freed_heap();
@@ -950,6 +1037,26 @@ impl Worker {
         reporter.session_started(active, session_ref);
         *self.herdr.lock().unwrap() = reporter;
     }
+}
+
+/// Each native child gets a fresh Studio binding; copied parent bindings never survive.
+pub(super) fn bind_studio_mcp_servers(
+    mut servers: Vec<pa_core::mcp::AcpMcpServerConfig>,
+    binding: &Value,
+) -> Vec<pa_core::mcp::AcpMcpServerConfig> {
+    for server in &mut servers {
+        if let pa_core::mcp::AcpMcpServerConfig::Stdio { cwd, env, .. } = server {
+            env.retain(|key, _| !key.starts_with("PRIME_STUDIO_NATIVE_"));
+            env.insert(
+                "PRIME_STUDIO_NATIVE_SESSION".to_string(),
+                binding.to_string(),
+            );
+            if let Some(child_cwd) = binding.get("cwd").and_then(Value::as_str) {
+                *cwd = child_cwd.to_string();
+            }
+        }
+    }
+    servers
 }
 
 pub(super) fn active_session_id_of(payload: &[u8]) -> String {
@@ -1036,6 +1143,203 @@ fn append_creation_prefix(
 #[cfg(test)]
 #[path = "create_collapse_tests.rs"]
 mod create_collapse_tests;
+
+#[cfg(test)]
+mod studio_mcp_tests {
+    use super::{bind_studio_mcp_servers, json};
+    use pa_core::mcp::AcpMcpServerConfig;
+    use std::collections::HashMap;
+
+    #[test]
+    fn inherited_studio_servers_rebind_for_each_native_generation() {
+        let server = AcpMcpServerConfig::Stdio {
+            name: "studio".to_string(),
+            command: "node".to_string(),
+            args: vec!["bridge.mjs".to_string()],
+            cwd: "/parent".to_string(),
+            env: HashMap::from([
+                (
+                    "PRIME_STUDIO_NATIVE_SESSION".to_string(),
+                    "parent".to_string(),
+                ),
+                (
+                    "PRIME_STUDIO_NATIVE_WRITER".to_string(),
+                    "parent-writer".to_string(),
+                ),
+                ("RELAY_TOKEN".to_string(), "shared-relay".to_string()),
+            ]),
+        };
+        let child = json!({
+            "sessionId": "child", "activeSessionId": "child-active",
+            "sessionFile": "/child.jsonl", "cwd": "/child", "parentSessionId": "parent"
+        });
+        let grandchild = json!({
+            "sessionId": "grandchild", "activeSessionId": "grandchild-active",
+            "sessionFile": "/grandchild.jsonl", "cwd": "/grandchild", "parentSessionId": "child"
+        });
+        let bound = bind_studio_mcp_servers(vec![server], &child);
+        let expected = |binding: &serde_json::Value| {
+            vec![AcpMcpServerConfig::Stdio {
+                name: "studio".to_string(),
+                command: "node".to_string(),
+                args: vec!["bridge.mjs".to_string()],
+                cwd: binding["cwd"].as_str().unwrap().to_string(),
+                env: HashMap::from([
+                    (
+                        "PRIME_STUDIO_NATIVE_SESSION".to_string(),
+                        binding.to_string(),
+                    ),
+                    ("RELAY_TOKEN".to_string(), "shared-relay".to_string()),
+                ]),
+            }]
+        };
+        assert_eq!(bound, expected(&child));
+        assert_eq!(
+            bind_studio_mcp_servers(bound, &grandchild),
+            expected(&grandchild)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_child_startup_holds_first_prompt_and_shutdown_keeps_native_identity() {
+        use crate::worker::{Worker, WorkerConfig};
+        use serde_json::Value;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::{mpsc, oneshot};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("sup.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (hooks_tx, mut hooks) = mpsc::unbounded_channel::<(Value, oneshot::Sender<()>)>();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let hooks_tx = hooks_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    writer
+                        .write_all(b"{\"type\":\"daemon_hello\"}\n")
+                        .await
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(reader).read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let command = &request["command"];
+                    let kind = command["type"].as_str().unwrap();
+                    if kind == "request_host_hook" {
+                        let (answer, wait) = oneshot::channel();
+                        hooks_tx.send((command.clone(), answer)).unwrap();
+                        wait.await.unwrap();
+                    }
+                    let response =
+                        crate::protocol::response_line(&crate::protocol::response_success(
+                            request["id"].as_str(),
+                            kind,
+                            Some(json!({"result":{}})),
+                        ));
+                    let mut line = serde_json::to_vec(&response).unwrap();
+                    line.push(b'\n');
+                    writer.write_all(&line).await.unwrap();
+                });
+            }
+        });
+        let worker = Arc::new(Worker::new(
+            WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: socket,
+                token: "child-token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "child-active".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: Some(json!({"responses":["child reply"]})),
+            },
+            None,
+        ));
+        let created = tokio::time::timeout(Duration::from_secs(5), worker.dispatch("create", &json!({
+            "cwd":dir.path(), "sessionDir":dir.path().join("sessions"), "rlmDepth":1,
+            "runtimeMetadata":{"kind":"subagent", "rlmChildId":"kid", "parentSessionId":"parent", "parentActiveSessionId":"parent-active"},
+            "hostHooksParent":{"activeSessionId":"parent-active", "hostContractVersion":1, "hooks":["session_start","session_shutdown"], "timeoutMs":150000},
+            "studioHostContractVersion":1, "studioMcpParentSessionId":"parent",
+            "studioMcpServers":[{"type":"stdio", "name":"studio", "command":"node", "args":["bridge.mjs"], "cwd":"/parent", "env":{"PRIME_STUDIO_NATIVE_SESSION":"parent"}}],
+        }))).await.expect("create must return while startup awaits its answer");
+        assert!(created.success, "{created:?}");
+        let session_id = created.data.unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (startup, answer) = tokio::time::timeout(Duration::from_secs(5), hooks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(startup["hook"], "session_start");
+        assert_eq!(startup["origin"]["sessionId"], session_id);
+        assert_eq!(startup["origin"]["activeSessionId"], "child-active");
+        assert_eq!(startup["origin"]["parentSessionId"], "parent");
+        let snapshot = worker.dispatch("session_snapshot", &json!({})).await;
+        assert!(
+            snapshot.success,
+            "startup callback read must reenter: {snapshot:?}"
+        );
+        assert!(worker.input_pauses.paused());
+        let servers = worker.acp_mcp.lock().unwrap().get_acp_servers();
+        let pa_core::mcp::AcpMcpServerConfig::Stdio { env, .. } = &servers[0] else {
+            panic!("stdio binding");
+        };
+        let binding: Value = serde_json::from_str(&env["PRIME_STUDIO_NATIVE_SESSION"]).unwrap();
+        assert_eq!(binding["sessionId"], session_id);
+        let mut frames = worker.events.subscribe();
+        let queued = worker
+            .dispatch("prompt", &json!({"message":"first task"}))
+            .await;
+        assert!(queued.success, "{queued:?}");
+        {
+            let core = worker.core.lock().unwrap();
+            assert!(!core.busy, "first prompt must remain parked during startup");
+            assert_eq!(core.steering.len() + core.follow_up.len(), 1);
+        }
+        answer.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = frames.recv().await.unwrap();
+                let outbound: Value = serde_json::from_slice(&frame.payload).unwrap();
+                if outbound["event"]["type"] == "agent_end" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("first prompt must finish after startup settles");
+        let closing = tokio::spawn({
+            let worker = Arc::clone(&worker);
+            async move { worker.dispatch("kill", &json!({})).await }
+        });
+        let (shutdown, answer) = tokio::time::timeout(Duration::from_secs(5), hooks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shutdown["hook"], "session_shutdown");
+        assert_eq!(shutdown["origin"]["sessionId"], session_id);
+        assert_eq!(shutdown["origin"]["rlmChildId"], "kid");
+        assert!(
+            worker.core.lock().unwrap().created,
+            "shutdown retains readable identity"
+        );
+        answer.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), closing)
+                .await
+                .unwrap()
+                .unwrap()
+                .success
+        );
+        server.abort();
+    }
+}
 
 #[cfg(test)]
 mod harness_seed_tests {

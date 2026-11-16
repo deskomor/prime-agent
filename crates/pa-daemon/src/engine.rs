@@ -29,6 +29,53 @@ mod scripted;
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
+    /// Whether the cached provider projection was applied to this exact canonical source.
+    fn host_context_source_matches(&self, _source: &Value) -> bool {
+        false
+    }
+
+    /// Latest applied host projections, separate from the canonical session context.
+    fn host_context_projections(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    /// Read current native tool schemas without waiting for the turn's session lock.
+    fn host_tool_definitions(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(std::future::ready(Vec::new()))
+    }
+
+    /// Narrow or widen the host selection within the native tool inventory.
+    fn set_host_active_tools(
+        &self,
+        _tools: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("Engine does not support host active tools") })
+    }
+
+    /// Remove only the host tool override when its adapter detaches.
+    fn clear_host_active_tools(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    /// Clear only host-owned prompt/tool adaptations when its adapter detaches.
+    fn clear_host_overrides(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    /// Inject a custom context row; the worker remains the persistence owner.
+    fn inject_host_custom_message(
+        &self,
+        _row: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("Engine does not support host context injection") })
+    }
+
     /// The session's shared MCP manager, when the engine owns one: the
     /// `replace_acp_mcp_servers` command writes through it.
     fn acp_mcp_manager(

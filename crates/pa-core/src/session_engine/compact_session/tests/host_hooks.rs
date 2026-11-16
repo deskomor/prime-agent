@@ -57,10 +57,12 @@ async fn the_host_cancels_a_compaction() {
     let model = registration.get_model();
     let tmp = tempfile::tempdir().unwrap();
     let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let completed: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let session = hooked_session(
         tmp.path(),
         SessionHostHooks {
             session_before_compact: Some(recording_hook(&seen, Some(json!({ "cancel": true })))),
+            lifecycle: Some(recording_hook(&completed, None)),
             ..SessionHostHooks::default()
         },
     )
@@ -81,6 +83,7 @@ async fn the_host_cancels_a_compaction() {
         .is_some_and(|messages| !messages.is_empty()));
     assert!(seen[0]["firstKeptEntryId"].is_string(), "{}", seen[0]);
     assert!(compaction_summaries(&session).await.is_empty());
+    assert!(completed.lock().unwrap().is_empty());
     registration.unregister();
 }
 
@@ -91,6 +94,7 @@ async fn the_host_supplies_the_compaction_summary() {
     let tmp = tempfile::tempdir().unwrap();
     let before: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let projections: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let completed: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let session = hooked_session(
         tmp.path(),
         SessionHostHooks {
@@ -99,6 +103,7 @@ async fn the_host_supplies_the_compaction_summary() {
                 Some(json!({ "summary": "HOST SUMMARY" })),
             )),
             context: Some(recording_hook(&projections, None)),
+            lifecycle: Some(recording_hook(&completed, None)),
             ..SessionHostHooks::default()
         },
     )
@@ -113,6 +118,17 @@ async fn the_host_supplies_the_compaction_summary() {
         registration.call_count(),
         calls_before,
         "the summarizer never ran"
+    );
+    let CompactOutcome::Ran(run) = &outcome else {
+        panic!("the host-supplied summary must compact");
+    };
+    assert_eq!(
+        *completed.lock().unwrap(),
+        vec![json!({
+            "type": "session_compact",
+            "compactionEntry": run.entry,
+            "fromExtension": false,
+        })]
     );
     let summaries = compaction_summaries(&session).await;
     assert_eq!(summaries.len(), 1, "{summaries:?}");

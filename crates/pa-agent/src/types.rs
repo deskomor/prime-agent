@@ -47,7 +47,8 @@ pub enum Transport {
 }
 
 /// How tool calls from one assistant message are executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ToolExecutionMode {
     Sequential,
     /// Preflight sequentially, execute allowed calls concurrently.
@@ -650,11 +651,28 @@ pub struct AfterToolCallContext {
     pub context: AgentContext,
 }
 
+/// A native tool call paired with its inputs and finalized result in source order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeToolExchange {
+    /// Zero-based position in the assistant message's tool calls.
+    pub source_order: usize,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub original_input: serde_json::Value,
+    /// Validated execution arguments; original input when preparation rejects the call.
+    pub executed_input: serde_json::Value,
+    pub result: ToolResultMessage,
+}
+
 /// Context passed to `should_stop_after_turn` and `get_continuation_messages`.
 #[derive(Clone)]
 pub struct ShouldStopAfterTurnContext {
     pub message: AssistantMessage,
     pub tool_results: Vec<ToolResultMessage>,
+    /// Effective batch mode, including per-tool sequential requirements.
+    pub tool_execution: ToolExecutionMode,
+    pub tool_exchanges: Vec<NativeToolExchange>,
     pub context: AgentContext,
     /// Messages returned by this invocation; prompts include initial prompts,
     /// continuations exclude prior context.

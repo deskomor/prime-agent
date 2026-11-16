@@ -69,6 +69,12 @@ Every contributor (human or agent) must read this before working on this repo.
 
 ## Tests
 
+- Before running native tests or probes that can start workers or provision Python,
+  use a throwaway `HOME` and agent/session directories, and explicitly set
+  `PRIME_AGENT_KERNEL_VENV`, `UV_CACHE_DIR`, and `UV_PYTHON_INSTALL_DIR` to scratch
+  paths. Strip auth and live agent-home environment variables. A temporary
+  `WorkerConfig.agent_dir` alone does not isolate process-global provisioning.
+  Never roll back or delete live agent state to repair a test side effect.
 - Prefer whole-object equality comparisons over field-by-field checks.
 - Do not add tests for statically defined values.
 - Do not add negative tests for logic that was removed.
@@ -184,6 +190,22 @@ EXPLICIT EXCEPTION: wire-protocol identifiers that must stay byte-compatible wit
 - RLM kernel API in the persistent Python REPL: `rlm.spawn/find_models/collect/list_subagents/delete_subagent/create_session/progress_note`, `rlm.harness` CRUD, `agent_message.send`, `agent_observe`, `compact`, `goal`, `refine`, `attach_image`, skills (markdown + Python) per the skill contract in the base system prompt.
 - System prompt structure: layered — cache-stable static layer files (core harness description with the full API surface, mandatory usage rules, opinionated guidelines, per-model additions from the model-prompts TOML rule map) followed by one dynamic tail (packages, project context, skills inventory, MCP servers, environment, session role); the harness digest stays a separate `[harness-digest]` user message. `prime-agent prompt` dumps the assembled prompt with its layer breakdown.
 - CLI shape: `prime-agent` with the same commands/flags as the TS product; headless modes (RPC/daemon/session-worker) with identical behavior.
+
+## Optional Studio ACP host
+
+- Studio's native fork opts in at ACP initialize with
+  `_meta["ai.primeintellect.prime-agent"].hostContract.version = 1`.
+  Without this opt-in, legacy ACP and CLI run behavior stay unchanged. The safe
+  `--version` output keeps the product version first and adds compiled source
+  identity on its second line (`crates/pa-cli/README.md`).
+- Native session identities, finalized exchanges, context refs, and family routing
+  remain authoritative. Host snapshots and writes must target the hosted root or
+  its native descendants, never arbitrary daemon sessions.
+- Host detach releases only host-owned prompt/tool adaptations and refinement pause.
+  The daemon continues to own native supervision and generic MCP lifetimes.
+- Contract and implementation ownership: `crates/pa-daemon/README.md` (ACP relay,
+  snapshots, writes, Studio MCP bindings), `crates/pa-core/README.md` (context and
+  family policy), `crates/pa-agent/README.md` (loop exchanges and continuation).
 
 ## Crates
 

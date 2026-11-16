@@ -300,6 +300,136 @@ async fn tool_call_turn_dispatches_and_feeds_result_back() {
 }
 
 #[tokio::test]
+async fn settled_turn_carries_original_prepared_inputs_and_finalized_results() {
+    struct PreparedEcho;
+
+    impl AgentTool for PreparedEcho {
+        fn name(&self) -> &'static str {
+            "prepared_echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Echoes prepared arguments."
+        }
+
+        fn parameters(&self) -> &serde_json::Value {
+            static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                })
+            })
+        }
+
+        fn prepare_arguments(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "text": args["raw"] }))
+        }
+
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            params: serde_json::Value,
+            _signal: AbortSignal,
+            _on_update: AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<AgentToolResult>> {
+            Box::pin(async move {
+                assert_eq!(params, serde_json::json!({ "text": "42" }));
+                Ok(AgentToolResult::text("unfinalized"))
+            })
+        }
+    }
+
+    for mode in [ToolExecutionMode::Parallel, ToolExecutionMode::Sequential] {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_tool_call_turn(
+            None,
+            vec![
+                ("same-id", "prepared_echo", serde_json::json!({ "raw": 42 })),
+                (
+                    "same-id",
+                    "missing",
+                    serde_json::json!({ "raw": "missing" }),
+                ),
+            ],
+        );
+        let captured = Arc::new(Mutex::new(None));
+        let mut config =
+            AgentLoopConfig::new(test_model(), AgentLoopConfig::default_convert_to_llm());
+        config.tool_execution = mode;
+        config.before_tool_call = Some(Arc::new(|context, _signal| {
+            Box::pin(async move {
+                assert_eq!(context.args, serde_json::json!({ "text": "42" }));
+                Ok(None)
+            })
+        }));
+        config.after_tool_call = Some(Arc::new(|context, _signal| {
+            Box::pin(async move {
+                assert_eq!(context.args, serde_json::json!({ "text": "42" }));
+                Ok(Some(pa_agent::types::AfterToolCallResult {
+                    content: Some(vec![ToolResultContent::text("finalized")]),
+                    details: Some(serde_json::json!({ "final": true })),
+                    is_error: Some(true),
+                    ..Default::default()
+                }))
+            })
+        }));
+        config.should_stop_after_turn = Some(Arc::new({
+            let captured = Arc::clone(&captured);
+            move |context| {
+                let captured = Arc::clone(&captured);
+                Box::pin(async move {
+                    *captured.lock().unwrap() = Some(context);
+                    Ok(true)
+                })
+            }
+        }));
+        let stream_fn = provider.stream_fn();
+        run_agent_loop_continue(
+            AgentContext {
+                system_prompt: String::new(),
+                messages: vec![AgentMessage::user("go")],
+                tools: vec![Arc::new(PreparedEcho)],
+            },
+            &config,
+            Arc::new(|_event| Box::pin(async { Ok(()) })),
+            None,
+            Some(&stream_fn),
+        )
+        .await
+        .unwrap();
+        let context = captured.lock().unwrap().take().unwrap();
+        assert_eq!(context.tool_execution, mode);
+        let mut finalized = context.tool_results[0].clone();
+        finalized.content = vec![ToolResultContent::text("finalized")];
+        finalized.details = Some(serde_json::json!({ "final": true }));
+        finalized.is_error = true;
+        assert_eq!(
+            context.tool_exchanges,
+            vec![
+                pa_agent::types::NativeToolExchange {
+                    source_order: 0,
+                    tool_call_id: "same-id".into(),
+                    tool_name: "prepared_echo".into(),
+                    original_input: serde_json::json!({ "raw": 42 }),
+                    executed_input: serde_json::json!({ "text": "42" }),
+                    result: finalized,
+                },
+                pa_agent::types::NativeToolExchange {
+                    source_order: 1,
+                    tool_call_id: "same-id".into(),
+                    tool_name: "missing".into(),
+                    original_input: serde_json::json!({ "raw": "missing" }),
+                    executed_input: serde_json::json!({ "raw": "missing" }),
+                    result: context.tool_results[1].clone(),
+                },
+            ]
+        );
+    }
+}
+
+#[tokio::test]
 async fn parallel_tool_calls_execute_concurrently_and_emit_in_order() {
     // Both calls target the same slow tool: overlap shows up as its
     // concurrent-execution high-water mark.

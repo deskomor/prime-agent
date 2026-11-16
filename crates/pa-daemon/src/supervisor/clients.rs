@@ -312,6 +312,27 @@ impl Supervisor {
         // stop the session). The registry entries go first — no session event may
         // be enqueued for a connection whose loop has exited.
         attached.detach_all(&self.session_subscribers);
+        let host_sessions = connection
+            .host_hook_sessions
+            .lock()
+            .await
+            .take()
+            .unwrap_or_default();
+        let owner_admission = self.host_owner_admission.lock().await;
+        self.client_connections
+            .lock()
+            .unwrap()
+            .remove(&connection_id);
+        let mut groups: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for (selector, owner) in host_sessions {
+            groups.entry(owner).or_default().insert(selector);
+        }
+        for (owner, sessions) in groups {
+            self.active_host_owners.lock().unwrap().remove(&owner);
+            self.release_host_owner_sessions(&owner, sessions).await;
+        }
+        drop(owner_admission);
         let attached_sessions = attached.session_ids();
         for active_session_id in &attached_sessions {
             if let Ok(resident) = self.registry.resolve(active_session_id).await {
@@ -332,6 +353,59 @@ impl Supervisor {
         self.release_all_client_pauses(&connection).await;
         connection.prompt_admissions.cancel_all_waiting();
         served
+    }
+
+    /// Release one root adapter's explicit targets and inherited descendants.
+    /// The caller holds host_owner_admission to fence child inheritance.
+    async fn release_host_owner_sessions(
+        &self,
+        owner_token: &str,
+        mut host_sessions: std::collections::HashSet<String>,
+    ) {
+        for resident in self.registry.list().await {
+            let mut descriptor = resident.descriptor.lock().await;
+            let inherited = descriptor
+                .create_command
+                .rest
+                .get("hostHooksParent")
+                .and_then(|hooks| hooks.get("hostOwnerToken"))
+                .and_then(Value::as_str)
+                == Some(owner_token);
+            if inherited {
+                host_sessions.insert(descriptor.root_active_session_id.clone());
+                descriptor.create_command.rest.remove("hostHooksParent");
+                if let Err(error) =
+                    crate::descriptor::persist_worker(&resident.descriptor_path, &descriptor)
+                {
+                    self.log_line(&format!(
+                        "could not clear inherited host adapter: {error:#}"
+                    ));
+                }
+            }
+        }
+        for selector in host_sessions {
+            let resident = match self.registry.resolve(&selector).await {
+                Ok(resident) => Some(resident),
+                Err(_) => self.binding_target(&selector).await,
+            };
+            if let Some(resident) = resident {
+                let payload = json!({
+                    "type": "set_host_hooks",
+                    "activeSessionId": selector,
+                    "hooks": [],
+                    "hostOwnerToken": owner_token,
+                });
+                let _ = self
+                    .route_command_typed(
+                        &resident,
+                        "set_host_hooks",
+                        payload,
+                        ROUTE_TIMEOUT_MS,
+                        RouteAdmission::SupervisorInternal,
+                    )
+                    .await;
+            }
+        }
     }
 
     /// Retire a connection's response path before its asynchronous cleanup.
@@ -1113,6 +1187,127 @@ impl Supervisor {
                 )
                 .await
             }
+            DaemonCommand::SetHostHooks {
+                active_session_id, ..
+            }
+            | DaemonCommand::SetActiveTools {
+                active_session_id, ..
+            }
+            | DaemonCommand::SetAutoRefine {
+                active_session_id, ..
+            } => {
+                let mut leases = connection.host_hook_sessions.lock().await;
+                let Some(sessions) = leases.as_mut() else {
+                    return (
+                        vec![response_line(&response_failure(
+                            Some(&command_id),
+                            &type_name,
+                            "Host connection is closed",
+                            None,
+                        ))],
+                        false,
+                    );
+                };
+                let owner_admission = self.host_owner_admission.lock().await;
+                let mut owner = sessions.get(active_session_id).cloned();
+                let mut detach = false;
+                if let DaemonCommand::SetHostHooks { hooks, .. } = command {
+                    owner.get_or_insert_with(|| {
+                        format!(
+                            "supervisor:{connection_id}:{active_session_id}:{}",
+                            util::new_display_id()
+                        )
+                    });
+                    detach = hooks.is_empty();
+                    if !detach {
+                        self.active_host_owners
+                            .lock()
+                            .unwrap()
+                            .insert(owner.clone().unwrap());
+                    }
+                } else if owner.is_none() && !sessions.is_empty() {
+                    if let Ok(resident) = self.registry.resolve(active_session_id).await {
+                        owner = resident
+                            .descriptor
+                            .lock()
+                            .await
+                            .create_command
+                            .rest
+                            .get("hostHooksParent")
+                            .and_then(|hooks| hooks.get("hostOwnerToken"))
+                            .and_then(Value::as_str)
+                            .filter(|token| {
+                                token.starts_with(&format!("supervisor:{connection_id}:"))
+                            })
+                            .map(str::to_string);
+                    }
+                    if owner.is_none() {
+                        return (
+                            vec![response_line(&response_failure(
+                                Some(&command_id),
+                                &type_name,
+                                "Target is not owned by this host adapter",
+                                None,
+                            ))],
+                            false,
+                        );
+                    }
+                }
+                let mut owned = command.clone();
+                if let Some(owner) = &owner {
+                    sessions.insert(active_session_id.clone(), owner.clone());
+                    if let DaemonCommand::SetHostHooks { rest, .. }
+                    | DaemonCommand::SetActiveTools { rest, .. }
+                    | DaemonCommand::SetAutoRefine { rest, .. } = &mut owned
+                    {
+                        rest.insert("hostOwnerToken".to_string(), json!(owner));
+                    }
+                }
+                let client_id = effective_client_id.lock().unwrap().clone();
+                if !matches!(command, DaemonCommand::SetHostHooks { .. }) {
+                    drop(owner_admission);
+                    drop(leases);
+                    return self
+                        .route_client_command(
+                            &owned,
+                            &client_id,
+                            attached,
+                            command_id,
+                            type_name,
+                            Some(stream),
+                        )
+                        .await;
+                }
+                if detach {
+                    if let Some(owner) = &owner {
+                        self.active_host_owners.lock().unwrap().remove(owner);
+                    }
+                }
+                drop(owner_admission);
+                let outcome = self
+                    .route_client_command(
+                        &owned,
+                        &client_id,
+                        attached,
+                        command_id,
+                        type_name,
+                        Some(stream),
+                    )
+                    .await;
+                if detach {
+                    let _owner_admission = self.host_owner_admission.lock().await;
+                    if let Some(owner) = owner {
+                        let targets = sessions
+                            .iter()
+                            .filter(|(_, token)| **token == owner)
+                            .map(|(selector, _)| selector.clone())
+                            .collect();
+                        sessions.retain(|_, token| *token != owner);
+                        self.release_host_owner_sessions(&owner, targets).await;
+                    }
+                }
+                outcome
+            }
             command => {
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.route_client_command(
@@ -1356,6 +1551,145 @@ mod tests {
             "the log names the dropped count: {line}"
         );
         connection.abort();
+    }
+
+    #[tokio::test]
+    async fn original_host_socket_disconnect_releases_root_and_inherited_child_only() {
+        async fn resident(
+            supervisor: &Arc<Supervisor>,
+            dir: &std::path::Path,
+            id: &str,
+            inherited: Option<Value>,
+        ) -> (
+            Arc<crate::host_hooks::HostHookBroker>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
+                "version": 2, "workerId": id, "pid": 0,
+                "socketPath": "/tmp/none.sock", "recoveryJournalPath": "/tmp/none.jsonl",
+                "supervisorSocketPath": "/tmp/none.sock", "authenticationToken": "shared-hop",
+                "rootActiveSessionId": id, "createdAt": "t", "updatedAt": "t",
+                "lifecycle": "ready", "createCommand": {"hostHooksParent": inherited},
+                "consecutiveFailures": 0,
+            }))
+            .unwrap();
+            let worker =
+                ResidentWorker::new(id.to_string(), descriptor, dir.join(format!("{id}.json")));
+            let broker = crate::host_hooks::HostHookBroker::new(Arc::new(|_| {}));
+            if let Some(inherited) = inherited {
+                broker
+                    .set_hooks(&["context".to_string()], None, None)
+                    .unwrap();
+                broker.set_owner_token(
+                    inherited
+                        .get("hostOwnerToken")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                );
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::registry::WorkerRequest>(8);
+            let epoch = worker.note_connection_live();
+            worker.install_command_channel(epoch, tx).await;
+            worker.note_session_ready();
+            supervisor.registry.insert(Arc::clone(&worker)).await;
+            let task_broker = Arc::clone(&broker);
+            let task = tokio::spawn(async move {
+                while let Some(request) = rx.recv().await {
+                    assert_eq!(request.command_type, "set_host_hooks");
+                    let token = request
+                        .payload
+                        .get("hostOwnerToken")
+                        .and_then(Value::as_str)
+                        .expect("original socket ownership must survive the shared worker hop");
+                    assert_ne!(token, "shared-hop");
+                    let hooks: Vec<String> =
+                        serde_json::from_value(request.payload["hooks"].clone()).unwrap();
+                    let owner = task_broker
+                        .inherited_config()
+                        .and_then(|config| config.get("hostOwnerToken").cloned());
+                    if !hooks.is_empty() || owner.as_ref().and_then(Value::as_str) == Some(token) {
+                        task_broker.set_hooks(&hooks, None, None).unwrap();
+                        task_broker.set_owner_token((!hooks.is_empty()).then(|| token.to_string()));
+                    }
+                    let reply = response_success(None, "set_host_hooks", None);
+                    worker
+                        .pending
+                        .lock()
+                        .await
+                        .remove(&request.request_id)
+                        .unwrap()
+                        .send(crate::registry::WorkerReply::Typed(reply))
+                        .ok();
+                }
+            });
+            (broker, task)
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .unwrap(),
+        );
+        let (root, root_task) = resident(&supervisor, dir.path(), "root", None).await;
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let connection = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.handle_client(Box::new(server)).await })
+        };
+        let (read, mut write) = client.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let command = json!({
+            "type": "command", "id": "hooks", "clientId": "acp:owner",
+            "protocol": {"name": "prime-agent.daemon", "version": 7},
+            "command": {"type": "set_host_hooks", "activeSessionId": "root", "hooks": ["context"]},
+        });
+        write
+            .write_all((command.to_string() + "\n").as_bytes())
+            .await
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["success"],
+            true
+        );
+        let inherited = root.inherited_config().unwrap();
+        let (child, child_task) = resident(&supervisor, dir.path(), "child", Some(inherited)).await;
+        let (unrelated, unrelated_task) = resident(
+            &supervisor,
+            dir.path(),
+            "other",
+            Some(json!({
+                "hostOwnerToken": "supervisor:another-socket:other:nonce",
+            })),
+        )
+        .await;
+        root.set_auto_refine_paused(true);
+        child.set_auto_refine_paused(true);
+        unrelated.set_auto_refine_paused(true);
+        drop(write);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            [
+                root.auto_refine_paused().load(Ordering::SeqCst),
+                child.auto_refine_paused().load(Ordering::SeqCst),
+                unrelated.auto_refine_paused().load(Ordering::SeqCst),
+            ],
+            [false, false, true]
+        );
+        root_task.abort();
+        child_task.abort();
+        unrelated_task.abort();
     }
 
     // One real connection speaking for `client_id`, driven through its

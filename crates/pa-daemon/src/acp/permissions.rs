@@ -89,6 +89,7 @@ struct OutstandingRequest {
 #[derive(Default)]
 pub(crate) struct PermissionRelay {
     opted_in: AtomicBool,
+    contract_v1: AtomicBool,
     hooks: Mutex<HookOptIn>,
     next_id: AtomicU64,
     outstanding: Mutex<HashMap<String, OutstandingRequest>>,
@@ -109,24 +110,39 @@ impl PermissionRelay {
             .and_then(Value::as_bool)
             == Some(true);
         self.opted_in.store(opted_in, Ordering::SeqCst);
+        self.contract_v1.store(
+            meta.and_then(|meta| meta.pointer("/hostContract/version"))
+                .and_then(Value::as_u64)
+                == Some(1),
+            Ordering::SeqCst,
+        );
+        let contract = self
+            .host_contract()
+            .then(|| meta.and_then(|meta| meta.get("hostContract")))
+            .flatten();
+        let field = |key: &str| {
+            contract
+                .and_then(|contract| contract.get(key))
+                .or_else(|| meta.and_then(|meta| meta.get(key)))
+        };
         let strings = |key: &str| {
-            meta.and_then(|meta| meta.get(key))
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
+            field(key).and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
         };
         *self.hooks.lock().expect("hook opt-in lock") = HookOptIn {
             hooks: strings("hooks").unwrap_or_default(),
             host_call_types: strings("hostCallTypes"),
-            timeout_ms: meta
-                .and_then(|meta| meta.get("hookTimeoutMs"))
-                .and_then(Value::as_u64),
+            timeout_ms: field("hookTimeoutMs").and_then(Value::as_u64),
         };
+    }
+
+    pub(crate) fn host_contract(&self) -> bool {
+        self.contract_v1.load(Ordering::SeqCst)
     }
 
     pub(crate) fn opted_in(&self) -> bool {
@@ -458,6 +474,27 @@ mod tests {
             ("daemon-1", "reject_once"),
             "the parent session decides the subagent's call"
         );
+    }
+
+    #[test]
+    fn nested_contract_hooks_require_v1() {
+        let relay = PermissionRelay::default();
+        let mut params = json!({"clientCapabilities":{"_meta":{"ai.primeintellect.prime-agent":{"hostContract":{"version":1,"hooks":["session_start"],"hookTimeoutMs":150000}}}}});
+        relay.observe_initialize(&params);
+        assert!(relay.host_contract());
+        assert_eq!(
+            relay.hook_opt_in(),
+            HookOptIn {
+                hooks: vec!["session_start".into()],
+                host_call_types: None,
+                timeout_ms: Some(150000)
+            }
+        );
+        params["clientCapabilities"]["_meta"][PRIME_AGENT_META_NAMESPACE]["hostContract"]
+            ["version"] = json!(2);
+        relay.observe_initialize(&params);
+        assert!(!relay.host_contract());
+        assert_eq!(relay.hook_opt_in(), HookOptIn::default());
     }
 
     #[test]

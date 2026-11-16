@@ -79,7 +79,11 @@ the internal `daemon start`/`open` commands, which are not reachable from the pu
 
 The release artifact is exe-adjacent (TS install.sh native layout): the binary
 plus `package.json` (the version manifest `--version` reads at runtime, with
-the compiled-in version as the fallback), `prime-agent-runtime/` (the kernel
+the compiled-in version as the fallback). The first `--version` line stays the
+product version. The second is `build: <40hex|unknown> dirty: <true|false|unknown>`,
+using immutable `pa_daemon::protocol::build_identity()` metadata rather than runtime
+Git or environment values. Product-version consumers read the first line only.
+Other sidecars are `prime-agent-runtime/` (the kernel
 sidecar), `skills/`, and `docs/`. `scripts/package_release.py` (`make package`)
 assembles, validates, version-pins, hashes, and tars it; the hidden
 `--prime-agent-bootstrap` flag is the installer handoff that pre-bootstraps the

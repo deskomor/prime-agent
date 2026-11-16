@@ -313,9 +313,8 @@ pub struct GenerateBranchSummaryOptions<'a> {
     pub custom_instructions: Option<&'a str>,
     /// Replace the default prompt instead of appending the custom focus.
     pub replace_instructions: bool,
-    /// The host's `context` hook, which may project the prepared branch
-    /// messages (purpose `branch_summary`) before the summarizer reads them.
-    pub project: Option<super::host_hooks::HostHookFn>,
+    /// The host's negotiated context projection for the prepared branch messages.
+    pub project: Option<super::host_hooks::SessionHostHooks>,
     /// Tokens reserved for prompt + response (TS default 16384).
     pub reserve_tokens: u64,
     /// When present, the summary call resolves its model through the
@@ -448,20 +447,25 @@ pub async fn generate_branch_summary(
     let mut preparation = prepare_branch_entries_with_refinements(entries, token_budget, enabled);
     // The host's `context` hook may project the branch messages the
     // summarizer reads; the file-op tally keeps the unprojected branch.
-    if let Some(hook) = project.as_ref() {
-        if !preparation.messages.is_empty() {
-            if let Some(messages) = super::host_hooks::project_messages(
-                hook,
+    let projection = if preparation.messages.is_empty() {
+        None
+    } else if let Some(hooks) = project.as_ref() {
+        hooks
+            .project_context(
                 "branch_summary",
                 &preparation.messages,
                 &preparation.entry_ids,
             )
             .await
-            {
-                preparation.entry_ids = vec![None; messages.len()];
-                preparation.messages = messages;
-            }
+    } else {
+        None
+    };
+    if let Some(projection) = projection {
+        preparation.entry_ids = vec![None; projection.messages.len()];
+        for entry_ref in projection.entry_refs {
+            preparation.entry_ids[entry_ref.message_index] = Some(entry_ref.entry_id);
         }
+        preparation.messages = projection.messages;
     }
     let request_messages =
         branch_summary_request_messages(&preparation, custom_instructions, replace_instructions);

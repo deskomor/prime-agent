@@ -202,7 +202,7 @@ def main() -> int:
         )
         if run.returncode != 0:
             fail(f"staged prime-agent --version failed: {run.stderr.strip()}")
-        version_out = run.stdout.strip()
+        version_out = run.stdout.partition("\n")[0].strip()
         expected_version = (
             f"{args.version}-{CONTINUOUS_SUFFIX}.{args.sha}" if args.sha else args.version
         )

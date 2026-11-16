@@ -3,6 +3,16 @@
 These rules mirror the repo standards in AGENTS.md - update both whenever
 either changes.
 
+## Optional Studio ACP host
+
+- Studio host contract v1 is explicitly negotiated; unchanged ACP/CLI run behavior
+  is required without it. `--version` preserves its product-version first line and
+  adds immutable compiled source identity on its second. Native identity, context refs, finalized tool exchanges,
+  and resolved family membership remain authoritative.
+- Host operations may target only the hosted root and its native descendants.
+  Detach clears only host-owned prompt/tool adaptations and refinement pause,
+  not native defaults or supervision. See the crate READMEs named in AGENTS.md.
+
 ## No legacy or migration scaffolding
 
 - When a migration or refactor completes within a PR, its staging scaffolding must be deleted, not kept: no type aliases where two names point at one type, no re-exports "for compatibility" without a live external consumer, no migration-era vocabulary ("staged", "legacy", "new-style") surviving in names, comments, or test titles.
@@ -49,6 +59,12 @@ either changes.
 
 ## Tests
 
+- Native tests or probes that can start workers or provision Python require a
+  throwaway `HOME` and agent/session directories plus explicit scratch paths for
+  `PRIME_AGENT_KERNEL_VENV`, `UV_CACHE_DIR`, and `UV_PYTHON_INSTALL_DIR`. Strip auth
+  and live agent-home environment variables. Flag reliance on a temporary
+  `WorkerConfig.agent_dir` alone; it does not isolate process-global provisioning.
+  Never roll back or delete live agent state to repair a test side effect.
 - A bug fix that changes meaningful behavior lands with a regression test that fails without the fix; flag tests that pass without it. Trivial or documentation-only changes need no test.
 - Reject incidental or duplicate coverage, tests that re-check behavior the PR does not change, and copy/string snapshot assertions that merely restate labels or descriptions; assert text only when the text is the behavior.
 - Flag test code far out of proportion to the product change (for example 2,300 test lines for ~400 product lines). Ask for one discriminating test per behavior change, not several tests that pin the same behavior.

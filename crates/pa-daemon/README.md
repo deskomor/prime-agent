@@ -243,11 +243,114 @@ broadcast owns its surface here too (the worker's cron-store
 to every client, so any heartbeat mutation anywhere in the daemon reaches
 attached UIs daemon-wide).
 
+Host state access (`agent_engine/host_session.rs`) uses the mirrored live agent
+rather than holding the core-session mutex across an awaited host request.
+The worker owns custom-message persistence; injection adds its canonical row only
+to live agent context. Host active-tool selections narrow the retained native
+inventory and can widen back to it; detach restores that inventory and clears only
+host prompt overrides and suffixes, leaving the native prompt unchanged. Selection
+writes, detach, and runtime adoption serialize through the same async lock.
+`SessionEngine::host_context_projections` exposes cached applied projections by
+purpose, separate from the worker's durable canonical context. The connection
+installing host hooks owns their lease: only its disconnect clears hooks,
+host prompt/tool overrides, and the host refinement pause. Supervisor-routed hooks
+carry a unique root-adapter owner token from the original client connection,
+not the shared worker-hop token. Explicit root detach releases its targeted
+sessions and inherited descendants; socket disconnect releases all of that
+socket's adapters. Other roots and owners remain attached. Cleanup resolves
+rebound selectors and removes stale inherited config from child descriptors.
+Child admission fences inheritance against owner release, so a captured spawn
+cannot restore a detached adapter.
+
+## ACP host session access
+
+Negotiated Studio host contract v1 exposes `session_snapshot`,
+`append_custom_message`, and `set_active_tools` in the
+`_ai.primeintellect.prime-agent/` namespace. `sessionId` always names the ACP
+root; optional `targetActiveSessionId` must resolve through native parent links
+as that root or a descendant. `append_session_entry` and `set_auto_refine`
+accept the same scoped target; their legacy root-only calls need no negotiation.
+
+Snapshots carry native durable identity, the header and leaf, a revision tuple,
+active tool schemas, model and context usage, and faithful branch entries,
+including bookkeeping. `offset` and `limit` page entries, canonical context, and
+each available applied projection independently; each collection has its own
+`total` and `nextOffset`. `entryRefs.messageIndex` is local to the returned
+message page. Projection identities come only from applied native projections.
+`contextUsage` uses the applied provider projection only when its complete
+source matches the current canonical context; `contextUsageSource` names that
+choice. `canonicalContextUsage` remains available, and cached projection usage
+is labeled `lastAppliedProjectionUsage` rather than assumed current.
+Pages stay below the wire budget without changing row content; a single row or
+metadata too large for that budget returns an explicit error. A revision change
+between pages requires a fresh read. Reentrant handlers use worker state and
+cached live engine handles, not the engine's outer session mutex.
+
+Custom messages persist once before context injection and return the durable
+`entryId`; a failed injection reports the already-persisted identity. Empty host
+hook registration restores native tools and clears host prompt overrides.
+
+## Optional Studio ACP host contract
+
+Initialize opts in with `clientCapabilities._meta["ai.primeintellect.prime-agent"].hostContract.version = 1`.
+The response publishes the implemented v1 features. Hook callbacks use
+`_ai.primeintellect.prime-agent/hook`; negotiated hooks default to 150 seconds.
+The native origin identifies the executing durable session, including child hooks.
+The root admits `session/new` before awaiting its actual `session_start`; callback
+snapshots and writes can reenter while prompts wait on the session's startup gate.
+Close and disconnect cancel that session's startup wait, not a replacement's gate.
+An opted-in child emits its actual `session_start` after native create/resume and
+before queued input can run. Create returns to let the supervisor mark its route
+ready; an owned queued-work pause remains held until the native hook settles,
+so callback snapshots and writes can reenter without racing the first prompt.
+Graceful shutdown and kill/cascade paths cancel work before native
+`session_shutdown`, whose optional notification has a two-second budget before
+session identity is cleared. Abrupt process death cannot emit a hook.
+The `family_scope` feature declares authoritative caller-family payloads and native
+durable-session scope enforcement; it is not a runtime switch. `hostContract.build`
+reports `{commit, dirty}` captured by this crate's std-only `build.rs`, with null
+fields when Git identity is unavailable. Git HEAD, its resolved branch ref,
+packed refs, index and tracked source inputs invalidate the compile metadata.
+`dirty:false` requires explicit build-time `PRIME_AGENT_CLEAN_BUILD_COMMIT` matching
+actual HEAD and an empty Git status. Ordinary builds report observed dirty state
+or null, never implicit clean status; changing/removing that build input reruns
+the capture. `protocol::build_identity()` exposes the same immutable fields to the CLI; product
+version and mutable runtime checkout state are not build identity.
+Guarded v1 `agent_message.*` and `agent_observe.*` host calls include top-level
+`payload.family = { current, agents }` from the executing worker's native observe
+controller. Rows carry native session IDs, names, relationships, cwd, parent/child
+IDs, runtime kind and state flags, never message previews. Optional native fields
+remain absent when unavailable. User `data.family` is not authoritative. Each child
+reads its own family before relay; the root preserves it. Missing/failed native
+reads refuse guarded calls. Hooks off, legacy calls and non-family calls do not
+read this roster. Host-returned durable session scopes still constrain native
+family lists, alias selection and sends.
+
+Terminal `turn_end` advice resumes the same prompt only with explicit `continue:true`
+and nonempty custom messages. Without v1, the original hook behavior remains.
+
+`session_snapshot`, `append_session_entry`, `append_custom_message`, `set_active_tools`,
+and `set_auto_refine` share that extension namespace. `sessionId` identifies the ACP
+root; optional `targetActiveSessionId` must resolve to that root or its native
+descendants. Snapshots page faithful branch entries and active context separately;
+context refs and applied projection metadata remain separate from durable history.
+Writes return canonical committed entry IDs and remain callable during awaited hooks.
+
+Studio MCP inheritance requires v1 and per-stdio-server
+`_meta["ai.primeintellect.prime-agent"].inheritStudioMcp = true`. Native code stamps
+`PRIME_STUDIO_NATIVE_SESSION` for the root and each actual child before discovery.
+The durable child create payload retains the v1 marker, server configs and parent
+session ID, so initial launch and replay both reach the child's identity binding.
+A child never inherits a parent's native identity. Generic manager ownership and
+non-Studio server behavior remain unchanged.
+
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
 ## Public API
-Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::daemon::{run_daemon_attached_acp_mode, DaemonAcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types), `agent_engine::AgentSessionEngine::dispose_kernel` (the session-end kernel teardown the worker invokes at kill/shutdown/orphan exit — the engine outlives the session, so the pa-core engine-drop teardown cannot run there), the worker's `get_mcp_connections` command (`mcp_connections.rs`: the `/mcp` view's roster from the session's MCP manager overlaid with the session kernel's per-server tool listing, plus the api-key credential rows the same response serves — Rust-native session-plane extension; the TS daemon has no counterpart). Supervision internals `pub(crate)`.
+Supervisor entrypoint, worker entrypoint, `protocol::build_identity()` (immutable
+build-source commit and explicit clean/dirty metadata shared with CLI and ACP),
+`mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::daemon::{run_daemon_attached_acp_mode, DaemonAcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types), `agent_engine::AgentSessionEngine::dispose_kernel` (the session-end kernel teardown the worker invokes at kill/shutdown/orphan exit — the engine outlives the session, so the pa-core engine-drop teardown cannot run there), the worker's `get_mcp_connections` command (`mcp_connections.rs`: the `/mcp` view's roster from the session's MCP manager overlaid with the session kernel's per-server tool listing, plus the api-key credential rows the same response serves — Rust-native session-plane extension; the TS daemon has no counterpart). Supervision internals `pub(crate)`.
 
 
 ## Depends on

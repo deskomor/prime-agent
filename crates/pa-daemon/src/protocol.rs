@@ -23,6 +23,16 @@ pub const DAEMON_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static PRODUCT_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
+/// Source identity captured at build time; unavailable fields are JSON null.
+#[must_use]
+pub fn build_identity() -> Value {
+    let commit = env!("PA_BUILD_COMMIT");
+    serde_json::json!({
+        "commit": (commit != "unknown").then_some(commit),
+        "dirty": env!("PA_BUILD_DIRTY").parse::<bool>().ok(),
+    })
+}
+
 /// Set the packaged product version once in the composition root, before
 /// serving supervisor or worker connections. Repeating the same value is safe.
 ///
@@ -174,6 +184,8 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "request_tool_permission",
     "set_host_hooks",
     "respond_host_hook",
+    "session_snapshot",
+    "set_active_tools",
     "append_session_entry",
     "set_auto_refine",
     "request_host_hook",
@@ -763,6 +775,12 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::RequestHostHook {
             active_session_id, ..
         }
+        | DaemonCommand::SessionSnapshot {
+            active_session_id, ..
+        }
+        | DaemonCommand::SetActiveTools {
+            active_session_id, ..
+        }
         | DaemonCommand::AppendSessionEntry {
             active_session_id, ..
         }
@@ -1044,6 +1062,8 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::RequestToolPermission { .. } => "request_tool_permission",
         DaemonCommand::SetHostHooks { .. } => "set_host_hooks",
         DaemonCommand::RespondHostHook { .. } => "respond_host_hook",
+        DaemonCommand::SessionSnapshot { .. } => "session_snapshot",
+        DaemonCommand::SetActiveTools { .. } => "set_active_tools",
         DaemonCommand::AppendSessionEntry { .. } => "append_session_entry",
         DaemonCommand::SetAutoRefine { .. } => "set_auto_refine",
         DaemonCommand::RequestHostHook { .. } => "request_host_hook",

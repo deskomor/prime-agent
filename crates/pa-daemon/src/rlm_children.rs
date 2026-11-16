@@ -434,6 +434,8 @@ struct SupervisorChildSessionsInner {
     /// The host hooks this session has on: a child created while it has
     /// any runs the same hooks through this session.
     host_hook_probe: std::sync::Mutex<Option<HostHookProbe>>,
+    /// Only the MCP servers explicitly opted into the negotiated Studio host contract.
+    studio_mcp_servers: std::sync::Mutex<Vec<pa_core::mcp::AcpMcpServerConfig>>,
     /// The model-allowlist refusal telemetry: `spawn`/`create_session`
     /// refusals emit through the engine's shared lazily-built client.
     model_refusal_telemetry: std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
@@ -493,6 +495,7 @@ impl SupervisorChildSessions {
                 settle_notify: tokio::sync::Notify::new(),
                 tool_permission_probe: std::sync::Mutex::new(None),
                 host_hook_probe: std::sync::Mutex::new(None),
+                studio_mcp_servers: std::sync::Mutex::new(Vec::new()),
                 model_refusal_telemetry,
                 usage_sink: std::sync::Mutex::new(None),
                 delete_notifier: std::sync::Mutex::new(None),
@@ -533,6 +536,15 @@ impl SupervisorChildSessions {
             .host_hook_probe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
+    }
+
+    /// Replace the host-authorized MCP configs inherited by future native children.
+    pub(crate) fn set_studio_mcp_servers(&self, servers: Vec<pa_core::mcp::AcpMcpServerConfig>) {
+        *self
+            .inner
+            .studio_mcp_servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = servers;
     }
 
     pub(crate) fn set_child_update_sink(&self, sink: ChildUpdateSink) {

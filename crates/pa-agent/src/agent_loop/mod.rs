@@ -38,6 +38,13 @@ pub type TransformContextFn = Arc<
 /// Resolves the system prompt immediately before each LLM call.
 pub type GetSystemPromptFn = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Reads the live tool inventory after the provider context hook completes.
+pub type GetToolsFn = Arc<
+    dyn Fn() -> crate::BoxFut<'static, anyhow::Result<Vec<Arc<dyn crate::types::AgentTool>>>>
+        + Send
+        + Sync,
+>;
+
 /// Resolves an API key dynamically for each LLM call.
 pub type GetApiKeyFn =
     Arc<dyn Fn(String) -> crate::BoxFut<'static, anyhow::Result<Option<String>>> + Send + Sync>;
@@ -104,6 +111,7 @@ pub struct AgentLoopConfig {
     pub convert_to_llm: ConvertToLlmFn,
     pub transform_context: Option<TransformContextFn>,
     pub get_system_prompt: Option<GetSystemPromptFn>,
+    pub get_tools: Option<GetToolsFn>,
     pub get_api_key: Option<GetApiKeyFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
     pub should_stop_before_turn: Option<ShouldStopBeforeTurnFn>,
@@ -134,6 +142,7 @@ impl AgentLoopConfig {
             convert_to_llm,
             transform_context: None,
             get_system_prompt: None,
+            get_tools: None,
             get_api_key: None,
             should_stop_after_turn: None,
             should_stop_before_turn: None,

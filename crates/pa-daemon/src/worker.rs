@@ -159,6 +159,8 @@ pub struct Worker {
     pub(crate) tool_permissions: Arc<crate::tool_permission::ToolPermissionBroker>,
     /// The awaited host hooks (`set_host_hooks`, `respond_host_hook`).
     pub(crate) host_hooks: Arc<crate::host_hooks::HostHookBroker>,
+    /// Connection owning the installed host adapter; unrelated disconnects do not clear it.
+    pub(crate) host_hook_owner: tokio::sync::Mutex<Option<String>>,
     /// Single-use peer-transport grants (worker memory only).
     pub(crate) peer_grants: PeerGrantStore,
     pub(crate) compaction: crate::compaction::CompactionManager,
@@ -730,12 +732,39 @@ impl Worker {
         );
         let hook_core = Arc::clone(&core);
         let hook_events = events.clone();
-        let host_hooks = crate::host_hooks::HostHookBroker::new(Arc::new(move |event| {
+        let host_hooks = crate::host_hooks::HostHookBroker::new(Arc::new(move |mut event| {
+            if event.get("type").and_then(serde_json::Value::as_str) == Some("host_hook_request")
+                && event.get("origin").is_none()
+            {
+                let core = hook_core.lock().unwrap();
+                event["origin"] = serde_json::json!({
+                    "activeSessionId": core.active_session_id,
+                    "sessionId": core.store.as_ref().map(SessionFile::session_id),
+                    "sessionFile": core.store.as_ref().map(|store| store.path.to_string_lossy()),
+                    "cwd": core.cwd,
+                    "parentSessionId": core.parent_session_id,
+                    "parentActiveSessionId": core.parent_active_session_id,
+                    "rlmChildId": core.rlm_child_id,
+                    "generation": core.generation,
+                    "eventSequence": core.last_event_sequence,
+                    "admissionIds": core.running_admission_ids,
+                });
+            }
             emit_worker_event_with(&hook_core, &hook_events, event);
         }));
         if let Some(concrete) = agent_engine.as_ref() {
+            if let Some(reader) = concrete
+                .extra_host_handlers()
+                .and_then(|handlers| handlers.get("agent_observe.list").cloned())
+            {
+                host_hooks.set_family_reader(reader);
+            }
             concrete.set_host_hooks(pa_core::session_engine::host_hooks::SessionHostHooks {
-                before_tool_call: Some(tool_permissions.gate()),
+                contract_v1: Some(host_hooks.contract_flag()),
+                contract_epoch: host_hooks.contract_epoch(),
+                context_projection: Default::default(),
+                lifecycle: Some(host_hooks.lifecycle_hook()),
+                before_tool_call: Some(host_hooks.before_tool_call(tool_permissions.gate())),
                 after_tool_call: Some(host_hooks.after_tool_call()),
                 host_call_gate: Some(host_hooks.host_call_gate()),
                 before_agent_start: Some(
@@ -746,6 +775,9 @@ impl Worker {
                     host_hooks.optional_hook(crate::host_hooks::SESSION_BEFORE_COMPACT),
                 ),
                 context: Some(host_hooks.optional_hook(crate::host_hooks::CONTEXT)),
+                resources_discover: Some(
+                    host_hooks.optional_hook(crate::host_hooks::RESOURCES_DISCOVER),
+                ),
                 message_end: Some(host_hooks.optional_hook(crate::host_hooks::MESSAGE_END)),
                 auto_refine_paused: Some(host_hooks.auto_refine_paused()),
             });
@@ -819,6 +851,7 @@ impl Worker {
             side_questions,
             tool_permissions,
             host_hooks,
+            host_hook_owner: tokio::sync::Mutex::new(None),
             peer_grants: PeerGrantStore::new(),
             compaction,
             tree_navigation,

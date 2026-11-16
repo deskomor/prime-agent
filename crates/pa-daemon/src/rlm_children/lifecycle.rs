@@ -132,6 +132,16 @@ impl SupervisorChildSessionsInner {
             inherited["activeSessionId"] = json!(self.parent_active_session_id);
             config["hostHooksParent"] = inherited;
         }
+        let studio_mcp_servers = self
+            .studio_mcp_servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !studio_mcp_servers.is_empty() {
+            config["studioHostContractVersion"] = json!(1);
+            config["studioMcpServers"] = json!(studio_mcp_servers);
+            config["studioMcpParentSessionId"] = json!(identity.session_id);
+        }
         if let Some(script) = &identity.child_script {
             config["script"] = json!(script);
             // The scripted engine rides the identity down the recursion (TS
@@ -172,7 +182,10 @@ impl SupervisorChildSessionsInner {
             runtime_metadata,
             lifecycle: Some(DaemonSessionLifecycle::Resident),
             env: None,
-            launch_env,
+            launch_env: launch_env.map(|mut env| {
+                env.retain(|key, _| !key.starts_with("PRIME_STUDIO_NATIVE_"));
+                env
+            }),
             rest: Map::default(),
         };
         let summary = self

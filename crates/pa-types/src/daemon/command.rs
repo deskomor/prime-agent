@@ -810,6 +810,25 @@ pub enum DaemonCommand {
     },
     /// Append one durable custom entry (host state outside the model
     /// context); answers its `entryId`.
+    SessionSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetActiveTools {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        tools: Vec<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     AppendSessionEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

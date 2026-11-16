@@ -11,7 +11,7 @@
 //! - Enforcement hooks (`host_call`) guard a rule, so they refuse the call.
 //! - Optional hooks (`after_tool_call`, `before_agent_start`, `turn_end`,
 //!   `session_before_compact`, `session_before_tree`, `context`,
-//!   `message_end`, `user_bash_end`) add context or listen, so the session
+//!   `message_end`, `user_bash_end`, `resources_discover`) add context or listen, so the session
 //!   continues as if the hook were not there.
 //!
 //! With no hooks enabled (the default) every hook point answers at once and
@@ -33,6 +33,7 @@ use anyhow::anyhow;
 use pa_agent::abort::AbortSignal;
 use pa_agent::agent_loop::AfterToolCallFn;
 use pa_agent::types::{AfterToolCallResult, ToolResultContent};
+use pa_core::kernel::shared::{HostHandlerFn, HostRequestPayload};
 use pa_core::session_engine::host_hooks::HostCallGateFn;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -51,12 +52,24 @@ pub(crate) const SESSION_BEFORE_COMPACT: &str = "session_before_compact";
 pub(crate) const SESSION_BEFORE_TREE: &str = "session_before_tree";
 /// Project the messages a consumer reads, by purpose (optional).
 pub(crate) const CONTEXT: &str = "context";
+/// Discover host-generated skill paths before idle prompt normalization (optional).
+pub(crate) const RESOURCES_DISCOVER: &str = "resources_discover";
 /// Hear each finished message (optional, notification).
 pub(crate) const MESSAGE_END: &str = "message_end";
 /// Hear each finished user `!` bash run (optional, notification).
 pub(crate) const USER_BASH_END: &str = "user_bash_end";
 /// Every hook a client may enable.
-pub(crate) const KNOWN_HOOKS: [&str; 9] = [
+pub(crate) const KNOWN_HOOKS: [&str; 20] = [
+    "session_start",
+    "agent_start",
+    "turn_start",
+    "tool_call",
+    "tool_execution_start",
+    "model_select",
+    "session_compact",
+    "session_tree",
+    "agent_end",
+    "session_shutdown",
     AFTER_TOOL_CALL,
     HOST_CALL,
     BEFORE_AGENT_START,
@@ -64,6 +77,7 @@ pub(crate) const KNOWN_HOOKS: [&str; 9] = [
     SESSION_BEFORE_COMPACT,
     SESSION_BEFORE_TREE,
     CONTEXT,
+    RESOURCES_DISCOVER,
     MESSAGE_END,
     USER_BASH_END,
 ];
@@ -116,6 +130,9 @@ struct BrokerState {
     pending: HashMap<String, oneshot::Sender<HookAnswer>>,
     /// Set on an RLM child: its hooks go to the parent session.
     upstream: Option<HostHookUpstream>,
+    owner_token: Option<String>,
+    /// The executing worker's ungated native observe reader, never its relay parent's.
+    family_reader: Option<HostHandlerFn>,
 }
 
 /// The session's hook broker: the engine's hook points await it, the worker
@@ -125,6 +142,8 @@ pub(crate) struct HostHookBroker {
     emit: HostHookEmit,
     /// `set_auto_refine`: while set, the session runs no auto-refinement.
     auto_refine_paused: Arc<std::sync::atomic::AtomicBool>,
+    contract_v1: Arc<std::sync::atomic::AtomicBool>,
+    contract_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HostHookBroker {
@@ -133,7 +152,26 @@ impl HostHookBroker {
             state: Mutex::new(BrokerState::default()),
             emit,
             auto_refine_paused: Arc::default(),
+            contract_v1: Arc::default(),
+            contract_epoch: Arc::default(),
         })
+    }
+
+    pub(crate) fn set_family_reader(&self, reader: HostHandlerFn) {
+        self.state.lock().expect("host hook lock").family_reader = Some(reader);
+    }
+
+    pub(crate) fn contract_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.contract_v1)
+    }
+
+    pub(crate) fn contract_epoch(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.contract_epoch)
+    }
+
+    pub(crate) fn set_contract(&self, enabled: bool) {
+        self.contract_v1
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The shared pause flag the session's auto-refine trigger reads.
@@ -174,6 +212,11 @@ impl HostHookBroker {
             ));
         }
         let mut state = self.state.lock().expect("host hook lock");
+        if hooks.is_empty() {
+            self.set_auto_refine_paused(false);
+        }
+        self.contract_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         state.config = HookConfig {
             enabled: hooks.iter().cloned().collect(),
             host_call_types,
@@ -200,6 +243,8 @@ impl HostHookBroker {
         hooks.sort();
         Some(json!({
             "hooks": hooks,
+            "hostOwnerToken": state.owner_token,
+            "hostContractVersion": if self.contract_v1.load(std::sync::atomic::Ordering::SeqCst) { 1 } else { 0 },
             "hostCallTypes": state.config.host_call_types,
             "timeoutMs": u64::try_from(state.config.timeout.as_millis()).unwrap_or(u64::MAX),
         }))
@@ -210,6 +255,10 @@ impl HostHookBroker {
     /// # Panics
     ///
     /// Panics when the broker lock is poisoned.
+    pub(crate) fn set_owner_token(&self, owner: Option<String>) {
+        self.state.lock().expect("host hook lock").owner_token = owner;
+    }
+
     pub(crate) fn set_upstream(&self, upstream: HostHookUpstream) {
         self.state.lock().expect("host hook lock").upstream = Some(upstream);
     }
@@ -258,6 +307,8 @@ impl HostHookBroker {
         signal: Option<AbortSignal>,
         origin: Option<Value>,
     ) -> Option<HookAnswer> {
+        let bounded_close = hook == "session_shutdown"
+            && self.contract_v1.load(std::sync::atomic::Ordering::SeqCst);
         let route = {
             let mut state = self.state.lock().expect("host hook lock");
             if !state.config.enabled.contains(hook) {
@@ -269,7 +320,12 @@ impl HostHookBroker {
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let (sender, receiver) = oneshot::channel();
                 state.pending.insert(request_id.clone(), sender);
-                Ok((request_id, receiver, state.config.timeout))
+                let timeout = if bounded_close {
+                    state.config.timeout.min(Duration::from_secs(2))
+                } else {
+                    state.config.timeout
+                };
+                Ok((request_id, receiver, timeout))
             }
         };
         let (request_id, receiver, timeout) = match route {
@@ -277,6 +333,8 @@ impl HostHookBroker {
             Err(upstream) => {
                 return tokio::select! {
                     answer = upstream(hook.to_string(), payload, origin) => answer,
+                    () = tokio::time::sleep(Duration::from_secs(2)), if bounded_close =>
+                        Some(Err("the shutdown hook timed out".to_string())),
                     () = aborted(signal) => Some(Err("the turn was aborted".to_string())),
                 };
             }
@@ -328,6 +386,38 @@ impl HostHookBroker {
         })
     }
 
+    pub(crate) fn lifecycle_enabled(&self, hook: &str) -> bool {
+        self.contract_v1.load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .state
+                .lock()
+                .expect("host hook lock")
+                .config
+                .enabled
+                .contains(hook)
+    }
+
+    /// Optional close notification: cancellation must precede this short budget.
+    pub(crate) async fn bounded_shutdown(self: &Arc<Self>, payload: Value) {
+        let _ = self.lifecycle_hook()(payload).await;
+    }
+
+    pub(crate) fn lifecycle_hook(
+        self: &Arc<Self>,
+    ) -> pa_core::session_engine::host_hooks::HostHookFn {
+        let broker = Arc::clone(self);
+        Arc::new(move |payload| {
+            let broker = Arc::clone(&broker);
+            Box::pin(async move {
+                if !broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                let hook = payload.get("type").and_then(Value::as_str)?.to_string();
+                broker.optional(&hook, payload).await
+            })
+        })
+    }
+
     fn gates_host_call(&self, request_type: &str) -> bool {
         let state = self.state.lock().expect("host hook lock");
         state.config.enabled.contains(HOST_CALL)
@@ -337,6 +427,34 @@ impl HostHookBroker {
                     None => request_type == pattern,
                 })
             })
+    }
+
+    pub(crate) fn before_tool_call(
+        self: &Arc<Self>,
+        permission: pa_agent::agent_loop::BeforeToolCallFn,
+    ) -> pa_agent::agent_loop::BeforeToolCallFn {
+        let broker = Arc::clone(self);
+        Arc::new(move |context, signal| {
+            let broker = Arc::clone(&broker);
+            let permission = Arc::clone(&permission);
+            Box::pin(async move {
+                if broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst) {
+                    let answer = broker.call("tool_call", json!({"toolCallId":context.tool_call.id,"toolName":context.tool_call.name,"input":context.args}), Some(signal.clone())).await;
+                    if let Some(Ok(answer)) = answer {
+                        if answer.get("block").and_then(Value::as_bool) == Some(true) {
+                            return Ok(Some(pa_agent::types::BeforeToolCallResult {
+                                block: true,
+                                reason: answer
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            }));
+                        }
+                    }
+                }
+                permission(context, signal).await
+            })
+        })
     }
 
     /// The engine's `after_tool_call` hook point (optional: no usable
@@ -371,12 +489,57 @@ impl HostHookBroker {
             let broker = Arc::clone(&broker);
             Box::pin(async move {
                 if !broker.gates_host_call(&request_type) {
-                    return Ok(());
+                    return Ok(None);
                 }
-                let payload = json!({ "type": request_type, "data": data });
+                let mut payload = json!({ "type": request_type, "data": data });
+                if broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst)
+                    && (request_type.starts_with("agent_message.")
+                        || request_type.starts_with("agent_observe."))
+                {
+                    let reader = broker
+                        .state
+                        .lock()
+                        .expect("host hook lock")
+                        .family_reader
+                        .clone()
+                        .ok_or_else(|| {
+                            anyhow!("The native family reader is unavailable for {request_type}.")
+                        })?;
+                    let family = reader(HostRequestPayload { data: json!({}) }).await?;
+                    let current = family
+                        .get("current")
+                        .filter(|row| row.is_object())
+                        .ok_or_else(|| {
+                            anyhow!("The native family reader returned no current session.")
+                        })?;
+                    let agents =
+                        family
+                            .get("agents")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                anyhow!("The native family reader returned no family roster.")
+                            })?;
+                    if agents.iter().any(|row| !row.is_object()) {
+                        return Err(anyhow!(
+                            "The native family reader returned an invalid family member."
+                        ));
+                    }
+                    payload["family"] = json!({
+                        "current": family_identity_fields(current),
+                        "agents": agents.iter().map(family_identity_fields).collect::<Vec<_>>(),
+                    });
+                }
                 match broker.call(HOST_CALL, payload, None).await {
-                    None => Ok(()),
-                    Some(Ok(answer)) => host_call_verdict(&request_type, &answer),
+                    None if broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst) && (request_type.starts_with("agent_message.")
+                        || request_type.starts_with("agent_observe.")) => Err(anyhow!(
+                        "The host could not provide a native session scope for {request_type}, so it was refused."
+                    )),
+                    None => Ok(None),
+                    Some(Ok(answer)) => {
+                        let scoped = broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst);
+                        if !scoped && answer.get("allow").and_then(Value::as_bool) == Some(true) { Ok(None) }
+                        else { host_call_verdict(&request_type, &answer) }
+                    },
                     Some(Err(reason)) => Err(anyhow!(
                         "The host could not check {request_type} ({reason}), so it was refused."
                     )),
@@ -384,6 +547,29 @@ impl HostHookBroker {
             })
         })
     }
+}
+
+/// Only native identity and directory fields cross the policy boundary, not previews.
+fn family_identity_fields(row: &Value) -> Value {
+    let mut fields = row.as_object().expect("validated family row").clone();
+    fields.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "sessionId"
+                | "activeSessionId"
+                | "sessionName"
+                | "relationship"
+                | "runtimeKind"
+                | "cwd"
+                | "parentSessionId"
+                | "parentActiveSessionId"
+                | "rlmChildId"
+                | "isCurrent"
+                | "status"
+                | "isSessionActive"
+        )
+    });
+    Value::Object(fields)
 }
 
 /// The override an `after_tool_call` answer asks for: `null` or `{}` keeps
@@ -414,11 +600,37 @@ fn tool_result_override(answer: &Value) -> Option<AfterToolCallResult> {
     changes.then_some(result)
 }
 
-/// A host-call answer: only `{"allow": true}` lets the call run; anything
-/// else refuses it, with the answer's `reason` when it gives one.
-fn host_call_verdict(request_type: &str, answer: &Value) -> anyhow::Result<()> {
+/// A host-call answer: `allow: true` permits ordinary requests. Guarded
+/// family requests also require a native durable-session scope; malformed or
+/// absent scopes refuse them. A refusal uses the host's reason when provided.
+fn host_call_verdict(request_type: &str, answer: &Value) -> anyhow::Result<Option<Vec<String>>> {
     if answer.get("allow").and_then(Value::as_bool) == Some(true) {
-        return Ok(());
+        return match answer.get("scope") {
+            None if request_type.starts_with("agent_message.")
+                || request_type.starts_with("agent_observe.") =>
+            {
+                Err(anyhow!(
+                    "The host did not return a native session scope for {request_type}."
+                ))
+            }
+            None => Ok(None),
+            Some(scope) => {
+                let ids = serde_json::from_value::<Vec<String>>(
+                    scope.get("sessionIds").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|_| {
+                    anyhow!(
+                        "The host returned an unreadable native session scope for {request_type}."
+                    )
+                })?;
+                if ids.iter().any(|id| id.trim().is_empty()) {
+                    return Err(anyhow!(
+                        "The host returned an unreadable native session scope for {request_type}."
+                    ));
+                }
+                Ok(Some(ids))
+            }
+        };
     }
     match answer.get("reason").and_then(Value::as_str) {
         Some(reason) if !reason.is_empty() => Err(anyhow!("{reason}")),
@@ -536,6 +748,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn family_host_call_verdict_requires_native_scope() {
+        for request_type in [
+            "agent_message.send",
+            "agent_observe.list",
+            "agent_observe.get",
+            "agent_observe.recent",
+            "agent_observe.session_messages",
+        ] {
+            for answer in [
+                json!({"allow": true}),
+                json!({"allow": true, "scope": null}),
+                json!({"allow": true, "scope": {"sessionIds": [1]}}),
+                json!({"allow": true, "scope": {"sessionIds": [""]}}),
+            ] {
+                assert!(host_call_verdict(request_type, &answer).is_err());
+            }
+            assert_eq!(
+                host_call_verdict(
+                    request_type,
+                    &json!({"allow": true, "scope": {"sessionIds": []}})
+                )
+                .unwrap(),
+                Some(Vec::new())
+            );
+            assert_eq!(
+                host_call_verdict(
+                    request_type,
+                    &json!({"allow": true, "scope": {"sessionIds": ["durable-child"]}})
+                )
+                .unwrap(),
+                Some(vec!["durable-child".to_string()])
+            );
+        }
+        assert_eq!(
+            host_call_verdict("rlm.spawn", &json!({"allow": true})).unwrap(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn the_host_call_gate_denies_without_an_allow() {
         let (broker, events) = recording_broker();
@@ -580,6 +832,28 @@ mod tests {
         assert!(error.to_string().contains("so it was refused"), "{error}");
     }
     #[tokio::test]
+    async fn family_scope_is_only_required_by_the_negotiated_contract() {
+        let (broker, events) = recording_broker();
+        broker
+            .set_hooks(&[HOST_CALL.to_string()], None, None)
+            .unwrap();
+        let gate = broker.host_call_gate();
+        let call = tokio::spawn(gate("agent_observe.list".to_string(), json!({})));
+        let (id, _) = requested_id(&events).await;
+        broker.resolve(&id, Ok(json!({"allow":true})));
+        assert_eq!(call.await.unwrap().unwrap(), None);
+        events.lock().unwrap().clear();
+        broker.set_family_reader(pa_core::kernel::shared::host_handler(|_| async {
+            Ok(json!({"current":{"sessionId":"actor"},"agents":[]}))
+        }));
+        broker.set_contract(true);
+        let call = tokio::spawn(gate("agent_observe.list".to_string(), json!({})));
+        let (id, _) = requested_id(&events).await;
+        broker.resolve(&id, Ok(json!({"allow":true})));
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn optional_hooks_continue_without_an_answer() {
         let (broker, events) = recording_broker();
         // Off: no event, no answer.
@@ -620,7 +894,90 @@ mod tests {
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         broker.set_auto_refine_paused(true);
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        broker.set_hooks(&[], None, None).unwrap();
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
     }
+    #[tokio::test]
+    async fn family_host_call_reads_the_executing_child_not_the_relay_parent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (parent, events) = recording_broker();
+        let (child, _) = recording_broker();
+        for broker in [&parent, &child] {
+            broker
+                .set_hooks(&[HOST_CALL.to_string()], None, None)
+                .unwrap();
+        }
+        parent.set_contract(true);
+        parent.set_family_reader(pa_core::kernel::shared::host_handler(|_| async {
+            anyhow::bail!("the relay must not read its own family")
+        }));
+        child.set_upstream(Arc::new({
+            let parent = Arc::clone(&parent);
+            move |hook, payload, origin| {
+                let parent = Arc::clone(&parent);
+                Box::pin(async move { parent.call_from(&hook, payload, None, origin).await })
+            }
+        }));
+        let reads = Arc::new(AtomicUsize::new(0));
+        child.set_family_reader(pa_core::kernel::shared::host_handler({
+            let reads = Arc::clone(&reads);
+            move |payload| {
+                assert_eq!(payload.data, json!({}));
+                reads.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(json!({
+                        "current": {"sessionId":"child", "cwd":"/project", "parentSessionId":"parent", "firstMessage":"private"},
+                        "agents": [{"sessionId":"parent", "relationship":"parent", "cwd":"/project", "messageCount":3}],
+                    }))
+                }
+            }
+        }));
+        let gate = child.host_call_gate();
+        // Legacy calls retain their exact payload and do not read family data.
+        let call = tokio::spawn(gate("agent_observe.list".to_string(), json!({})));
+        let (id, event) = requested_id(&events).await;
+        assert_eq!(
+            event["payload"],
+            json!({"type":"agent_observe.list", "data":{}})
+        );
+        parent.resolve(&id, Ok(json!({"allow":true})));
+        assert_eq!(call.await.unwrap().unwrap(), None);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        events.lock().unwrap().clear();
+
+        child.set_contract(true);
+        let forged = json!({"family":{"current":{"sessionId":"spoof"}}});
+        let call = tokio::spawn(gate("agent_message.send".to_string(), forged.clone()));
+        let (id, event) = requested_id(&events).await;
+        assert_eq!(
+            event["payload"],
+            json!({
+                "type":"agent_message.send", "data":forged,
+                "family":{
+                    "current":{"sessionId":"child", "cwd":"/project", "parentSessionId":"parent"},
+                    "agents":[{"sessionId":"parent", "relationship":"parent", "cwd":"/project"}],
+                },
+            })
+        );
+        parent.resolve(
+            &id,
+            Ok(json!({"allow":true, "scope":{"sessionIds":["parent"]}})),
+        );
+        assert_eq!(
+            call.await.unwrap().unwrap(),
+            Some(vec!["parent".to_string()])
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        events.lock().unwrap().clear();
+        child.set_family_reader(pa_core::kernel::shared::host_handler(|_| async {
+            anyhow::bail!("native roster unavailable")
+        }));
+        assert!(gate("agent_observe.list".to_string(), json!({}))
+            .await
+            .is_err());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_child_runs_its_hooks_through_the_parent() {
         let (broker, events) = recording_broker();

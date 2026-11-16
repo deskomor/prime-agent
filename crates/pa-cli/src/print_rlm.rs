@@ -1104,6 +1104,7 @@ impl AgentMessageController for InlineMessages {
         if let Some(parent) = node.parent_node() {
             members.push(AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Parent,
+                session_id: parent.session_id.clone(),
                 id: parent.session_id.clone(),
                 name: parent.session_name().filter(|name| !name.is_empty()),
                 aliases: Vec::new(),
@@ -1114,6 +1115,7 @@ impl AgentMessageController for InlineMessages {
                 }
                 siblings.push(AgentFamilyMember {
                     relationship: AgentFamilyRelationship::Sibling,
+                    session_id: sibling.node.session_id.clone(),
                     id: sibling.node.session_id.clone(),
                     name: sibling.node.session_name(),
                     aliases: vec![sibling.rlm_child_id.clone()],
@@ -1125,6 +1127,7 @@ impl AgentMessageController for InlineMessages {
         for child in node.children.lock().await.clone() {
             children.push(AgentFamilyMember {
                 relationship: AgentFamilyRelationship::Child,
+                session_id: child.node.session_id.clone(),
                 id: child.node.session_id.clone(),
                 name: child.node.session_name(),
                 aliases: vec![child.rlm_child_id.clone()],

@@ -119,16 +119,15 @@ const INTERNAL_PAUSE_OWNER: &str = "worker-internal";
 
 /// A held queued-work pause for one daemon-internal flow (TS
 /// `_navigateTree`'s `acquireQueuedWorkPause`): the runner parks queued input
-/// until the guard drops, which releases through the wire handler's lift.
-pub(crate) struct QueuedWorkPause<'a> {
-    worker: &'a Worker,
-    pause_id: String,
+/// until the owned guard drops, including across a native startup task.
+pub(crate) struct QueuedWorkPause {
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Worker {
     /// Hold the queued-work pause for one daemon-internal flow. The lease
     /// key carries a fresh uuid so concurrent flows hold distinct pauses.
-    pub(crate) fn hold_queued_work_pause(&self, purpose: &str) -> QueuedWorkPause<'_> {
+    pub(crate) fn hold_queued_work_pause(&self, purpose: &str) -> QueuedWorkPause {
         let lease_key = format!("internal-{purpose}-{}", uuid::Uuid::new_v4());
         let pause_id = self.input_pauses.acquire(
             &self.config.active_session_id,
@@ -137,14 +136,26 @@ impl Worker {
         );
         // The runner re-evaluates its admission gate and parks.
         self.idle_notify.notify_waiters();
+        let pauses = self.input_pauses.clone();
+        let active_session_id = self.config.active_session_id.clone();
+        let work_notify = std::sync::Arc::clone(&self.work_notify);
+        let engine = self.agent_engine.clone();
         QueuedWorkPause {
-            worker: self,
-            pause_id,
+            release: Some(Box::new(move || {
+                if matches!(
+                    pauses.release(&pause_id, INTERNAL_PAUSE_OWNER, &active_session_id),
+                    ReleaseOutcome::Released
+                ) {
+                    work_notify.notify_one();
+                    if let Some(engine) = engine {
+                        engine.retry_owed_goal_continuation();
+                    }
+                }
+            })),
         }
     }
 
-    /// One release lift shared by the wire handler and the internal guard:
-    /// every `Released` outcome wakes the runner and re-evaluates the owed
+    /// A released client pause wakes the runner and re-evaluates the owed
     /// goal continuation.
     fn release_session_pause(
         &self,
@@ -244,13 +255,11 @@ impl Worker {
     }
 }
 
-impl Drop for QueuedWorkPause<'_> {
+impl Drop for QueuedWorkPause {
     fn drop(&mut self) {
-        let _ = self.worker.release_session_pause(
-            &self.pause_id,
-            INTERNAL_PAUSE_OWNER,
-            &self.worker.config.active_session_id,
-        );
+        if let Some(release) = self.release.take() {
+            release();
+        }
     }
 }
 

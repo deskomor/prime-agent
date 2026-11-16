@@ -11,6 +11,62 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn host_context_source_matches(&self, source: &Value) -> bool {
+        self.host_hooks
+            .lock()
+            .expect("host hooks lock")
+            .projection_source_matches(source)
+    }
+
+    fn host_context_projections(&self) -> Value {
+        let hooks = self.host_hooks.lock().expect("host hooks lock").clone();
+        let mut projections = serde_json::Map::new();
+        for purpose in [
+            "provider",
+            "budget",
+            "compaction",
+            "branch-summary",
+            "refine",
+        ] {
+            if let Some(projection) = hooks.projection_snapshot(purpose) {
+                projections.insert(purpose.to_string(), projection);
+            }
+        }
+        Value::Object(projections)
+    }
+
+    fn host_tool_definitions(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(AgentSessionEngine::host_tool_definitions(self))
+    }
+
+    fn set_host_active_tools(
+        &self,
+        tools: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(AgentSessionEngine::set_host_active_tools(self, tools))
+    }
+
+    fn clear_host_active_tools(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(AgentSessionEngine::clear_host_active_tools(self))
+    }
+
+    fn clear_host_overrides(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(AgentSessionEngine::clear_host_overrides(self))
+    }
+
+    fn inject_host_custom_message(
+        &self,
+        row: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(AgentSessionEngine::inject_host_custom_message(self, row))
+    }
+
     /// Withdraw the queued minted goal-context turns so a state change leaves nothing stale to run.
     fn purge_queued_goal_contexts(&self) {
         let purge = self
@@ -740,12 +796,7 @@ impl SessionEngine for AgentSessionEngine {
             agent_dir: self.config.agent_dir.clone(),
         };
         // The host's `context` hook may project the branch the summary reads.
-        let project = self
-            .host_hooks
-            .lock()
-            .expect("host hooks lock")
-            .context
-            .clone();
+        let project = Some(self.host_hooks.lock().expect("host hooks lock").clone());
         let run = async {
             pa_core::session_engine::branch_summarization::generate_branch_summary(
                 &entries,

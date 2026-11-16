@@ -152,6 +152,13 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
 
     if parsed.version {
         println!("{}", crate::config::version());
+        let build = pa_daemon::protocol::build_identity();
+        let commit = build["commit"].as_str().unwrap_or("unknown");
+        let dirty = build["dirty"]
+            .as_bool()
+            .map(|dirty| dirty.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("build: {commit} dirty: {dirty}");
         return Ok(0);
     }
     if parsed.help {

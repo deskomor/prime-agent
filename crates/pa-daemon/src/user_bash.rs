@@ -258,7 +258,7 @@ impl Worker {
             .await;
             // Persist the durable row (transient runs live only in their
             // pane; reloads and rebuilds cannot resurface them).
-            if !transient {
+            let entry_id = if !transient {
                 record_bash_result(
                     &core,
                     &command,
@@ -270,8 +270,10 @@ impl Worker {
                         full_output_path: end.full_output_path.clone(),
                     },
                     exclude_from_context,
-                );
-            }
+                )
+            } else {
+                None
+            };
             user_bash.release();
             let mut event = json!({
                 "type": "bash_end",
@@ -289,12 +291,20 @@ impl Worker {
             emit_session_event_frame(&core, &events, event);
             // The host's `user_bash_end` hears the run before queued work
             // resumes (its answer is ignored).
-            let _ = host_hooks
+            if entry_id.is_some()
+                || !host_hooks
+                    .contract_flag()
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = host_hooks
                 .optional(
                     crate::host_hooks::USER_BASH_END,
                     json!({
+                        "entryId": entry_id,
                         "command": command,
                         "output": end.output,
+                        "isError": end.cancelled || end.exit_code.is_some_and(|code| code != 0) || end.error_message.is_some(),
+                        "fullOutputPath": end.full_output_path,
                         "exitCode": end.exit_code,
                         "cancelled": end.cancelled,
                         "truncated": end.truncated,
@@ -302,6 +312,7 @@ impl Worker {
                     }),
                 )
                 .await;
+            }
             // The queue drains after the slot is released (TS
             // `_drainQueuedMessagesAfterBash`).
             work_notify.notify_one();
@@ -421,7 +432,24 @@ impl Worker {
             truncated: end.truncated,
             full_output_path: end.full_output_path,
         };
-        record_bash_result(&self.core, &command, &result, false);
+        let entry_id = record_bash_result(&self.core, &command, &result, false);
+        if entry_id.is_some()
+            && self
+                .host_hooks
+                .contract_flag()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.host_hooks.optional(crate::host_hooks::USER_BASH_END, json!({
+                "entryId": entry_id,
+                "command": command,
+                "output": result.output,
+                "exitCode": result.exit_code,
+                "cancelled": result.cancelled,
+                "truncated": result.truncated,
+                "fullOutputPath": result.full_output_path,
+                "isError": result.cancelled || result.exit_code.is_some_and(|code| code != 0),
+            })).await;
+        }
         drop(awaited);
         response_success(
             None,
@@ -739,11 +767,9 @@ fn record_bash_result(
     command: &str,
     result: &BashResult,
     exclude_from_context: bool,
-) {
+) -> Option<String> {
     let mut core = core.lock().unwrap();
-    let Some(store) = core.store.as_mut() else {
-        return;
-    };
+    let store = core.store.as_mut()?;
     let mut row = json!({
         "role": "bashExecution",
         "command": command,
@@ -761,7 +787,13 @@ fn record_bash_result(
     if exclude_from_context {
         row["excludeFromContext"] = json!(true);
     }
-    let _ = store.persist_entry("message", json!({ "message": row }));
+    match store.persist_entry("message", json!({ "message": row })) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            eprintln!("Could not persist user bash result: {error}");
+            None
+        }
+    }
 }
 
 /// Sanitize one output chunk (TS `strip-ansi` + `sanitizeBinaryOutput` +

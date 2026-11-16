@@ -58,6 +58,8 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "request_tool_permission"
         | "set_host_hooks"
         | "respond_host_hook"
+        | "session_snapshot"
+        | "set_active_tools"
         | "append_session_entry"
         | "set_auto_refine"
         | "request_host_hook"
@@ -152,6 +154,7 @@ const READ_ONLY_DAEMON_COMMANDS: &[&str] = &[
     "update_restore_status",
     "heartbeat_get",
     "get_session_context",
+    "session_snapshot",
     "get_session_tree",
     "get_user_messages_for_forking",
     "get_last_assistant_text",

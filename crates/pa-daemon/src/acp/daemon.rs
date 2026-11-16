@@ -265,6 +265,8 @@ pub(crate) struct HostedSession {
     pub(crate) daemon_active_session_id: String,
     pub(crate) producer: Arc<UpdateProducer>,
     pub(crate) config: Arc<HostedConfig>,
+    host_ready: Option<tokio::sync::watch::Receiver<bool>>,
+    host_startup: Option<tokio::task::JoinHandle<()>>,
     cancelling: bool,
     stop_failure: Option<String>,
     input_pause_key: Option<String>,
@@ -366,11 +368,15 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             if let Some(stop) = wire_events::assistant_stop(&event) {
                                 current.assistant_stop_reason = stop.stop_reason;
                             }
-                            if let Some(request) = permissions.client_request(
+                            if let Some(mut request) = permissions.client_request(
                                 &event,
                                 &current.acp_session_id,
                                 &current.daemon_active_session_id,
                             ) {
+                                if permissions.host_contract() {
+                                    request["params"]["promptTurnId"] =
+                                        json!(current.producer.active_prompt_turn().await);
+                                }
                                 if let Some(permission_tx) = permission_tx.upgrade() {
                                     let _ = permission_tx.send(request);
                                 }
@@ -1081,7 +1087,10 @@ async fn handle_incoming(
             handle_set_config_option(id, params, link, state, tx).await;
         }
         super::session_ext::APPEND_SESSION_ENTRY_METHOD
-        | super::session_ext::SET_AUTO_REFINE_METHOD => {
+        | super::session_ext::SET_AUTO_REFINE_METHOD
+        | super::session_ext::SESSION_SNAPSHOT_METHOD
+        | super::session_ext::APPEND_CUSTOM_MESSAGE_METHOD
+        | super::session_ext::SET_ACTIVE_TOOLS_METHOD => {
             super::session_ext::handle_session_ext(id, &method, params, link, state, tx).await;
         }
         other => {
@@ -1100,8 +1109,21 @@ fn handle_initialize(id: &Value, params: &Value, product_version: &str, tx: &pro
         let _ = tx.send(error_response);
         return;
     }
-    let result =
+    let mut result =
         serde_json::to_value(types::initialize_result(product_version)).expect("serializes");
+    if params
+        .pointer("/clientCapabilities/_meta")
+        .and_then(|meta| meta.get(super::meta::PRIME_AGENT_META_NAMESPACE))
+        .and_then(|meta| meta.pointer("/hostContract/version"))
+        .and_then(Value::as_u64)
+        == Some(1)
+    {
+        result["_meta"][super::meta::PRIME_AGENT_META_NAMESPACE]["hostContract"] = json!({
+            "version": 1,
+            "build": crate::protocol::build_identity(),
+            "features": ["session_snapshot", "lifecycle", "canonical_exchanges", "context_refs", "projection_identity", "bash_entry_id", "session_writes", "refinement_pause", "family_scope"]
+        });
+    }
     let _ = tx.send(jsonrpc::response(id, &result));
 }
 
@@ -1156,6 +1178,31 @@ async fn handle_session_new(
         }
         guard.session_new_in_flight = true;
     }
+    let studio_names: std::collections::HashSet<String> =
+        if state.lock().await.permissions.host_contract() {
+            params
+                .get("mcpServers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|server| {
+                    server
+                        .get("_meta")
+                        .and_then(|meta| meta.get(super::meta::PRIME_AGENT_META_NAMESPACE))
+                        .and_then(|meta| meta.get("inheritStudioMcp"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                })
+                .filter_map(|server| {
+                    server
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
     let params = types::NewSessionParams::parse(&params);
     if !state.lock().await.mcp_server_names.is_empty() {
         if let Err(error) = clear_connection_servers(
@@ -1210,7 +1257,11 @@ async fn handle_session_new(
         published: tokio::sync::Mutex::new(published),
         models: tokio::sync::Mutex::new(models),
     });
+    let contract_v1 = state.lock().await.permissions.host_contract();
+    let (host_ready_tx, host_ready_rx) = tokio::sync::watch::channel(!contract_v1);
     let mut hosted = HostedSession {
+        host_ready: contract_v1.then_some(host_ready_rx),
+        host_startup: None,
         acp_session_id: acp_session_id.clone(),
         daemon_active_session_id: binding.active_session_id.clone(),
         producer,
@@ -1243,6 +1294,14 @@ async fn handle_session_new(
             &binding.active_session_id,
             &binding.mcp_owner_id,
             &resolved,
+            &resolved
+                .iter()
+                .filter(|server| {
+                    studio_names.contains(server.name())
+                        && matches!(server, pa_core::mcp::AcpMcpServerConfig::Stdio { .. })
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
         )
         .await
         {
@@ -1285,8 +1344,14 @@ async fn handle_session_new(
             active_session_id: binding.active_session_id.clone(),
             hooks: hooks.hooks,
             host_call_types: hooks.host_call_types,
-            timeout_ms: hooks.timeout_ms,
-            rest: Map::new(),
+            timeout_ms: hooks
+                .timeout_ms
+                .or(permissions.host_contract().then_some(150_000)),
+            rest: if permissions.host_contract() {
+                Map::from_iter([("hostContractVersion".to_string(), json!(1))])
+            } else {
+                Map::new()
+            },
         });
     }
     for command in setup {
@@ -1407,6 +1472,43 @@ async fn handle_session_new(
         }
     }
     producer.commit_session_new_response().await;
+    if permissions.host_contract() {
+        // Admission stays inline, but the real startup hook must let stdin read
+        // its callback requests and answer. Prompts join the session's ready gate.
+        let link = Arc::clone(link);
+        let active_session_id = binding.active_session_id.clone();
+        let startup = tokio::spawn(async move {
+            match link
+                .request_until_close(DaemonCommand::RequestHostHook {
+                    id: None,
+                    active_session_id: active_session_id.clone(),
+                    hook: "session_start".to_string(),
+                    payload: json!({"type":"session_start","reason":"startup"}),
+                    origin: None,
+                    rest: Map::default(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    if !response.success {
+                        let error = response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        eprintln!("ACP session_start hook failed for {active_session_id}: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("ACP session_start hook failed for {active_session_id}: {error}");
+                }
+            }
+            let _ = host_ready_tx.send(true);
+        });
+        if let Some(hosted) = state.lock().await.session.as_mut() {
+            hosted.host_startup = Some(startup);
+        }
+    } else {
+        let _ = host_ready_tx.send(true);
+    }
 }
 
 async fn replace_connection_servers(
@@ -1414,13 +1516,20 @@ async fn replace_connection_servers(
     daemon_session_id: &str,
     owner_id: &str,
     resolved: &[pa_core::mcp::AcpMcpServerConfig],
+    studio_servers: &[pa_core::mcp::AcpMcpServerConfig],
 ) -> anyhow::Result<()> {
     link.request_ok(DaemonCommand::ReplaceAcpMcpServers {
         id: None,
         active_session_id: daemon_session_id.to_string(),
         owner_id: owner_id.to_string(),
         servers: serde_json::to_value(resolved)?,
-        rest: Map::default(),
+        rest: Map::from_iter([
+            (
+                "studioMcpServers".to_string(),
+                serde_json::to_value(studio_servers)?,
+            ),
+            ("studioHostContractVersion".to_string(), json!(1)),
+        ]),
     })
     .await
 }
@@ -1431,7 +1540,7 @@ async fn clear_connection_servers(
     owner_id: &str,
     state: &Arc<Mutex<DaemonAcpState>>,
 ) -> anyhow::Result<()> {
-    replace_connection_servers(link, daemon_session_id, owner_id, &[]).await?;
+    replace_connection_servers(link, daemon_session_id, owner_id, &[], &[]).await?;
     state.lock().await.mcp_server_names.clear();
     Ok(())
 }
@@ -1517,6 +1626,18 @@ async fn prompt_turn(
     state: &Arc<Mutex<DaemonAcpState>>,
 ) -> Value {
     let params = types::PromptParams::parse(&params);
+    let ready = state
+        .lock()
+        .await
+        .session
+        .as_ref()
+        .filter(|hosted| hosted.acp_session_id == params.session_id)
+        .and_then(|hosted| hosted.host_ready.clone());
+    if let Some(mut ready) = ready {
+        if ready.wait_for(|ready| *ready).await.is_err() {
+            return super::internal_error(&id, "Host session initialization did not finish");
+        }
+    }
     let admitted = match types::AdmittedPrompt::parse(&params.prompt) {
         Ok(admitted) => admitted,
         Err(error) => return prompt_block_error(&id, &error),
@@ -1935,6 +2056,9 @@ async fn handle_session_close(
             return;
         };
         hosted.cancelling = true;
+        if let Some(startup) = hosted.host_startup.take() {
+            startup.abort();
+        }
         if let Some(turn) = hosted.turn.as_mut() {
             turn.cancelled = true;
         }
@@ -2018,7 +2142,25 @@ async fn teardown(
     state: &Arc<Mutex<DaemonAcpState>>,
     binding: &DaemonBinding,
 ) {
-    let hosted = state.lock().await.session.take();
+    let mut hosted = state.lock().await.session.take();
+    if let Some(startup) = hosted
+        .as_mut()
+        .and_then(|hosted| hosted.host_startup.take())
+    {
+        startup.abort();
+    }
+    if state.lock().await.permissions.host_contract() {
+        let _ = link
+            .request(DaemonCommand::SetHostHooks {
+                id: None,
+                active_session_id: binding.active_session_id.clone(),
+                hooks: Vec::new(),
+                host_call_types: None,
+                timeout_ms: None,
+                rest: Map::default(),
+            })
+            .await;
+    }
     if let Some(hosted) = hosted.as_ref() {
         if let Some(turn) = hosted.turn.as_ref() {
             cancel_owned_admission(link, &binding.active_session_id, &turn.admission_id).await;
@@ -2066,6 +2208,8 @@ mod tests {
     fn hosted_session() -> HostedSession {
         let (sink, _drain) = mpsc::unbounded_channel();
         HostedSession {
+            host_ready: None,
+            host_startup: None,
             acp_session_id: "acp-1".to_string(),
             daemon_active_session_id: "daemon-1".to_string(),
             producer: UpdateProducer::new("acp-1", sink),

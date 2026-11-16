@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::abort::AbortSignal;
 use crate::types::{
-    AgentContext, AgentEvent, AgentTool, AgentToolResult, AssistantMessage, ToolCall,
-    ToolExecutionMode, ToolResultMessage,
+    AgentContext, AgentEvent, AgentTool, AgentToolResult, AssistantMessage, NativeToolExchange,
+    ToolCall, ToolExecutionMode, ToolResultMessage,
 };
 
 use super::run::clone_context;
@@ -19,6 +19,8 @@ use super::{AgentEventSink, AgentLoopConfig};
 
 pub(crate) struct ExecutedToolCallBatch {
     pub(crate) messages: Vec<ToolResultMessage>,
+    pub(crate) tool_execution: ToolExecutionMode,
+    pub(crate) exchanges: Vec<NativeToolExchange>,
     pub(crate) terminate: bool,
 }
 
@@ -88,8 +90,9 @@ async fn execute_tool_calls_sequential(
 ) -> anyhow::Result<ExecutedToolCallBatch> {
     let mut finalized_calls: Vec<FinalizedToolCallOutcome> = Vec::new();
     let mut messages: Vec<ToolResultMessage> = Vec::new();
+    let mut exchanges = Vec::new();
 
-    for tool_call in tool_calls {
+    for (source_order, tool_call) in tool_calls.iter().enumerate() {
         if signal.is_some_and(AbortSignal::is_aborted) {
             break;
         }
@@ -109,6 +112,7 @@ async fn execute_tool_calls_sequential(
             signal,
         )
         .await;
+        let mut executed_input = tool_call.arguments.clone();
         let finalized = match preparation {
             Preparation::Immediate { result, is_error } => FinalizedToolCallOutcome {
                 tool_call: tool_call.clone(),
@@ -116,6 +120,7 @@ async fn execute_tool_calls_sequential(
                 is_error,
             },
             Preparation::Prepared(prepared) => {
+                executed_input = prepared.args.clone();
                 let executed =
                     execute_prepared_tool_call(&prepared, config.tool_progress, signal, emit).await;
                 finalize_executed_tool_call(
@@ -133,6 +138,14 @@ async fn execute_tool_calls_sequential(
         emit_tool_execution_end(&finalized, emit).await?;
         let tool_result_message = create_tool_result_message(&finalized);
         emit_tool_result_message(&tool_result_message, emit).await?;
+        exchanges.push(NativeToolExchange {
+            source_order,
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            original_input: tool_call.arguments.clone(),
+            executed_input,
+            result: tool_result_message.clone(),
+        });
         messages.push(tool_result_message);
         finalized_calls.push(finalized);
 
@@ -143,6 +156,8 @@ async fn execute_tool_calls_sequential(
 
     Ok(ExecutedToolCallBatch {
         messages,
+        tool_execution: ToolExecutionMode::Sequential,
+        exchanges,
         terminate: should_terminate_tool_batch(&finalized_calls),
     })
 }
@@ -159,11 +174,13 @@ async fn execute_tool_calls_parallel(
     emit: &AgentEventSink,
 ) -> anyhow::Result<ExecutedToolCallBatch> {
     enum TaskOrOutcome {
-        Task(tokio::task::JoinHandle<anyhow::Result<FinalizedToolCallOutcome>>),
+        Task(
+            tokio::task::JoinHandle<anyhow::Result<(FinalizedToolCallOutcome, serde_json::Value)>>,
+        ),
         // Boxed: the finalized outcome holds the tool call's ordered
         // argument map (insertion-ordered for wire parity), which dwarfs
         // the join handle and would trip `large_enum_variant`.
-        Outcome(Box<FinalizedToolCallOutcome>),
+        Outcome(Box<FinalizedToolCallOutcome>, serde_json::Value),
     }
 
     let mut entries: Vec<TaskOrOutcome> = Vec::new();
@@ -192,7 +209,10 @@ async fn execute_tool_calls_parallel(
                     is_error,
                 };
                 emit_tool_execution_end(&finalized, emit).await?;
-                entries.push(TaskOrOutcome::Outcome(Box::new(finalized)));
+                entries.push(TaskOrOutcome::Outcome(
+                    Box::new(finalized),
+                    tool_call.arguments.clone(),
+                ));
             }
             Preparation::Prepared(prepared) => {
                 let sink = Arc::clone(emit);
@@ -223,7 +243,7 @@ async fn execute_tool_calls_parallel(
                     )
                     .await?;
                     emit_tool_execution_end(&finalized, &sink).await?;
-                    Ok(finalized)
+                    Ok((finalized, prepared.args))
                 });
                 entries.push(TaskOrOutcome::Task(handle));
             }
@@ -232,27 +252,42 @@ async fn execute_tool_calls_parallel(
 
     // Promise.all semantics: await every entry; results stay in source order.
     let mut ordered_finalized_calls: Vec<FinalizedToolCallOutcome> = Vec::new();
+    let mut executed_inputs = Vec::new();
     for entry in entries {
-        match entry {
-            TaskOrOutcome::Outcome(finalized) => ordered_finalized_calls.push(*finalized),
-            TaskOrOutcome::Task(handle) => {
-                let finalized = handle.await.map_err(|error| {
-                    anyhow::anyhow!("Parallel tool execution task failed: {error}")
-                })??;
-                ordered_finalized_calls.push(finalized);
-            }
-        }
+        let (finalized, executed_input) = match entry {
+            TaskOrOutcome::Outcome(finalized, executed_input) => (*finalized, executed_input),
+            TaskOrOutcome::Task(handle) => handle.await.map_err(|error| {
+                anyhow::anyhow!("Parallel tool execution task failed: {error}")
+            })??,
+        };
+        ordered_finalized_calls.push(finalized);
+        executed_inputs.push(executed_input);
     }
 
     let mut messages: Vec<ToolResultMessage> = Vec::new();
-    for finalized in &ordered_finalized_calls {
+    let mut exchanges = Vec::new();
+    for (source_order, (finalized, executed_input)) in ordered_finalized_calls
+        .iter()
+        .zip(executed_inputs)
+        .enumerate()
+    {
         let tool_result_message = create_tool_result_message(finalized);
         emit_tool_result_message(&tool_result_message, emit).await?;
+        exchanges.push(NativeToolExchange {
+            source_order,
+            tool_call_id: finalized.tool_call.id.clone(),
+            tool_name: finalized.tool_call.name.clone(),
+            original_input: finalized.tool_call.arguments.clone(),
+            executed_input,
+            result: tool_result_message.clone(),
+        });
         messages.push(tool_result_message);
     }
 
     Ok(ExecutedToolCallBatch {
         messages,
+        tool_execution: ToolExecutionMode::Parallel,
+        exchanges,
         terminate: should_terminate_tool_batch(&ordered_finalized_calls),
     })
 }

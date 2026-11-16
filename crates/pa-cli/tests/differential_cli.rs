@@ -462,9 +462,14 @@ fn differential_corpus_matches_ts_binary() {
     for case in CORPUS {
         let ts_out = run(&ts, case, &ts_sandbox);
         let rs_out = run(&rust, case, &rs_sandbox);
+        // Product-version parity excludes the native build-identity line.
+        let rust_stdout = if case.len() == 1 && ["--version", "-v"].contains(&case[0]) {
+            format!("{}\n", rs_out.stdout.lines().next().unwrap_or_default())
+        } else {
+            rs_out.stdout.clone()
+        };
         let ok = ts_out.exit_code == rs_out.exit_code
-            && normalize(&ts_out.stdout, &sandbox_roots)
-                == normalize(&rs_out.stdout, &sandbox_roots)
+            && normalize(&ts_out.stdout, &sandbox_roots) == normalize(&rust_stdout, &sandbox_roots)
             && normalize(&ts_out.stderr, &sandbox_roots)
                 == normalize(&rs_out.stderr, &sandbox_roots);
         if !ok {

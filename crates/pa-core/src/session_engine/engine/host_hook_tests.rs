@@ -74,6 +74,7 @@ async fn optional_host_hooks_shape_the_tool_loop() {
         vec![("call-1", "echo", json!({ "text": "hi" }))],
     );
     provider.push_text_turn("all done");
+    provider.push_text_turn("review applied");
     let requests: Requests = Arc::default();
     let capture = Arc::clone(&requests);
     let inner_stream = provider.stream_fn();
@@ -90,14 +91,25 @@ async fn optional_host_hooks_shape_the_tool_loop() {
     let projections: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let ends: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let hooks = SessionHostHooks {
+        contract_v1: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
         before_agent_start: Some(recording_hook(&starts, |_| {
-            Some(json!({ "appendSystemPrompt": "HOST-APPENDED-RULE" }))
+            Some(
+                json!({ "systemPrompt": "HOST-REPLACED-PROMPT", "appendSystemPrompt": "HOST-APPENDED-RULE" }),
+            )
         })),
         turn_end: Some(recording_hook(&turns, |payload| {
             let after_tools = payload["toolResults"]
                 .as_array()
                 .is_some_and(|results| !results.is_empty());
-            after_tools.then(|| json!({ "messages": ["HIDDEN-HOST-NOTE"] }))
+            if after_tools {
+                Some(json!({ "messages": ["HIDDEN-HOST-NOTE"] }))
+            } else if payload["message"].to_string().contains("all done") {
+                Some(
+                    json!({ "continue": true, "messages": [{"customType":"advisor","content":"TERMINAL-REVIEW","details":{"kind":"advice"}}] }),
+                )
+            } else {
+                None
+            }
         })),
         // Keep the messages: the projection only proves it is asked.
         context: Some(recording_hook(&projections, |_| None)),
@@ -167,11 +179,11 @@ async fn optional_host_hooks_shape_the_tool_loop() {
         .is_some_and(|prompt| prompt.starts_with("# prime-agent harness")
             && !prompt.contains("HOST-APPENDED-RULE")));
     let requests = requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(requests[2].1.contains("TERMINAL-REVIEW"));
+    // The LLM conversion carries content; custom metadata remains in native history.
     for (system_prompt, _) in &requests {
-        assert!(system_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.ends_with("\n\nHOST-APPENDED-RULE")));
+        assert_eq!(system_prompt.as_deref(), Some("HOST-REPLACED-PROMPT"));
     }
     // The base prompt itself is untouched.
     assert!(!engine.system_prompt.contains("HOST-APPENDED-RULE"));
@@ -179,7 +191,7 @@ async fn optional_host_hooks_shape_the_tool_loop() {
     // turn_end: the tool batch's hidden row reaches the next request and is
     // saved as a hidden custom row.
     let turns = turns.lock().unwrap().clone();
-    assert_eq!(turns.len(), 2, "{turns:?}");
+    assert_eq!(turns.len(), 3, "{turns:?}");
     assert_eq!(turns[0]["toolResults"][0]["toolName"], "echo");
     assert!(!requests[0].1.contains("HIDDEN-HOST-NOTE"));
     assert!(
@@ -188,6 +200,13 @@ async fn optional_host_hooks_shape_the_tool_loop() {
         requests[1].1
     );
     let entries = engine.session.entries().await;
+    assert!(entries.iter().any(|entry| matches!(entry,
+        pa_types::session::FileEntry::Message { message: pa_types::session::AgentMessage::Custom(row), .. }
+            if row.custom_type == "advisor" && row.details.as_ref().is_some_and(|details| details["kind"] == "advice")
+    ) || matches!(entry,
+        pa_types::session::FileEntry::CustomMessage { payload, .. }
+            if payload.custom_type == "advisor" && payload.details.as_ref().is_some_and(|details| details["kind"] == "advice")
+    )), "advisor metadata remains canonical: {entries:?}");
     assert!(
         entries.iter().any(|entry| matches!(
             entry,
@@ -213,7 +232,12 @@ async fn optional_host_hooks_shape_the_tool_loop() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["entryId"].is_string()));
+        .any(|message| message["role"] == "user"));
+    assert!(projections[0]["entryRefs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["entryId"].is_string() && entry["messageIndex"].is_number()));
 
     // message_end: hears the user prompt, both assistant turns and the tool result.
     let ends = ends.lock().unwrap().clone();

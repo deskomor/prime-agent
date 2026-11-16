@@ -182,6 +182,23 @@ struct SessionAttachGuard {
 impl Drop for SessionAttachGuard {
     fn drop(&mut self) {
         self.worker.release_session_attachments(&self.token, true);
+        let worker = Arc::clone(&self.worker);
+        let token = self.token.clone();
+        tokio::spawn(async move {
+            let mut owner = worker.host_hook_owner.lock().await;
+            if owner.as_deref() != Some(token.as_str()) {
+                return;
+            }
+            if let Err(error) = worker.host_hooks.set_hooks(&[], None, None) {
+                eprintln!("pa-daemon: cannot detach host hooks: {error}");
+            }
+            worker.host_hooks.set_contract(false);
+            worker.host_hooks.set_owner_token(None);
+            if let Err(error) = worker.engine.clear_host_overrides().await {
+                eprintln!("pa-daemon: cannot clear disconnected host overrides: {error:#}");
+            }
+            *owner = None;
+        });
     }
 }
 
@@ -479,6 +496,16 @@ impl Worker {
                     }
                 }
                 ConnectionRole::Supervisor { ref generation } => {
+                    if command_type == "set_host_hooks" {
+                        if let Some(object) = payload.as_object_mut() {
+                            let owner = object
+                                .get("hostOwnerToken")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&connection_token)
+                                .to_string();
+                            object.insert("connectionToken".to_string(), json!(owner));
+                        }
+                    }
                     if command_type == "worker_register_peer_transport" {
                         let response =
                             self.handle_worker_register_peer_transport(&payload, generation);
@@ -515,7 +542,10 @@ impl Worker {
                 ConnectionRole::SessionClient { ref session } => {
                     // The connection token rides the attach/detach payloads; the registry
                     // keys this connection's retained ids by it.
-                    if matches!(command_type.as_str(), "attach" | "detach") {
+                    if matches!(
+                        command_type.as_str(),
+                        "attach" | "detach" | "set_host_hooks"
+                    ) {
                         if let Some(object) = payload.as_object_mut() {
                             object.insert("connectionToken".to_string(), json!(connection_token));
                         }

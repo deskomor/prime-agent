@@ -1,0 +1,1 @@
+- Added opt-in Studio ACP session context, scoped native family tools, terminal advisor continuation, per-child Studio MCP bindings and lifecycle hooks, and compiled build identity in `--version`.

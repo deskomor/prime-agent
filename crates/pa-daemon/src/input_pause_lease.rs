@@ -25,6 +25,8 @@ pub(crate) struct ClientConnectionState {
     /// The connection's prompt-admission registry (TS `promptAdmissions`
     /// per client): the `prompt`/`prompt_and_wait` admissions.
     pub(crate) prompt_admissions: crate::prompt_admission::PromptAdmissionTable,
+    /// Session hook leases installed by this socket; `None` after disconnect.
+    pub(crate) host_hook_sessions: tokio::sync::Mutex<Option<HashMap<String, String>>>,
 }
 
 impl ClientConnectionState {
@@ -34,6 +36,7 @@ impl ClientConnectionState {
             pause_epoch: AtomicU64::new(0),
             detaching_sessions: std::sync::Mutex::new(HashSet::new()),
             prompt_admissions: crate::prompt_admission::PromptAdmissionTable::default(),
+            host_hook_sessions: tokio::sync::Mutex::new(Some(HashMap::new())),
         }
     }
 

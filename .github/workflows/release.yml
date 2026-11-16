@@ -209,6 +209,7 @@ jobs:
           set -euo pipefail
           bin="target/${{ matrix.target }}/dist/prime-agent"
           out="$("${bin}" --version)"
+          out="${out%%$'\n'*}"
           [[ "${out}" == "${RELEASE_VERSION#v}" ]]             || { echo "binary reports '${out}', expected '${RELEASE_VERSION#v}'"; exit 1; }
       - name: "GLIBC baseline gate: no symbols above GLIBC_2.35 (Ubuntu 22.04)"
         run: |
@@ -371,6 +372,7 @@ jobs:
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/prime-agent"
           out="$("${bin}" --version)"
+          out="${out%%$'\n'*}"
           [[ "${out}" == "${RELEASE_VERSION#v}" ]]             || { echo "binary reports '${out}', expected '${RELEASE_VERSION#v}'"; exit 1; }
       # The live catalog from prime-agent-catalog (public; no token needed)
       # at the commit the catalog-ref job resolved: a fresh install's first
@@ -491,6 +493,7 @@ jobs:
           # assembler stages and the installer extracts.
           bin="target/${{ matrix.target }}/release/prime-agent.exe"
           out="$("${bin}" --version)"
+          out="${out%%$'\n'*}"
           [[ "${out}" == "${RELEASE_VERSION#v}" ]]             || { echo "binary reports '${out}', expected '${RELEASE_VERSION#v}'"; exit 1; }
       # The live catalog from prime-agent-catalog (public; no token needed)
       # at the commit the catalog-ref job resolved: a fresh install's first

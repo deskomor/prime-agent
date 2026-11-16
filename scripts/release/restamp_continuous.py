@@ -253,7 +253,7 @@ def restamp_target(incoming: Path, out_dir: Path, version: str,
                                  capture_output=True, text=True, env=env,
                                  cwd=staging, check=False)
             detail = (run.stdout or run.stderr).strip() or f"rc={run.returncode}"
-            if run.returncode != 0 or run.stdout.strip() != version:
+            if run.returncode != 0 or run.stdout.partition("\n")[0].strip() != version:
                 fail(f"{incoming.name}: the restamped binary reports {detail!r}, "
                      f"expected {version!r} — the runtime version manifest did not take")
             if target.endswith("-unknown-linux-gnu") \

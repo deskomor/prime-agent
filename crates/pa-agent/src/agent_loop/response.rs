@@ -93,6 +93,9 @@ async fn stream_assistant_response_inner(
         .await?;
     }
 
+    if let Some(get_tools) = config.get_tools.as_ref() {
+        context.tools = race_with_abort(get_tools(), signal).await?;
+    }
     let llm_messages = race_with_abort((config.convert_to_llm)(messages), signal).await?;
 
     let stream_fn = stream_fn.ok_or_else(|| {

@@ -114,6 +114,7 @@ struct MutableAgentState {
     /// Appended to the system prompt of every run context until replaced
     /// (a host's per-prompt addition); `None` adds nothing.
     system_prompt_suffix: Option<String>,
+    system_prompt_override: Option<String>,
     model: Model,
     thinking_level: ThinkingLevel,
     tools: Vec<Arc<dyn AgentTool>>,
@@ -129,6 +130,7 @@ impl Default for MutableAgentState {
         MutableAgentState {
             system_prompt: String::new(),
             system_prompt_suffix: None,
+            system_prompt_override: None,
             model: Model::unknown(),
             thinking_level: ThinkingLevel::Off,
             tools: Vec::new(),
@@ -330,6 +332,8 @@ struct AgentInner {
     event_delivery: tokio::sync::Mutex<()>,
     shared: tokio::sync::Mutex<Shared>,
     steering_queue: Mutex<PendingMessageQueue>,
+    /// Canonical host rows queued in this run; unconsumed rows land at settlement.
+    host_steering_ids: Mutex<HashSet<String>>,
     follow_up_queue: Mutex<PendingMessageQueue>,
     /// Active-run bookkeeping. A plain mutex: never held across awaits.
     run: Mutex<Option<ActiveRun>>,
@@ -521,9 +525,14 @@ impl AgentInner {
     }
 
     fn snapshot_locked(shared: &Shared) -> crate::types::AgentContext {
+        let base = shared
+            .state
+            .system_prompt_override
+            .as_ref()
+            .unwrap_or(&shared.state.system_prompt);
         let system_prompt = match &shared.state.system_prompt_suffix {
-            Some(suffix) => format!("{}\n\n{suffix}", shared.state.system_prompt),
-            None => shared.state.system_prompt.clone(),
+            Some(suffix) => format!("{base}\n\n{suffix}"),
+            None => base.clone(),
         };
         crate::types::AgentContext {
             system_prompt,
@@ -576,6 +585,11 @@ impl AgentInner {
         config.session_id.clone_from(&self.session_id);
         config.transport = self.transport;
         config.transform_context.clone_from(&self.transform_context);
+        let tools_inner = Arc::clone(self);
+        config.get_tools = Some(Arc::new(move || {
+            let inner = Arc::clone(&tools_inner);
+            Box::pin(async move { Ok(inner.shared.lock().await.state.tools.clone()) })
+        }));
         config.get_api_key.clone_from(&self.get_api_key);
         config.should_stop_after_turn = should_stop_after_turn;
         config
@@ -641,9 +655,22 @@ impl AgentInner {
             shared.state.is_streaming = false;
             shared.state.streaming_message = None;
             shared.state.pending_tool_calls.clear();
-        }
-        {
             let mut run = self.run.lock().unwrap();
+            let mut host_ids = self.host_steering_ids.lock().unwrap();
+            let remaining = self
+                .steering_queue
+                .lock()
+                .unwrap()
+                .remove_where(&|message| match message {
+                    AgentMessage::Custom(custom) => custom
+                        .payload
+                        .get("entryId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| host_ids.contains(id)),
+                    AgentMessage::Standard(_) => false,
+                });
+            shared.state.messages.extend(remaining);
+            host_ids.clear();
             if let Some(active) = run.take() {
                 let _ = active.idle_tx.send(true);
             }
@@ -794,6 +821,7 @@ impl Agent {
             steering_queue: Mutex::new(PendingMessageQueue::new(
                 options.steering_mode.unwrap_or(QueueMode::OneAtATime),
             )),
+            host_steering_ids: Mutex::new(HashSet::new()),
             follow_up_queue: Mutex::new(PendingMessageQueue::new(
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             )),
@@ -887,6 +915,28 @@ impl Agent {
         self.inner.shared.lock().await.state.system_prompt_suffix = suffix;
     }
 
+    /// Apply a host prompt only while its negotiated owner remains attached.
+    pub async fn set_host_prompt(
+        &self,
+        prompt: Option<String>,
+        suffix: Option<String>,
+        owner: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
+    ) {
+        let mut shared = self.inner.shared.lock().await;
+        if owner.as_ref().is_some_and(|(epoch, expected)| {
+            epoch.load(std::sync::atomic::Ordering::SeqCst) != *expected
+        }) {
+            return;
+        }
+        shared.state.system_prompt_override = prompt;
+        shared.state.system_prompt_suffix = suffix;
+    }
+
+    /// Replace only the host-owned prompt adaptation, leaving the native base intact.
+    pub async fn set_system_prompt_override(&self, prompt: Option<String>) {
+        self.inner.shared.lock().await.state.system_prompt_override = prompt;
+    }
+
     pub async fn set_model(&self, model: Model) {
         self.inner.shared.lock().await.state.model = model;
     }
@@ -939,6 +989,43 @@ impl Agent {
             .state
             .messages
             .extend(messages);
+    }
+
+    /// Inject an already-persisted host row into the active run or idle context.
+    /// Run admission and settlement share the same state/run lock ordering, so
+    /// a row arriving after the final steering poll remains available next run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical row has no saved entry ID.
+    pub async fn inject_host_message(
+        &self,
+        message: crate::types::CustomAgentMessage,
+    ) -> anyhow::Result<()> {
+        let entry_id = message
+            .payload
+            .get("entryId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Host context message requires a saved entryId"))?
+            .to_string();
+        let mut shared = self.inner.shared.lock().await;
+        let run = self.inner.run.lock().unwrap();
+        let message = AgentMessage::Custom(message);
+        if run.is_some() {
+            self.inner
+                .host_steering_ids
+                .lock()
+                .unwrap()
+                .insert(entry_id);
+            self.inner
+                .steering_queue
+                .lock()
+                .unwrap()
+                .enqueue(AgentMessageBatch::Single(message));
+        } else {
+            shared.state.messages.push(message);
+        }
+        Ok(())
     }
 
     /// Mutate the transcript under ONE state lock (the atomic form of the
@@ -1297,6 +1384,23 @@ impl Clone for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn detached_host_cannot_restore_its_prompt_override() {
+        let agent = Agent::new(AgentOptions::default());
+        agent.set_system_prompt("native").await;
+        let owner = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        agent
+            .set_host_prompt(Some("adapted".into()), None, Some((Arc::clone(&owner), 1)))
+            .await;
+        owner.store(2, std::sync::atomic::Ordering::SeqCst);
+        agent.set_system_prompt_override(None).await;
+        agent
+            .set_host_prompt(Some("stale".into()), None, Some((owner, 1)))
+            .await;
+        let shared = agent.inner.shared.lock().await;
+        assert_eq!(AgentInner::snapshot_locked(&shared).system_prompt, "native");
+    }
 
     #[test]
     fn pending_message_queue_all_mode_flattens() {

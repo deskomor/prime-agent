@@ -26,6 +26,7 @@ impl Worker {
                     | "set_session_entry_label"
                     | "navigate_tree"
                     | "fork"
+                    | "session_snapshot"
                     | "export_html"
                     | "export_jsonl"
             )
@@ -67,6 +68,8 @@ impl Worker {
                 self.handle_wait_for_headless_completion(payload).await
             }
             "get_state" => self.handle_get_state(),
+            "session_snapshot" => self.handle_session_snapshot(payload).await,
+            "set_active_tools" => self.handle_set_active_tools(payload).await,
             "get_messages" => self.handle_get_messages(payload),
             "get_session_messages" => self.handle_get_session_messages(payload).await,
             "get_session_header" => self.handle_get_session_header(),
@@ -102,11 +105,11 @@ impl Worker {
             "set_tool_permission_mode" => self.handle_set_tool_permission_mode(payload),
             "respond_tool_permission" => self.handle_respond_tool_permission(payload),
             "request_tool_permission" => self.handle_request_tool_permission(payload).await,
-            "set_host_hooks" => self.handle_set_host_hooks(payload),
+            "set_host_hooks" => self.handle_set_host_hooks(payload).await,
             "respond_host_hook" => self.handle_respond_host_hook(payload),
             "request_host_hook" => self.handle_request_host_hook(payload).await,
             "append_session_entry" => self.handle_append_session_entry(payload),
-            "set_auto_refine" => self.handle_set_auto_refine(payload),
+            "set_auto_refine" => self.handle_set_auto_refine(payload).await,
             "set_model" => self.handle_set_model(payload).await,
             "set_thinking_level" => self.handle_set_thinking_level(payload).await,
             "cycle_model" => self.handle_cycle_model(payload).await,
@@ -139,7 +142,7 @@ impl Worker {
                 self.handle_kernel_bash_activity(command_type, payload)
                     .await
             }
-            "append_custom_message" => self.handle_append_custom_message(payload),
+            "append_custom_message" => self.handle_append_custom_message(payload).await,
             "restore_next_turn" => self.handle_restore_next_turn(payload),
             "restore_actions" => self.handle_restore_actions(payload),
             "refine" => self.handle_refine(payload).await,
@@ -338,7 +341,12 @@ impl Worker {
 
     /// Replace the session's enabled host hooks (`hooks`, optional
     /// `hostCallTypes` and `timeoutMs`).
-    fn handle_set_host_hooks(&self, payload: &Value) -> DaemonResponse {
+    async fn handle_set_host_hooks(&self, payload: &Value) -> DaemonResponse {
+        let mut owner = self.host_hook_owner.lock().await;
+        let token = payload.get("connectionToken").and_then(Value::as_str);
+        if token.is_some_and(|token| self.released_attach_tokens.lock().unwrap().contains(token)) {
+            return response_failure(None, "set_host_hooks", "Host connection is closed", None);
+        }
         let strings = |key: &str| {
             payload.get(key).and_then(Value::as_array).map(|items| {
                 items
@@ -349,6 +357,14 @@ impl Worker {
             })
         };
         let hooks = strings("hooks").unwrap_or_default();
+        if hooks.is_empty() && owner.is_some() && owner.as_deref() != token {
+            return response_failure(
+                None,
+                "set_host_hooks",
+                "Host adapter belongs to another connection",
+                None,
+            );
+        }
         let timeout = payload
             .get("timeoutMs")
             .and_then(Value::as_u64)
@@ -358,7 +374,23 @@ impl Worker {
             .host_hooks
             .set_hooks(&hooks, strings("hostCallTypes"), timeout)
         {
-            Ok(()) => response_success(None, "set_host_hooks", None),
+            Ok(()) => {
+                self.host_hooks.set_contract(
+                    payload.get("hostContractVersion").and_then(Value::as_u64) == Some(1),
+                );
+                if hooks.is_empty() {
+                    if let Err(error) = self.engine.clear_host_overrides().await {
+                        return response_failure(None, "set_host_hooks", &error.to_string(), None);
+                    }
+                }
+                *owner = if hooks.is_empty() {
+                    None
+                } else {
+                    token.map(str::to_string)
+                };
+                self.host_hooks.set_owner_token(owner.clone());
+                response_success(None, "set_host_hooks", None)
+            }
             Err(message) => response_failure(None, "set_host_hooks", &message, None),
         }
     }
@@ -389,7 +421,20 @@ impl Worker {
     }
 
     /// Pause (`enabled: false`) or resume the session's own auto-refinement.
-    fn handle_set_auto_refine(&self, payload: &Value) -> DaemonResponse {
+    async fn handle_set_auto_refine(&self, payload: &Value) -> DaemonResponse {
+        let owner = self.host_hook_owner.lock().await;
+        if payload
+            .get("hostOwnerToken")
+            .and_then(Value::as_str)
+            .is_some_and(|token| owner.as_deref() != Some(token))
+        {
+            return response_failure(
+                None,
+                "set_auto_refine",
+                "Host adapter belongs to another connection",
+                None,
+            );
+        }
         let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
             return response_failure(
                 None,
@@ -418,11 +463,63 @@ impl Worker {
                 None,
             );
         }
-        let servers: Vec<pa_core::mcp::AcpMcpServerConfig> = payload
+        let mut servers: Vec<pa_core::mcp::AcpMcpServerConfig> = payload
             .get("servers")
             .cloned()
             .map(|servers| serde_json::from_value(servers).unwrap_or_default())
             .unwrap_or_default();
+        let inherited = match payload
+            .get("studioMcpServers")
+            .filter(|_| {
+                payload
+                    .get("studioHostContractVersion")
+                    .and_then(Value::as_u64)
+                    == Some(1)
+            })
+            .cloned()
+            .map(serde_json::from_value::<Vec<pa_core::mcp::AcpMcpServerConfig>>)
+            .transpose()
+        {
+            Ok(servers) => servers.unwrap_or_default(),
+            Err(error) => {
+                return response_failure(
+                    None,
+                    "replace_acp_mcp_servers",
+                    &format!("Invalid Studio MCP servers: {error}"),
+                    None,
+                )
+            }
+        };
+        let inherited = {
+            let core = self.core.lock().unwrap();
+            let Some(store) = core.store.as_ref() else {
+                return response_failure(
+                    None,
+                    "replace_acp_mcp_servers",
+                    "Session is still initializing",
+                    None,
+                );
+            };
+            super::create::bind_studio_mcp_servers(
+                inherited,
+                &json!({
+                    "activeSessionId": core.active_session_id,
+                    "sessionId": store.session_id(),
+                    "sessionFile": store.path,
+                    "cwd": core.cwd,
+                    "parentSessionId": core.parent_session_id,
+                    "parentActiveSessionId": core.parent_active_session_id,
+                }),
+            )
+        };
+        for server in &mut servers {
+            if let Some(bound) = inherited
+                .iter()
+                .find(|inherited| inherited.name() == server.name())
+            {
+                *server = bound.clone();
+            }
+        }
         // The agent cannot adopt a different MCP tool list mid-turn (TS
         // `session.isStreaming` guard).
         if !servers.is_empty() && self.core.lock().unwrap().busy {
@@ -443,7 +540,16 @@ impl Worker {
         match manager.replace_acp_servers(&servers, owner_id) {
             // An unchanged list (same owner, identical servers) is a
             // no-op success.
-            Ok(_) => response_success(None, "replace_acp_mcp_servers", None),
+            Ok(_) => {
+                if let Some(children) = self
+                    .agent_engine
+                    .as_ref()
+                    .and_then(|engine| engine.children.as_ref())
+                {
+                    children.set_studio_mcp_servers(inherited);
+                }
+                response_success(None, "replace_acp_mcp_servers", None)
+            }
             Err(error) => {
                 // Roll back any partially applied configuration with
                 // the owner-scoped clear before surfacing the failure.
@@ -915,6 +1021,25 @@ impl Worker {
         // their settle-hook retries bail from here on.
         if let Some(agent_engine) = &self.agent_engine {
             agent_engine.mark_session_closed();
+        }
+        let host_close_pause = self
+            .host_hooks
+            .lifecycle_enabled("session_shutdown")
+            .then(|| self.hold_queued_work_pause("host-session-shutdown"));
+        if host_close_pause.is_some() {
+            {
+                let mut core = self.core.lock().unwrap();
+                core.abort_requested = true;
+                core.turn_cancelled = true;
+            }
+            self.engine.abort_in_flight_turn();
+            self.work_notify.notify_one();
+            self.host_hooks
+                .bounded_shutdown(json!({
+                    "type": "session_shutdown",
+                    "reason": reason.recovery_operation(),
+                }))
+                .await;
         }
         // TS `closeSession` aborts the side questions per attached client
         // before `closeSessionOnce`'s arms run.

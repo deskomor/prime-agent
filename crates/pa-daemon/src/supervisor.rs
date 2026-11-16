@@ -160,6 +160,9 @@ pub struct Supervisor {
     /// effective client id (TS `this.clients` + `protocolClientId`).
     pub(crate) client_connections:
         std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<String>>>>,
+    /// Child hook inheritance cannot cross an owner disconnect's cleanup scan.
+    pub(crate) host_owner_admission: tokio::sync::Mutex<()>,
+    pub(crate) active_host_owners: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The supervisor's agent roster (classified entries; the roster arms
     /// live in `supervisor_roster.rs`).
     pub(crate) roster: std::sync::Mutex<crate::agent_roster::AgentRoster>,
@@ -266,6 +269,8 @@ impl Supervisor {
             events,
             session_subscribers: subscribers::SessionSubscribers::new(),
             client_connections: std::sync::Mutex::new(std::collections::HashMap::new()),
+            host_owner_admission: tokio::sync::Mutex::new(()),
+            active_host_owners: std::sync::Mutex::new(std::collections::HashSet::new()),
             roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
             last_published_roster: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_registration_seeds: std::sync::Mutex::new(Vec::new()),
