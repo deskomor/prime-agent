@@ -625,24 +625,43 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             let mut results = Vec::with_capacity(records.len());
             for record in &records {
-                this.refresh_record(record).await;
-                // A settled child that is busy again runs a follow-up turn:
-                // re-arm usage observation (the task-run watcher retired at
-                // its settle).
-                if record.lock().await.settled_status.is_some() {
-                    let active_session_id = record.lock().await.active_session_id.clone();
-                    if matches!(this.child_busy(&active_session_id).await, Ok(true)) {
-                        SupervisorChildSessionsInner::arm_usage_watch(&this, record).await;
-                    }
-                }
-                let still_running = record.lock().await.settled_status.is_none();
-                if still_running {
-                    // Wait inside the shared budget, then re-read the child:
-                    // a timeout yields the current snapshot, never an error.
+                loop {
+                    // Arm before reading state: every fresh run's settle funnel wakes this
+                    // signal, including failed admission. Reseeded rows are already settled.
+                    let settled = this.settle_notify.notified();
+                    tokio::pin!(settled);
+                    settled.as_mut().enable();
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    let active_session_id = record.lock().await.active_session_id.clone();
-                    this.wait_for_child(&active_session_id, remaining).await;
-                    this.refresh_record(record).await;
+                    if timeout_ms != 0 && remaining.is_zero() {
+                        break;
+                    }
+                    let refresh = async {
+                        this.refresh_record(record).await;
+                        // Retained children can run follow-up turns after their original task.
+                        if record.lock().await.settled_status.is_some() {
+                            let active_session_id = record.lock().await.active_session_id.clone();
+                            if matches!(this.child_busy(&active_session_id).await, Ok(true)) {
+                                SupervisorChildSessionsInner::arm_usage_watch(&this, record).await;
+                            }
+                        }
+                    };
+                    if timeout_ms == 0 {
+                        refresh.await;
+                    } else if tokio::time::timeout(remaining, refresh).await.is_err() {
+                        break;
+                    }
+                    let finished = {
+                        let record = record.lock().await;
+                        record.settled || record.closed_by_parent
+                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if finished || remaining.is_zero() {
+                        break;
+                    }
+                    // Pre-admission idle is not completion; use the original shared budget.
+                    if tokio::time::timeout(remaining, settled).await.is_err() {
+                        break;
+                    }
                 }
                 let result = {
                     let record = record.lock().await;

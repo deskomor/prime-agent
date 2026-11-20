@@ -22,12 +22,40 @@ impl AgentSessionEngine {
     pub(in crate::agent_engine) fn run_turns(
         &self,
         first: TurnPrompt,
+        accepted_rows: Vec<EngineEvent>,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
         // The first turn admits the prompt; every autonomous follow-up turn
         // runs text-only (attachments are never re-sent).
         let prompt = first;
+        let accepted_rows = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(accepted_rows),
+        ));
+        let pending = std::sync::Arc::clone(&accepted_rows);
+        let delivery_started = std::cell::Cell::new(false);
+        let mut forward = |event: EngineEvent| {
+            if matches!(
+                event,
+                EngineEvent::PromptPrefix(_) | EngineEvent::UserMessage(_)
+            ) {
+                delivery_started.set(true);
+            }
+            // Setup exits retain the raw input. A failed delivery never accepts its untouched tail.
+            if !delivery_started.get()
+                && matches!(event, EngineEvent::Done(_) | EngineEvent::DoneAborted)
+            {
+                delivery_started.set(true);
+                let rows: Vec<_> = pending.lock().unwrap().drain(..).collect();
+                for row in rows {
+                    if !emit(row) {
+                        break;
+                    }
+                }
+            }
+            emit(event)
+        };
+        let emit: &mut dyn FnMut(EngineEvent) -> bool = &mut forward;
         let mut overflow_retry = false;
         self.threshold_yielded
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -63,7 +91,14 @@ impl AgentSessionEngine {
             } else {
                 TurnAdmission::FreshPrompt
             };
-            let turn = self.run_model_turn(admission, &prompt, &boundary_passed, aborted, emit);
+            let turn = self.run_model_turn(
+                admission,
+                &prompt,
+                &accepted_rows,
+                &boundary_passed,
+                aborted,
+                emit,
+            );
             match turn {
                 TurnResult::Message(_assistant) => {
                     // A settled non-error turn resets the overflow state and

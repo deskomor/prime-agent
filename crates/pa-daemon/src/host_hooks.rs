@@ -244,7 +244,7 @@ impl HostHookBroker {
         Some(json!({
             "hooks": hooks,
             "hostOwnerToken": state.owner_token,
-            "hostContractVersion": if self.contract_v1.load(std::sync::atomic::Ordering::SeqCst) { 1 } else { 0 },
+            "hostContractVersion": i32::from(self.contract_v1.load(std::sync::atomic::Ordering::SeqCst)),
             "hostCallTypes": state.config.host_call_types,
             "timeoutMs": u64::try_from(state.config.timeout.as_millis()).unwrap_or(u64::MAX),
         }))

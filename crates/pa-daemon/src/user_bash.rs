@@ -258,7 +258,9 @@ impl Worker {
             .await;
             // Persist the durable row (transient runs live only in their
             // pane; reloads and rebuilds cannot resurface them).
-            let entry_id = if !transient {
+            let entry_id = if transient {
+                None
+            } else {
                 record_bash_result(
                     &core,
                     &command,
@@ -271,8 +273,6 @@ impl Worker {
                     },
                     exclude_from_context,
                 )
-            } else {
-                None
             };
             user_bash.release();
             let mut event = json!({

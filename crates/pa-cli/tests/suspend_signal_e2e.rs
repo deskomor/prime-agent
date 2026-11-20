@@ -203,16 +203,14 @@ fn ctrl_g_hands_the_terminal_to_the_external_editor() {
 
     // The first content frame is the readiness marker (earlier keystrokes race the kitty probe).
     harness.wait_from_start(" >  ", "the first frame's prompt row rendered");
-    let prompt_row = harness.wait_caret_row_from(0, 5, "the first frame's empty editor rendered");
 
-    // Each typed key paints its own cell: the draft's arrival is the caret's park.
+    // Each typed key paints its own cell: the draft's arrival is the caret's park. The prompt
+    // row comes from that completed draft frame, not the first frame: the attach snapshot's
+    // transcript can still render after it and move the prompt down.
     let mark_draft = harness.mark();
     harness.write(b"draft");
-    harness.wait_from(
-        mark_draft,
-        &format!("\x1b[{prompt_row};10H"),
-        "the draft rendered in the editor",
-    );
+    let prompt_row =
+        harness.wait_caret_park_row_from(mark_draft, 10, "the draft rendered in the editor");
 
     let mark_edit = harness.mark();
     harness.write(&[0x07]);
@@ -299,6 +297,11 @@ impl SuspendHarness {
     /// Wait until a caret parks at `column` and return its row (DERIVED, not assumed).
     fn wait_caret_row_from(&mut self, mark: usize, column: u16, what: &str) -> String {
         self.master.wait_caret_row_from(mark, column, what)
+    }
+
+    /// Wait until the caret parks at `column` (a frame's final cursor move) and return its row.
+    fn wait_caret_park_row_from(&mut self, mark: usize, column: u16, what: &str) -> String {
+        self.master.wait_caret_park_row_from(mark, column, what)
     }
 
     fn region_since(&self, mark: usize) -> Vec<u8> {
@@ -432,6 +435,45 @@ impl PtyReader {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+impl PtyReader {
+    /// Wait (the plain wait's 30s bound) until the caret parks at `column` and return its row.
+    fn wait_caret_park_row_from(&mut self, mark: usize, column: u16, what: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(row) = caret_park_row(&self.output[mark..], column) {
+                return row;
+            }
+            let mut buffer = [0u8; 8192];
+            if let Ok(n @ 1..) = self.file.read(&mut buffer) {
+                self.output.extend_from_slice(&buffer[..n]);
+            }
+            if Instant::now() > deadline {
+                let text = String::from_utf8_lossy(&self.output[mark..]);
+                panic!(
+                    "timeout waiting for {what} (a caret park at column {column}); \
+                     pty tail since mark:\n{text}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// The row of the LAST caret park at `column`: the frame's final cursor move, which hides
+/// the cursor and closes the synchronized update (`ESC[?25l ESC[row;colH ESC[?2026l`).
+/// Cursor moves that paint other content never match.
+fn caret_park_row(stream: &[u8], column: u16) -> Option<String> {
+    let text = String::from_utf8_lossy(stream);
+    let lead = "\x1b[?25l\x1b[";
+    text.match_indices(&format!(";{column}H\x1b[?2026l"))
+        .filter_map(|(at, _)| {
+            let digits = &text[text[..at].rfind(lead)? + lead.len()..at];
+            (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| digits.to_string())
+        })
+        .last()
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {

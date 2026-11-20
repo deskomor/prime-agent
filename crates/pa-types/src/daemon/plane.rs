@@ -42,6 +42,7 @@ pub fn command_plane(command_type: &str) -> DaemonCommandPlane {
         | "delete_rlm_subagent"
         | "wait_for_idle"
         | "wait_for_headless_completion"
+        | "wait_for_auto_refine_idle"
         | "get_session_header"
         | "get_state"
         | "get_connection_state"

@@ -469,6 +469,9 @@ pub struct AgentToolResult {
     pub content: Vec<ToolResultContent>,
     #[serde(default)]
     pub details: serde_json::Value,
+    /// A structured tool failure; content and details remain available to the caller.
+    #[serde(default, rename = "isError", skip_serializing_if = "is_false")]
+    pub is_error: bool,
     /// Hint that the agent should stop after the current tool batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminate: Option<bool>,
@@ -479,6 +482,7 @@ impl AgentToolResult {
         AgentToolResult {
             content: vec![ToolResultContent::text(s)],
             details: serde_json::Value::Null,
+            is_error: false,
             terminate: None,
         }
     }
@@ -487,6 +491,7 @@ impl AgentToolResult {
         AgentToolResult {
             content: vec![ToolResultContent::text(s)],
             details: serde_json::Value::Object(serde_json::Map::new()),
+            is_error: true,
             terminate: None,
         }
     }

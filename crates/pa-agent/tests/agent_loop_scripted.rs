@@ -299,49 +299,59 @@ async fn tool_call_turn_dispatches_and_feeds_result_back() {
     );
 }
 
-#[tokio::test]
-async fn settled_turn_carries_original_prepared_inputs_and_finalized_results() {
-    struct PreparedEcho;
+struct PreparedEcho {
+    is_error: bool,
+}
 
-    impl AgentTool for PreparedEcho {
-        fn name(&self) -> &'static str {
-            "prepared_echo"
-        }
-
-        fn description(&self) -> &'static str {
-            "Echoes prepared arguments."
-        }
-
-        fn parameters(&self) -> &serde_json::Value {
-            static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
-            SCHEMA.get_or_init(|| {
-                serde_json::json!({
-                    "type": "object",
-                    "properties": { "text": { "type": "string" } },
-                    "required": ["text"],
-                })
-            })
-        }
-
-        fn prepare_arguments(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
-            Some(serde_json::json!({ "text": args["raw"] }))
-        }
-
-        fn execute(
-            self: Arc<Self>,
-            _tool_call_id: String,
-            params: serde_json::Value,
-            _signal: AbortSignal,
-            _on_update: AgentToolUpdateCallback,
-        ) -> pa_agent::BoxFut<'static, anyhow::Result<AgentToolResult>> {
-            Box::pin(async move {
-                assert_eq!(params, serde_json::json!({ "text": "42" }));
-                Ok(AgentToolResult::text("unfinalized"))
-            })
-        }
+impl AgentTool for PreparedEcho {
+    fn name(&self) -> &'static str {
+        "prepared_echo"
     }
 
-    for mode in [ToolExecutionMode::Parallel, ToolExecutionMode::Sequential] {
+    fn description(&self) -> &'static str {
+        "Echoes prepared arguments."
+    }
+
+    fn parameters(&self) -> &serde_json::Value {
+        static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+        SCHEMA.get_or_init(|| {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"],
+            })
+        })
+    }
+
+    fn prepare_arguments(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "text": args["raw"] }))
+    }
+
+    fn execute(
+        self: Arc<Self>,
+        _tool_call_id: String,
+        params: serde_json::Value,
+        _signal: AbortSignal,
+        _on_update: AgentToolUpdateCallback,
+    ) -> pa_agent::BoxFut<'static, anyhow::Result<AgentToolResult>> {
+        Box::pin(async move {
+            assert_eq!(params, serde_json::json!({ "text": "42" }));
+            Ok(AgentToolResult {
+                is_error: self.is_error,
+                ..AgentToolResult::text("unfinalized")
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn settled_turn_carries_original_prepared_inputs_and_finalized_results() {
+    for (mode, initial_error) in [
+        (ToolExecutionMode::Parallel, false),
+        (ToolExecutionMode::Parallel, true),
+        (ToolExecutionMode::Sequential, false),
+        (ToolExecutionMode::Sequential, true),
+    ] {
         let provider = Arc::new(ScriptedProvider::new(test_model()));
         provider.push_tool_call_turn(
             None,
@@ -364,13 +374,15 @@ async fn settled_turn_carries_original_prepared_inputs_and_finalized_results() {
                 Ok(None)
             })
         }));
-        config.after_tool_call = Some(Arc::new(|context, _signal| {
+        config.after_tool_call = Some(Arc::new(move |context, _signal| {
             Box::pin(async move {
                 assert_eq!(context.args, serde_json::json!({ "text": "42" }));
+                assert_eq!(context.is_error, initial_error);
+                assert_eq!(context.result.is_error, initial_error);
                 Ok(Some(pa_agent::types::AfterToolCallResult {
                     content: Some(vec![ToolResultContent::text("finalized")]),
                     details: Some(serde_json::json!({ "final": true })),
-                    is_error: Some(true),
+                    is_error: Some(!initial_error),
                     ..Default::default()
                 }))
             })
@@ -390,7 +402,9 @@ async fn settled_turn_carries_original_prepared_inputs_and_finalized_results() {
             AgentContext {
                 system_prompt: String::new(),
                 messages: vec![AgentMessage::user("go")],
-                tools: vec![Arc::new(PreparedEcho)],
+                tools: vec![Arc::new(PreparedEcho {
+                    is_error: initial_error,
+                })],
             },
             &config,
             Arc::new(|_event| Box::pin(async { Ok(()) })),
@@ -404,7 +418,7 @@ async fn settled_turn_carries_original_prepared_inputs_and_finalized_results() {
         let mut finalized = context.tool_results[0].clone();
         finalized.content = vec![ToolResultContent::text("finalized")];
         finalized.details = Some(serde_json::json!({ "final": true }));
-        finalized.is_error = true;
+        finalized.is_error = !initial_error;
         assert_eq!(
             context.tool_exchanges,
             vec![

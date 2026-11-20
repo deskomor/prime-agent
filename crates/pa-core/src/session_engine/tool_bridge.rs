@@ -102,6 +102,7 @@ impl AgentTool for ToolDefinitionBridge {
                     on_update(AgentToolResult {
                         content: convert_content_blocks(update.content),
                         details: update.details.unwrap_or(serde_json::Value::Null),
+                        is_error: false,
                         terminate: None,
                     });
                 }));
@@ -111,10 +112,10 @@ impl AgentTool for ToolDefinitionBridge {
             let details = result.details.clone().unwrap_or(serde_json::Value::Null);
             let is_error = result.is_error;
             let terminate = result.terminate;
-            let _ = is_error;
             Ok(AgentToolResult {
                 content: convert_content(result),
                 details,
+                is_error,
                 terminate,
             })
         })
@@ -200,6 +201,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.content.len(), 1);
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn structured_errors_keep_payload_and_termination() {
+        use crate::tools::tool_definition::ToolContentBlock;
+
+        let mut definition = echo_definition(/*is_error*/ false);
+        definition.execute = Arc::new(|_id, _params, _signal, _on_update| {
+            Box::pin(async {
+                Ok(ToolExecutionResult {
+                    content: vec![
+                        ToolContentBlock::text("cell traceback"),
+                        ToolContentBlock::Image {
+                            data: "QUJD".into(),
+                            mime_type: "image/png".into(),
+                        },
+                    ],
+                    details: Some(serde_json::json!({
+                        "status": "error",
+                        "error": { "ename": "ValueError", "traceback": ["cell traceback"] },
+                        "attachments": [{ "data": "QUJD", "mimeType": "image/png" }],
+                    })),
+                    is_error: true,
+                    terminate: Some(true),
+                })
+            })
+        });
+        let result = bridge_tool(definition)
+            .execute(
+                "structured-error".into(),
+                serde_json::json!({}),
+                AbortSignal::default(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("a structured failure remains a tool result");
+        assert_eq!(
+            result,
+            AgentToolResult {
+                content: vec![
+                    ToolResultContent::text("cell traceback"),
+                    ToolResultContent::Image(pa_agent::types::ImageContent {
+                        data: "QUJD".into(),
+                        mime_type: "image/png".into()
+                    }),
+                ],
+                details: serde_json::json!({
+                    "status": "error",
+                    "error": { "ename": "ValueError", "traceback": ["cell traceback"] },
+                    "attachments": [{ "data": "QUJD", "mimeType": "image/png" }],
+                }),
+                is_error: true,
+                terminate: Some(true),
+            }
+        );
     }
 
     /// The interactive loader's kernel-boot note and live cell output

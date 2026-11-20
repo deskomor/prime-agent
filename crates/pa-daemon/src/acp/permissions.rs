@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn nested_contract_hooks_require_v1() {
         let relay = PermissionRelay::default();
-        let mut params = json!({"clientCapabilities":{"_meta":{"ai.primeintellect.prime-agent":{"hostContract":{"version":1,"hooks":["session_start"],"hookTimeoutMs":150000}}}}});
+        let mut params = json!({"clientCapabilities":{"_meta":{"ai.primeintellect.prime-agent":{"hostContract":{"version":1,"hooks":["session_start"],"hookTimeoutMs":150_000}}}}});
         relay.observe_initialize(&params);
         assert!(relay.host_contract());
         assert_eq!(
@@ -487,7 +487,7 @@ mod tests {
             HookOptIn {
                 hooks: vec!["session_start".into()],
                 host_call_types: None,
-                timeout_ms: Some(150000)
+                timeout_ms: Some(150_000)
             }
         );
         params["clientCapabilities"]["_meta"][PRIME_AGENT_META_NAMESPACE]["hostContract"]

@@ -149,15 +149,13 @@ fn write_models_json(agent_dir: &Path, base_url: &str) {
 
 #[test]
 fn offline_daemon_serves_the_bundled_catalog_fallback() {
-    let dir = std::env::temp_dir().join(format!(
-        "pa-model-catalog-{}",
-        std::process::id() * 1000
-            + std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or_default()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    // A unique temp dir, removed when the guard drops after the supervisor. The old name,
+    // PID * 1000 + subsec_nanos, overflowed u32 once the PID passed ~3.295 million.
+    let temp = tempfile::Builder::new()
+        .prefix("pa-model-catalog-")
+        .tempdir()
+        .expect("temp dir");
+    let dir = temp.path().to_path_buf();
     let agent_dir = dir.join("agent");
     let socket = dir.join("daemon.sock");
     // No auth beyond the models.json key: no provider credentials, no private-model entitlements.
@@ -228,5 +226,5 @@ fn offline_daemon_serves_the_bundled_catalog_fallback() {
     );
     drop(client);
     drop(supervisor);
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }

@@ -35,9 +35,16 @@ impl SessionNavigation {
     }
 
     /// Swap the live session onto `file` (store, engine session file, rebuilt
-    /// context). The caller retires the previous runtime and rebinds the cwd
-    /// first, so the context park lands on the fresh session.
-    async fn replace_session(&self, target: PreparedReplacement) -> Result<(), String> {
+    /// context). The caller retires the previous runtime and points the engine
+    /// at `cwd` first, so the context park lands on the fresh session; the
+    /// worker's own cwd changes with the store and the Studio binding, so no
+    /// credential of the old session ever validates for the new project.
+    async fn replace_session(
+        &self,
+        target: PreparedReplacement,
+        cwd: Option<String>,
+        studio_mcp: &std::sync::Mutex<pa_core::mcp::McpManager>,
+    ) -> Result<(), String> {
         let PreparedReplacement {
             mut file,
             trace_persisted,
@@ -53,6 +60,9 @@ impl SessionNavigation {
                 .await;
         let (previous, traces) = {
             let mut core = self.core.lock().unwrap();
+            if let Some(cwd) = cwd {
+                core.cwd = cwd;
+            }
             if file.trace_upload.is_none() {
                 file.trace_upload = core
                     .store
@@ -62,7 +72,9 @@ impl SessionNavigation {
             }
             let traces = file.trace_upload.clone();
             // No await or fallible preparation between slot transfer and publication.
-            (core.store.replace(file), traces)
+            let previous = core.store.replace(file);
+            crate::worker::create::rotate_studio_mcp_for_successor(studio_mcp, &core);
+            (previous, traces)
         };
         if let Some(traces) = traces.filter(|_| trace_persisted) {
             // The successful prepare wrote this file before its controller existed.
@@ -340,10 +352,16 @@ impl Worker {
         if let Err(error) = self.teardown_for_replacement().await {
             return response_failure(None, command, &format!("{error:#}"), None);
         }
-        if let Some(cwd) = target.cwd.as_deref() {
-            self.rebind_worker_cwd(cwd);
+        let cwd = target.cwd.clone();
+        if let Some(cwd) = cwd.as_deref() {
+            self.engine.set_cwd(std::path::PathBuf::from(cwd));
         }
-        match self.navigation.replace_session(target).await {
+        let studio_mcp = self.session_mcp_manager();
+        match self
+            .navigation
+            .replace_session(target, cwd, &studio_mcp)
+            .await
+        {
             Ok(()) => {
                 self.refresh_replaced_session_state().await;
                 self.reseed_service_tier_for_replacement();
@@ -447,6 +465,375 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
+
+    /// The real agent engine's MCP store: what admission, prompt gating and the credential
+    /// check use in production.
+    // The faux provider registration is global; the lock must span the awaited turns.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn replacement_rotates_the_engine_studio_binding() {
+        let _faux = crate::agent_engine::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        replacement_rotates_the_studio_binding(
+            json!({
+                "engine": "faux",
+                "responses": [{ "text": "one" }],
+            }),
+            true,
+        )
+        .await;
+    }
+
+    /// The child template follows only effective registrations: a clear from a client that
+    /// owns nothing leaves it, and a rejected owner update that clears the store clears it too.
+    // The faux provider registration is global; the lock must span the awaited turns.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_child_studio_template_follows_only_effective_registrations() {
+        let _faux = crate::agent_engine::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let worker = Arc::new(Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "template-active".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: None,
+                script: Some(json!({ "engine": "faux", "responses": [{ "text": "one" }] })),
+            },
+            None,
+        ));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({
+                    "cwd": dir.path().to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let children = worker
+            .agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.clone())
+            .expect("the real engine has a children registry");
+        let studio = json!({
+            "type": "stdio", "name": pa_core::mcp::STUDIO_MCP_SERVER, "command": "node",
+            "args": ["bridge.mjs"], "cwd": "/launch", "env": {}
+        });
+        // `servers` is the ACP registration; `inherited` the Studio servers among them.
+        let register = |owner: &str, servers: Value, inherited: Value| {
+            let worker = Arc::clone(&worker);
+            let owner = owner.to_string();
+            async move {
+                worker
+                    .dispatch(
+                        "replace_acp_mcp_servers",
+                        &json!({
+                            "ownerId": owner,
+                            "servers": servers,
+                            "studioMcpServers": inherited,
+                            "studioHostContractVersion": 1,
+                        }),
+                    )
+                    .await
+            }
+        };
+        assert!(
+            register("owner", json!([studio.clone()]), json!([studio.clone()]))
+                .await
+                .success
+        );
+        assert_eq!(children.studio_mcp_servers().len(), 1, "registered");
+
+        // A clear from a client that owns nothing is a no-op: the template stays.
+        assert!(register("stranger", json!([]), json!([])).await.success);
+        assert_eq!(
+            children.studio_mcp_servers().len(),
+            1,
+            "a foreign clear kept it"
+        );
+
+        // The owner's update fails (duplicate names) and its rollback clears the store.
+        let failed = register(
+            "owner",
+            json!([studio.clone(), studio.clone()]),
+            json!([studio.clone()]),
+        )
+        .await;
+        assert!(
+            !failed.success,
+            "duplicate servers were accepted: {failed:?}"
+        );
+        assert!(worker
+            .session_mcp_manager()
+            .lock()
+            .unwrap()
+            .studio_binding()
+            .is_none());
+        assert!(
+            children.studio_mcp_servers().is_empty(),
+            "a cleared store left the child template"
+        );
+    }
+
+    /// A worker validates only its own Studio credential: another session's valid credential,
+    /// claimed against this worker, answers `{valid: false}`.
+    #[tokio::test]
+    async fn another_sessions_studio_credential_is_refused() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut workers = Vec::new();
+        for name in ["first", "second"] {
+            let sessions_dir = dir.path().join(name);
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            let worker = Arc::new(Worker::new(
+                crate::worker::WorkerConfig {
+                    socket_path: dir.path().join(format!("{name}.sock")),
+                    supervisor_socket_path: std::path::PathBuf::new(),
+                    token: "token".to_string(),
+                    worker_instance_id: String::new(),
+                    active_session_id: format!("{name}-active"),
+                    agent_dir: dir.path().join("agent"),
+                    recovery_journal_path: dir.path().join(format!("{name}.jsonl")),
+                    telemetry_disabled: None,
+                    script: Some(json!({ "responses": ["ack"] })),
+                },
+                None,
+            ));
+            let created = worker
+                .dispatch(
+                    "create",
+                    &json!({
+                        "cwd": dir.path().to_string_lossy(),
+                        "sessionDir": sessions_dir.to_string_lossy(),
+                    }),
+                )
+                .await;
+            assert!(created.success, "create failed: {created:?}");
+            let studio = json!({
+                "type": "stdio", "name": pa_core::mcp::STUDIO_MCP_SERVER, "command": "node",
+                "args": [], "cwd": "/launch", "env": {}
+            });
+            let registered = worker
+                .dispatch(
+                    "replace_acp_mcp_servers",
+                    &json!({
+                        "ownerId": "owner",
+                        "servers": [studio],
+                        "studioMcpServers": [studio],
+                        "studioHostContractVersion": 1,
+                    }),
+                )
+                .await;
+            assert!(registered.success, "register failed: {registered:?}");
+            workers.push(worker);
+        }
+        let credential = |worker: &Worker| {
+            worker
+                .session_mcp_manager()
+                .lock()
+                .unwrap()
+                .studio_binding()
+                .expect("bound")
+                .credential
+        };
+        let validate = |worker: Arc<Worker>, credential: String| async move {
+            worker
+                .dispatch(
+                    "validate_studio_mcp_credential",
+                    &json!({ "credential": credential }),
+                )
+                .await
+                .data
+                .expect("validate data")
+        };
+        let (first, second) = (Arc::clone(&workers[0]), Arc::clone(&workers[1]));
+        // Positive controls: each worker accepts its own binding and names its own session.
+        let session_of = |worker: &Worker| {
+            worker
+                .core
+                .lock()
+                .unwrap()
+                .store
+                .as_ref()
+                .map(|store| store.session_id().to_string())
+                .expect("created session")
+        };
+        for worker in [&first, &second] {
+            let own = validate(Arc::clone(worker), credential(worker)).await;
+            assert_eq!(own["valid"], true, "{own}");
+            assert_eq!(own["sessionId"], session_of(worker), "{own}");
+        }
+        assert_ne!(session_of(&first), session_of(&second));
+        assert_eq!(
+            validate(Arc::clone(&second), credential(&first)).await,
+            json!({ "valid": false })
+        );
+        assert_eq!(
+            validate(Arc::clone(&first), credential(&second)).await,
+            json!({ "valid": false })
+        );
+    }
+
+    /// The worker-level fallback store a scripted harness engine uses.
+    #[tokio::test]
+    async fn replacement_rotates_the_fallback_studio_binding() {
+        replacement_rotates_the_studio_binding(json!({ "responses": ["ack"] }), false).await;
+    }
+
+    /// A replacement inside the worker (fork, then new session) rotates the Studio MCP
+    /// binding onto the successor: the predecessor's credential stops validating, the
+    /// successor's validates against its own session, and the descriptor names it.
+    async fn replacement_rotates_the_studio_binding(script: Value, engine_store: bool) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("rotate.jsonl");
+        let message = json!({ "role": "user", "content": "first prompt", "timestamp": 10u64 });
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"rotate-session\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/tmp\"}}\n\
+                 {{\"type\":\"message\",\"message\":{},\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\"}}\n",
+                serde_json::to_string(&message).unwrap(),
+            ),
+        )
+        .unwrap();
+        let worker = Arc::new(Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "rotate-active".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: None,
+                script: Some(script),
+            },
+            None,
+        ));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({
+                    "cwd": dir.path().to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                    "sessionPath": path.to_string_lossy(),
+                }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        assert_eq!(
+            worker.engine.acp_mcp_manager().is_some(),
+            engine_store,
+            "the test runs against the intended MCP store"
+        );
+        let studio = json!({
+            "type": "stdio", "name": pa_core::mcp::STUDIO_MCP_SERVER, "command": "node",
+            "args": ["bridge.mjs"], "cwd": "/launch", "env": {}
+        });
+        let registered = worker
+            .dispatch(
+                "replace_acp_mcp_servers",
+                &json!({
+                    "ownerId": "studio-owner",
+                    "servers": [studio],
+                    "studioMcpServers": [studio],
+                    "studioHostContractVersion": 1,
+                }),
+            )
+            .await;
+        assert!(registered.success, "register failed: {registered:?}");
+
+        let binding = || {
+            worker
+                .session_mcp_manager()
+                .lock()
+                .unwrap()
+                .studio_binding()
+                .expect("bound")
+        };
+        let descriptor_session = || {
+            let servers = worker
+                .session_mcp_manager()
+                .lock()
+                .unwrap()
+                .get_acp_servers();
+            let Some(pa_core::mcp::AcpMcpServerConfig::Stdio { env, .. }) = servers
+                .into_iter()
+                .find(|server| server.name() == pa_core::mcp::STUDIO_MCP_SERVER)
+            else {
+                panic!("no Studio descriptor");
+            };
+            serde_json::from_str::<Value>(&env["PRIME_STUDIO_NATIVE_SESSION"]).unwrap()["sessionId"]
+                .clone()
+        };
+        let validate = |credential: String| {
+            let worker = Arc::clone(&worker);
+            async move {
+                worker
+                    .dispatch(
+                        "validate_studio_mcp_credential",
+                        &json!({ "credential": credential }),
+                    )
+                    .await
+                    .data
+                    .expect("validate data")
+            }
+        };
+        let first = binding();
+        let checked = validate(first.credential.clone()).await;
+        assert_eq!(checked["valid"], true);
+        assert_eq!(checked["sessionId"], "rotate-session");
+        assert_eq!(descriptor_session(), "rotate-session");
+
+        let mut before = first;
+        let mut predecessor = json!("rotate-session");
+        for (command, payload) in [
+            ("fork", json!({ "entryId": "m1", "position": "at" })),
+            ("new_session", json!({})),
+        ] {
+            let replaced = worker.dispatch(command, &payload).await;
+            assert!(replaced.success, "{command} failed: {replaced:?}");
+            let after = binding();
+            assert_ne!(
+                after.credential, before.credential,
+                "{command} kept the credential"
+            );
+            assert!(
+                after.generation > before.generation,
+                "{command} kept the generation"
+            );
+            assert_eq!(
+                validate(before.credential.clone()).await,
+                json!({ "valid": false }),
+                "{command}: the predecessor's credential still validates"
+            );
+            let checked = validate(after.credential.clone()).await;
+            assert_eq!(checked["valid"], true, "{command}: {checked}");
+            assert_ne!(
+                checked["sessionId"], predecessor,
+                "{command} kept the session"
+            );
+            assert_eq!(
+                descriptor_session(),
+                checked["sessionId"],
+                "{command}: the descriptor names the successor"
+            );
+            predecessor = checked["sessionId"].clone();
+            before = after;
+        }
+    }
 
     async fn created_worker() -> Arc<Worker> {
         let dir = std::env::temp_dir().join(format!("pa-worker-nav-{}", uuid::Uuid::new_v4()));

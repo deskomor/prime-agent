@@ -1416,8 +1416,8 @@ async fn session_messages_reads_the_transcript_end_to_end() {
     }
     let read = read_recorded(&receipts_dir, "transcript.json");
     assert_eq!(
-        read["total"], 6,
-        "the in-flight step is not counted: {read}"
+        read["total"], 7,
+        "the saved digest counts, but the in-flight step does not: {read}"
     );
     assert_eq!(
         read["users"],
@@ -1439,7 +1439,17 @@ async fn session_messages_reads_the_transcript_end_to_end() {
     );
     assert_eq!(
         read["roles"],
-        json!(["user", "user", "user", "compactionSummary", "user", "user"])
+        // The deferred first-turn digest rides the new turn's admission ahead of its prompt, after
+        // the resumed history; the provider sees the same order (Task4 admission: durable = live).
+        json!([
+            "user",
+            "user",
+            "user",
+            "compactionSummary",
+            "user",
+            "custom",
+            "user"
+        ])
     );
 
     client.send_command(
@@ -1447,6 +1457,13 @@ async fn session_messages_reads_the_transcript_end_to_end() {
         &json!({ "type": "get_messages", "activeSessionId": active_session_id }),
     );
     let messages = client.read_response("messages-reader");
+    let digest = messages["data"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["customType"] == "harness_digest")
+        .expect("the persisted harness digest");
+    assert_eq!(digest["display"], false);
     let cell_result = messages["data"]["messages"]
         .as_array()
         .expect("messages")
@@ -1458,8 +1475,8 @@ async fn session_messages_reads_the_transcript_end_to_end() {
         cell_result["details"]["transcriptReads"],
         json!([
             { "returned": 3, "first": 2, "total": 5, "roles": ["user"] },
-            { "returned": 4, "first": 0, "total": 6, "roles": ["*"] },
-            { "returned": 6, "first": 0, "total": 6, "roles": ["*"] },
+            { "returned": 4, "first": 0, "total": 7, "roles": ["*"] },
+            { "returned": 7, "first": 0, "total": 7, "roles": ["*"] },
         ]),
         "the cell's reads ride the tool result: {cell_result}"
     );
@@ -1642,8 +1659,17 @@ async fn passivated_child_recent_messages_reads_its_file_end_to_end() {
         .await
         .expect("kid-a recent messages");
     let previews = all["messages"].as_array().expect("previews");
+    // A fresh child's deferred harness digest rides first, ahead of its accepted primary row
+    // (Task4 admission order); the task from the parent is the next row.
+    assert_eq!(previews[0]["role"], "custom", "{all}");
     assert!(
         previews[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[harness-digest]")),
+        "{all}"
+    );
+    assert!(
+        previews[1]["text"]
             .as_str()
             .is_some_and(|text| text.contains("kid-a work")),
         "{all}"

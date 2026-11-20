@@ -356,7 +356,7 @@ impl Supervisor {
     }
 
     /// Release one root adapter's explicit targets and inherited descendants.
-    /// The caller holds host_owner_admission to fence child inheritance.
+    /// The caller holds `host_owner_admission` to fence child inheritance.
     async fn release_host_owner_sessions(
         &self,
         owner_token: &str,
@@ -1253,12 +1253,12 @@ impl Supervisor {
                         );
                     }
                 }
-                let mut owned = command.clone();
+                let mut scoped_command = command.clone();
                 if let Some(owner) = &owner {
                     sessions.insert(active_session_id.clone(), owner.clone());
                     if let DaemonCommand::SetHostHooks { rest, .. }
                     | DaemonCommand::SetActiveTools { rest, .. }
-                    | DaemonCommand::SetAutoRefine { rest, .. } = &mut owned
+                    | DaemonCommand::SetAutoRefine { rest, .. } = &mut scoped_command
                     {
                         rest.insert("hostOwnerToken".to_string(), json!(owner));
                     }
@@ -1269,7 +1269,7 @@ impl Supervisor {
                     drop(leases);
                     return self
                         .route_client_command(
-                            &owned,
+                            &scoped_command,
                             &client_id,
                             attached,
                             command_id,
@@ -1286,7 +1286,7 @@ impl Supervisor {
                 drop(owner_admission);
                 let outcome = self
                     .route_client_command(
-                        &owned,
+                        &scoped_command,
                         &client_id,
                         attached,
                         command_id,

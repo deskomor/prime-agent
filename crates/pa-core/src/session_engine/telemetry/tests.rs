@@ -193,6 +193,7 @@ fn tool_execution_event(tool: &str, is_error: bool) -> (AgentEvent, AgentEvent) 
             result: pa_agent::types::AgentToolResult {
                 content: vec![ToolResultContent::text("private tool output")],
                 details: serde_json::Value::Null,
+                is_error,
                 terminate: None,
             },
             is_error,

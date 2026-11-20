@@ -476,12 +476,12 @@ mod tests {
     use std::sync::Arc;
 
     async fn created_worker() -> Arc<Worker> {
-        created_worker_named(Some("custom")).await
+        created_worker_named(Some("custom"), json!({ "responses": ["ack"] })).await
     }
 
     /// The worker fixture over an optional create name: a `None` create
     /// leaves the session without a `session_info` name row.
-    async fn created_worker_named(name: Option<&str>) -> Arc<Worker> {
+    async fn created_worker_named(name: Option<&str>, script: Value) -> Arc<Worker> {
         let dir = std::env::temp_dir().join(format!("pa-worker-sc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = crate::worker::WorkerConfig {
@@ -493,7 +493,7 @@ mod tests {
             agent_dir: dir.join("agent"),
             recovery_journal_path: dir.join("recovery.jsonl"),
             telemetry_disabled: None,
-            script: Some(json!({ "responses": ["ack"] })),
+            script: Some(script),
         };
         let worker = Arc::new(Worker::new(config, None));
         let mut create = json!({ "noSession": true, "cwd": "/tmp" });
@@ -628,9 +628,20 @@ mod tests {
         drop(outer_engine);
     }
 
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the faux registry is process-global"
+    )]
     #[tokio::test]
     async fn append_custom_message_records_the_row() {
-        let worker = created_worker().await;
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let worker = created_worker_named(
+            Some("custom"),
+            json!({ "engine": "faux", "responses": ["ack"] }),
+        )
+        .await;
         let response = worker
             .dispatch(
                 "append_custom_message",
@@ -677,7 +688,7 @@ mod tests {
     /// name, or a rename that keeps the name, leaves none.
     #[tokio::test]
     async fn rename_leaves_a_displayed_notice_only_when_a_name_changed() {
-        let worker = created_worker_named(None).await;
+        let worker = created_worker_named(None, json!({ "responses": ["ack"] })).await;
         // A first name leaves no notice (there was no previous name).
         let response = worker.handle_rename("rename", &json!({ "name": "first" }));
         assert!(response.success, "rename failed: {response:?}");

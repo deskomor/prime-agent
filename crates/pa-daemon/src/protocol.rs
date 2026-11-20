@@ -185,10 +185,12 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "set_host_hooks",
     "respond_host_hook",
     "session_snapshot",
+    "validate_studio_mcp_credential",
     "set_active_tools",
     "append_session_entry",
     "set_auto_refine",
     "request_host_hook",
+    "wait_for_auto_refine_idle",
 ];
 
 /// Parsed client command envelope.
@@ -715,6 +717,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::WaitForHeadlessCompletion {
             active_session_id, ..
         }
+        | DaemonCommand::WaitForAutoRefineIdle {
+            active_session_id, ..
+        }
         | DaemonCommand::GetSessionHeader {
             active_session_id, ..
         }
@@ -776,6 +781,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
             active_session_id, ..
         }
         | DaemonCommand::SessionSnapshot {
+            active_session_id, ..
+        }
+        | DaemonCommand::ValidateStudioMcpCredential {
             active_session_id, ..
         }
         | DaemonCommand::SetActiveTools {
@@ -1043,6 +1051,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::DeleteRlmSubagent { .. } => "delete_rlm_subagent",
         DaemonCommand::WaitForIdle { .. } => "wait_for_idle",
         DaemonCommand::WaitForHeadlessCompletion { .. } => "wait_for_headless_completion",
+        DaemonCommand::WaitForAutoRefineIdle { .. } => "wait_for_auto_refine_idle",
         DaemonCommand::GetSessionHeader { .. } => "get_session_header",
         DaemonCommand::GetState { .. } => "get_state",
         DaemonCommand::GetConnectionState { .. } => "get_connection_state",
@@ -1063,6 +1072,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::SetHostHooks { .. } => "set_host_hooks",
         DaemonCommand::RespondHostHook { .. } => "respond_host_hook",
         DaemonCommand::SessionSnapshot { .. } => "session_snapshot",
+        DaemonCommand::ValidateStudioMcpCredential { .. } => "validate_studio_mcp_credential",
         DaemonCommand::SetActiveTools { .. } => "set_active_tools",
         DaemonCommand::AppendSessionEntry { .. } => "append_session_entry",
         DaemonCommand::SetAutoRefine { .. } => "set_auto_refine",

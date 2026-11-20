@@ -183,7 +183,10 @@ impl DaemonLink {
     /// link close ends the wait (turn-long commands — declared
     /// divergence, TS caps them at 24 h; the link-close signal is the
     /// liveness bound here, not a timer).
-    async fn request_until_close(&self, command: DaemonCommand) -> anyhow::Result<DaemonResponse> {
+    pub(super) async fn request_until_close(
+        &self,
+        command: DaemonCommand,
+    ) -> anyhow::Result<DaemonResponse> {
         self.exchange(command, None).await
     }
 
@@ -1090,7 +1093,10 @@ async fn handle_incoming(
         | super::session_ext::SET_AUTO_REFINE_METHOD
         | super::session_ext::SESSION_SNAPSHOT_METHOD
         | super::session_ext::APPEND_CUSTOM_MESSAGE_METHOD
-        | super::session_ext::SET_ACTIVE_TOOLS_METHOD => {
+        | super::session_ext::SET_ACTIVE_TOOLS_METHOD
+        | super::session_ext::VALIDATE_STUDIO_MCP_CREDENTIAL_METHOD
+        | super::session_ext::NAVIGATE_TREE_METHOD
+        | super::session_ext::WAIT_AUTO_REFINE_METHOD => {
             super::session_ext::handle_session_ext(id, &method, params, link, state, tx).await;
         }
         other => {
@@ -1121,8 +1127,30 @@ fn handle_initialize(id: &Value, params: &Value, product_version: &str, tx: &pro
         result["_meta"][super::meta::PRIME_AGENT_META_NAMESPACE]["hostContract"] = json!({
             "version": 1,
             "build": crate::protocol::build_identity(),
-            "features": ["session_snapshot", "lifecycle", "canonical_exchanges", "context_refs", "projection_identity", "bash_entry_id", "session_writes", "refinement_pause", "family_scope"]
+            "features": ["session_snapshot", "lifecycle", "canonical_exchanges", "context_refs", "projection_identity", "bash_entry_id", "session_writes", "refinement_pause", "family_scope", "studio_mcp_binding"]
         });
+    }
+    // Opt-in, so the default answer stays unchanged: the client may move the
+    // session leaf with the navigate_tree session extension.
+    if params
+        .pointer("/clientCapabilities/_meta")
+        .and_then(|meta| meta.get(super::meta::PRIME_AGENT_META_NAMESPACE))
+        .and_then(|meta| meta.get("treeNavigation"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        result["_meta"][super::meta::PRIME_AGENT_META_NAMESPACE]["treeNavigation"] = json!(true);
+    }
+    // Opt-in as well: the client may drain the session's background
+    // auto-refinement with the wait_auto_refine session extension.
+    if params
+        .pointer("/clientCapabilities/_meta")
+        .and_then(|meta| meta.get(super::meta::PRIME_AGENT_META_NAMESPACE))
+        .and_then(|meta| meta.get("autoRefineDrain"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        result["_meta"][super::meta::PRIME_AGENT_META_NAMESPACE]["autoRefineDrain"] = json!(true);
     }
     let _ = tx.send(jsonrpc::response(id, &result));
 }
@@ -1201,7 +1229,7 @@ async fn handle_session_new(
                 })
                 .collect()
         } else {
-            Default::default()
+            std::collections::HashSet::default()
         };
     let params = types::NewSessionParams::parse(&params);
     if !state.lock().await.mcp_server_names.is_empty() {

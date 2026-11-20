@@ -517,6 +517,142 @@ fn action_updates_with(events: &[Value], steering: &[&str], follow_ups: &[&str])
 }
 
 #[test]
+fn direct_prompt_acknowledges_and_stays_visible_during_core_startup() {
+    let (dir, mock, _supervisor, mut client, session_id) = setup("direct-startup");
+    assert_eq!(
+        client.send(
+            "hooks",
+            &json!({
+                "type": "set_host_hooks", "activeSessionId": session_id,
+                "hooks": ["before_agent_start"], "hostContractVersion": 1,
+            })
+        )["success"],
+        true
+    );
+    let text = "cold direct startup";
+    let admitted = client.send("direct", &queued_prompt(&session_id, text, "steer"));
+    assert_eq!(
+        admitted["success"], true,
+        "prompt ACK does not await core startup"
+    );
+    let hook = loop {
+        if let Some(hook) = client
+            .events
+            .iter()
+            .find(|event| event["type"] == "host_hook_request")
+        {
+            break hook.clone();
+        }
+        let line = client.read_line();
+        client.collect_event(&line);
+    };
+    assert_eq!(hook["hook"], "before_agent_start");
+    assert_eq!(
+        mock.count(),
+        0,
+        "the real core is held before its first provider call"
+    );
+    let preparing = client
+        .events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "session_action_update")
+        .expect("preparing projection before the held core hook");
+    assert_eq!(
+        preparing["actions"]["active"],
+        json!({"kind": "turn", "phase": "preparing", "label": text})
+    );
+    assert!(
+        client
+            .events
+            .iter()
+            .all(|event| event["type"] != "message_start" || event["message"]["role"] != "user"),
+        "the preview is independent of durable primary delivery"
+    );
+    assert_eq!(
+        client.send(
+            "release-hook",
+            &json!({
+                "type": "respond_host_hook", "activeSessionId": session_id,
+                "requestId": hook["requestId"], "result": {},
+            })
+        )["success"],
+        true,
+        "release the actual held hook"
+    );
+    assert_eq!(
+        client.send(
+            "idle-direct",
+            &json!({"type": "wait_for_idle", "activeSessionId": session_id})
+        )["success"],
+        true
+    );
+    assert_eq!(
+        client
+            .events
+            .iter()
+            .filter(|event| event["type"] == "message_start" && event["message"]["role"] == "user")
+            .count(),
+        1
+    );
+    assert!(client
+        .events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "session_action_update")
+        .unwrap()["actions"]["active"]
+        .is_null());
+
+    assert_eq!(
+        mock.count(),
+        1,
+        "the released primary reaches the provider once"
+    );
+    client.events.clear();
+    let refused = client.send(
+        "create-refused",
+        &json!({"type": "create", "config": {
+            "cwd": dir.path().to_string_lossy(),
+            "provider": "no-such-provider", "model": "no-such-model",
+        }}),
+    );
+    assert_eq!(refused["success"], true, "model resolution remains lazy");
+    let refused_id = refused["data"]["id"]
+        .as_str()
+        .or_else(|| refused["data"]["sessionId"].as_str())
+        .expect("refused session")
+        .to_string();
+    assert_eq!(
+        client.send(
+            "attach-refused",
+            &json!({"type": "attach", "activeSessionId": refused_id})
+        )["success"],
+        true
+    );
+    let failed = client.send("refused-prompt", &json!({"type": "prompt_and_wait", "activeSessionId": refused_id, "message": "refused direct startup"}));
+    assert_eq!(
+        failed["success"], false,
+        "the unavailable model refuses without a provider call"
+    );
+    assert!(client
+        .events
+        .iter()
+        .any(|event| event["type"] == "session_action_update"
+            && event["actions"]["active"]["phase"] == "preparing"));
+    assert!(
+        client
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "session_action_update")
+            .unwrap()["actions"]["active"]
+            .is_null(),
+        "refusal clears the Starting projection"
+    );
+    assert_eq!(mock.count(), 1, "model refusal does not call the provider");
+}
+
+#[test]
 fn queue_pickup_projection_reaches_clients_before_the_delivered_turn_starts() {
     let (_dir, mock, _supervisor, mut client, session_id) = setup("queue-pickup");
 
@@ -746,12 +882,20 @@ fn queue_delivery_projects_the_active_action_phases_around_the_turn() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let settled_index = loop {
         client.drain_events(Duration::from_millis(400));
+        let followup_start = client
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event["type"] == "agent_start")
+            .nth(1)
+            .map(|(index, _)| index);
         let found = client
             .events
             .iter()
             .enumerate()
-            .find(|(_, event)| {
-                event.get("type").and_then(Value::as_str) == Some("session_action_update")
+            .find(|(index, event)| {
+                followup_start.is_some_and(|start| *index > start)
+                    && event.get("type").and_then(Value::as_str) == Some("session_action_update")
                     && event["actions"]["steering"]
                         .as_array()
                         .is_some_and(Vec::is_empty)
@@ -780,8 +924,13 @@ fn queue_delivery_projects_the_active_action_phases_around_the_turn() {
         })
         .map(|(index, _)| index)
         .collect();
+    let first_turn_end = events
+        .iter()
+        .position(|event| event["type"] == "agent_end")
+        .expect("the preceding turn settled");
     let phase_at = |index: usize, phase: &str| {
-        events[index]["actions"]["active"]["phase"].as_str() == Some(phase)
+        index > first_turn_end
+            && events[index]["actions"]["active"]["phase"].as_str() == Some(phase)
     };
     let preparing = action_updates
         .iter()

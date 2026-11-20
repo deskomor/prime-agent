@@ -438,6 +438,17 @@ fn differential_live_export_matches_ts_binary() {
     for tool in &mut normalized_ts_tools {
         if tool["name"] == "ipython" {
             tool["name"] = json!("python_repl");
+            // Accepted fork difference against TS 0.9.8: the Rust tool adds a per-cell
+            // `timeout` parameter. TS must lack it; Rust must carry exactly this schema.
+            let properties = &mut tool["parameters"]["properties"];
+            assert!(
+                properties.get("timeout").is_none(),
+                "TS python tool has no timeout: {properties}"
+            );
+            properties["timeout"] = json!({
+                "type": "integer",
+                "description": "Seconds before this cell is interrupted (default 60 unless the user configured otherwise, max 180)."
+            });
         }
     }
     assert_eq!(&normalized_ts_tools, rs_tools, "tools section");

@@ -2989,6 +2989,141 @@ fn base_options(
 }
 
 #[tokio::test]
+async fn tui_direct_submit_ack_and_starting_render_before_core_startup_releases() {
+    use pa_tui::interactive::HeadlessStep;
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let session_dir = dir.path().join("agent/sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script =
+        serde_json::json!({"engine": "faux", "responses": [{"text": "released startup reply"}]});
+    let session_id = create_session_via_daemon(
+        &supervisor.socket,
+        &dir.path().join("script.json"),
+        &script,
+        dir.path(),
+        &session_dir,
+    )
+    .await;
+    let (client, mut events) = pa_tui::daemon_client::DaemonClient::connect(&supervisor.socket)
+        .await
+        .expect("control client");
+    client
+        .request_ok(
+            serde_json::from_value(serde_json::json!({
+                "type": "attach", "activeSessionId": session_id,
+            }))
+            .expect("attach command"),
+        )
+        .await
+        .expect("attach control");
+    client
+        .request_ok(
+            serde_json::from_value(serde_json::json!({
+                "type": "set_host_hooks", "activeSessionId": session_id,
+                "hooks": ["before_agent_start"], "hostContractVersion": 1,
+            }))
+            .expect("hook command"),
+        )
+        .await
+        .expect("install real startup hook");
+    let mut options = base_options(&supervisor, dir.path(), &session_dir);
+    options.session = pa_tui::interactive::SessionSelection::Attach(session_id.clone());
+    let (rendered_tx, rendered_rx) = std::sync::mpsc::channel();
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            HeadlessStep::Type("unsent startup draft".to_string()),
+            HeadlessStep::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('s'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+            HeadlessStep::Submit("cold startup input".to_string()),
+            // Only the admitted PromptSubmitNote restores this captured stash.
+            HeadlessStep::WaitRender {
+                needle: "Restored stashed prompt".to_string(),
+                timeout_ms: 30_000,
+            },
+            HeadlessStep::WaitRender {
+                needle: "Starting".to_string(),
+                timeout_ms: 30_000,
+            },
+            HeadlessStep::Timestamp(rendered_tx),
+            HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 120,
+        height: 36,
+    };
+    let release = async move {
+        let hook = tokio::time::timeout(HEADLESS_RUN_BOUND, async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("control event stream stays open");
+                if let pa_tui::daemon_client::DaemonClientEvent::SessionEvent { event, .. } = event
+                {
+                    if event["type"] == "host_hook_request" {
+                        break event;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("real core reaches before-start barrier");
+        assert_eq!(hook["hook"], "before_agent_start");
+        let (_, render_count) =
+            tokio::task::spawn_blocking(move || rendered_rx.recv_timeout(HEADLESS_RUN_BOUND))
+                .await
+                .expect("render witness task")
+                .expect("UI renders acknowledged pending input before release");
+        assert!(render_count > 0);
+        client
+            .request_ok(
+                serde_json::from_value(serde_json::json!({
+                    "type": "respond_host_hook", "activeSessionId": session_id,
+                    "requestId": hook["requestId"], "result": {},
+                }))
+                .expect("release command"),
+            )
+            .await
+            .expect("hook still held until the client painted");
+        client
+    };
+    let (outcome, client) = tokio::join!(run_headless_bounded(options, plan), release);
+    let outcome = outcome.expect("production submit/render path");
+    client.close();
+    assert!(
+        !outcome
+            .frames
+            .iter()
+            .any(|frame| frame.contains("timed out waiting for the headless render condition")),
+        "both pre-release frame barriers must actually succeed"
+    );
+    assert!(
+        outcome
+            .frames
+            .iter()
+            .any(|frame| frame.contains("Starting") && frame.contains("cold startup input")),
+        "the pending input paints before core delivery"
+    );
+    assert!(
+        outcome
+            .frames
+            .iter()
+            .any(|frame| frame.contains("Restored stashed prompt")
+                && frame.contains("unsent startup draft")),
+        "the successful submit ACK restores the captured draft"
+    );
+    assert!(
+        outcome
+            .frames
+            .iter()
+            .any(|frame| frame.contains("released startup reply")),
+        "the held turn completes after release"
+    );
+}
+
+#[tokio::test]
 async fn tui_renames_session_through_slash_command() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");

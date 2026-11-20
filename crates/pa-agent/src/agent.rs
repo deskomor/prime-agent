@@ -998,6 +998,10 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error when the canonical row has no saved entry ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the run, host steering IDs, or steering queue mutex is poisoned.
     pub async fn inject_host_message(
         &self,
         message: crate::types::CustomAgentMessage,

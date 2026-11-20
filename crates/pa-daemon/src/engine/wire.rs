@@ -61,6 +61,9 @@ pub enum EngineEvent {
     ModelChange(pa_types::session::ModelChangeEntry),
     /// The user message that was accepted (recorded into the session store).
     UserMessage(Value),
+    /// A custom admission prefix, persisted and framed like a custom message
+    /// without accepting the queued primary action.
+    PromptPrefix(Value),
     /// An assistant message update (streaming): the loop's shared
     /// [`AssistantSnapshot`] plus the provider stream event that produced it.
     AssistantUpdate {

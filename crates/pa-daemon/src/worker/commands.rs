@@ -64,11 +64,13 @@ impl Worker {
             }
             "set_auto_compaction" => self.handle_set_auto_compaction(payload),
             "wait_for_idle" => self.handle_wait_for_idle(payload).await,
+            "wait_for_auto_refine_idle" => self.handle_wait_for_auto_refine_idle(payload).await,
             "wait_for_headless_completion" => {
                 self.handle_wait_for_headless_completion(payload).await
             }
             "get_state" => self.handle_get_state(),
             "session_snapshot" => self.handle_session_snapshot(payload).await,
+            "validate_studio_mcp_credential" => self.handle_validate_studio_mcp_credential(payload),
             "set_active_tools" => self.handle_set_active_tools(payload).await,
             "get_messages" => self.handle_get_messages(payload),
             "get_session_messages" => self.handle_get_session_messages(payload).await,
@@ -447,6 +449,52 @@ impl Worker {
         response_success(None, "set_auto_refine", None)
     }
 
+    /// Read-only: is `credential` this session's current Studio MCP binding?
+    /// A match answers its generation and the live native identity; anything
+    /// else answers `{valid: false}` without detail. Never loads history.
+    fn handle_validate_studio_mcp_credential(&self, payload: &Value) -> DaemonResponse {
+        // A session still initializing (or shutting down) validates nothing.
+        if self
+            .require_created("validate_studio_mcp_credential")
+            .is_err()
+        {
+            return response_success(
+                None,
+                "validate_studio_mcp_credential",
+                Some(json!({ "valid": false })),
+            );
+        }
+        let credential = payload
+            .get("credential")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let manager = self.session_mcp_manager();
+        // Core first, then the binding: a session replacement rotates the binding under the
+        // same core lock it swaps the store in, so a match always names its own session.
+        let core = self.core.lock().unwrap();
+        let generation = (!credential.is_empty())
+            .then(|| {
+                manager
+                    .lock()
+                    .unwrap()
+                    .validate_studio_credential(credential)
+            })
+            .flatten();
+        let data = match (generation, core.store.as_ref()) {
+            (Some(generation), Some(store)) => json!({
+                "valid": true,
+                "generation": generation,
+                "sessionId": store.session_id(),
+                "activeSessionId": core.active_session_id,
+                "sessionFile": store.path,
+                "cwd": core.cwd,
+                "parentSessionId": core.parent_session_id,
+            }),
+            _ => json!({ "valid": false }),
+        };
+        response_success(None, "validate_studio_mcp_credential", Some(data))
+    }
+
     /// The session's owner-fenced ACP MCP store: the ACP transport resolves and
     /// validates the servers before sending them; the worker fences ownership,
     /// guards the busy turn, and rolls back a failed replacement.
@@ -463,11 +511,23 @@ impl Worker {
                 None,
             );
         }
-        let mut servers: Vec<pa_core::mcp::AcpMcpServerConfig> = payload
+        // A malformed list fails here: it must never read as an explicit clear.
+        let mut servers: Vec<pa_core::mcp::AcpMcpServerConfig> = match payload
             .get("servers")
             .cloned()
-            .map(|servers| serde_json::from_value(servers).unwrap_or_default())
-            .unwrap_or_default();
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(servers) => servers.unwrap_or_default(),
+            Err(error) => {
+                return response_failure(
+                    None,
+                    "replace_acp_mcp_servers",
+                    &format!("Invalid ACP MCP servers: {error}"),
+                    None,
+                )
+            }
+        };
         let inherited = match payload
             .get("studioMcpServers")
             .filter(|_| {
@@ -490,28 +550,19 @@ impl Worker {
                 )
             }
         };
-        let inherited = {
-            let core = self.core.lock().unwrap();
-            let Some(store) = core.store.as_ref() else {
-                return response_failure(
-                    None,
-                    "replace_acp_mcp_servers",
-                    "Session is still initializing",
-                    None,
-                );
-            };
-            super::create::bind_studio_mcp_servers(
-                inherited,
-                &json!({
-                    "activeSessionId": core.active_session_id,
-                    "sessionId": store.session_id(),
-                    "sessionFile": store.path,
-                    "cwd": core.cwd,
-                    "parentSessionId": core.parent_session_id,
-                    "parentActiveSessionId": core.parent_active_session_id,
-                }),
-            )
+        // Core, then the store: the descriptor's identity and its install sit under the lock
+        // a session replacement swaps the store and rotates the binding under, so this can
+        // never install a predecessor-bound descriptor after that rotation.
+        let core = self.core.lock().unwrap();
+        let Some(identity) = super::create::studio_session_identity(&core) else {
+            return response_failure(
+                None,
+                "replace_acp_mcp_servers",
+                "Session is still initializing",
+                None,
+            );
         };
+        let inherited = super::create::bind_studio_mcp_servers(inherited, &identity);
         for server in &mut servers {
             if let Some(bound) = inherited
                 .iter()
@@ -522,7 +573,7 @@ impl Worker {
         }
         // The agent cannot adopt a different MCP tool list mid-turn (TS
         // `session.isStreaming` guard).
-        if !servers.is_empty() && self.core.lock().unwrap().busy {
+        if !servers.is_empty() && core.busy {
             return response_failure(
                 None,
                 "replace_acp_mcp_servers",
@@ -532,19 +583,28 @@ impl Worker {
         }
         // The real agent engine owns the session's MCP store (one store for admission
         // and prompt gating); scripted harness engines fall back to the worker-level store.
-        let manager = self
-            .engine
-            .acp_mcp_manager()
-            .unwrap_or_else(|| std::sync::Arc::clone(&self.acp_mcp));
+        let manager = self.session_mcp_manager();
+        // Only the ACP owner's inherited Studio sidecar is enrolled for a credential.
+        let studio = if inherited
+            .iter()
+            .any(|server| server.name() == pa_core::mcp::STUDIO_MCP_SERVER)
+        {
+            pa_core::mcp::StudioUpdate::Bind(pa_core::mcp::STUDIO_MCP_SERVER)
+        } else {
+            pa_core::mcp::StudioUpdate::Unbind
+        };
         let manager = manager.lock().unwrap();
-        match manager.replace_acp_servers(&servers, owner_id) {
-            // An unchanged list (same owner, identical servers) is a
-            // no-op success.
-            Ok(_) => {
+        // The child template publishes under the same core and store guards as the commit,
+        // so an older registration can never publish after a newer one.
+        let response = match manager.replace_acp_servers_with_studio(&servers, owner_id, studio) {
+            // An unchanged list (same owner, identical servers) and a clear from a client
+            // that owns nothing are no-op successes: neither touches the child template.
+            Ok(changed) => {
                 if let Some(children) = self
                     .agent_engine
                     .as_ref()
                     .and_then(|engine| engine.children.as_ref())
+                    .filter(|_| changed)
                 {
                     children.set_studio_mcp_servers(inherited);
                 }
@@ -553,12 +613,24 @@ impl Worker {
             Err(error) => {
                 // Roll back any partially applied configuration with
                 // the owner-scoped clear before surfacing the failure.
-                if manager.can_release_acp_servers(owner_id) {
-                    let _ = manager.replace_acp_servers(&[], owner_id);
+                if manager.can_release_acp_servers(owner_id)
+                    && manager.replace_acp_servers(&[], owner_id).unwrap_or(false)
+                {
+                    // The clear revoked the binding: future children inherit nothing either.
+                    if let Some(children) = self
+                        .agent_engine
+                        .as_ref()
+                        .and_then(|engine| engine.children.as_ref())
+                    {
+                        children.set_studio_mcp_servers(Vec::new());
+                    }
                 }
                 response_failure(None, "replace_acp_mcp_servers", &error.to_string(), None)
             }
-        }
+        };
+        drop(manager);
+        drop(core);
+        response
     }
 
     /// Arm the one-shot forced steering batch: the visible plain-user steering

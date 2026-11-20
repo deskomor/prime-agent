@@ -82,6 +82,10 @@ pub struct PrimeAgentSessionMeta {
     pub goal: Option<PrimeAgentGoalMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinement: Option<PrimeAgentRefinementMeta>,
+    /// A saved refinement row (`refinement_outcome` or `refinement_notice`) as it lands in the
+    /// session: only the fields a client card shows, never edit bodies or before/after values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refinement_row: Option<PrimeAgentRefinementRowMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_message: Option<PrimeAgentAgentMessageMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +120,40 @@ pub struct PrimeAgentRefinementMeta {
     pub changes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The card fields of one saved refinement row; see [`PrimeAgentSessionMeta::refinement_row`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentRefinementRowMeta {
+    pub custom_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refinement_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_of: Option<String>,
+    pub edits: Vec<PrimeAgentRefinementEditMeta>,
+}
+
+/// One edit of a saved refinement row: what it did and to which entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentRefinementEditMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
 }
 
 /// An agent-to-agent message sent from inside a kernel cell.

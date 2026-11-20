@@ -401,7 +401,9 @@ fn custom_rows(events: &[EngineEvent]) -> Vec<serde_json::Value> {
     events
         .iter()
         .filter_map(|event| match event {
-            EngineEvent::CustomMessage(value) => Some(value.clone()),
+            EngineEvent::CustomMessage(value) | EngineEvent::PromptPrefix(value) => {
+                Some(value.clone())
+            }
             _ => None,
         })
         .collect()

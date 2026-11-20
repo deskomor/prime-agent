@@ -74,6 +74,10 @@ impl AgentSession {
     ///
     /// Error when the prompt fails validation, the session is busy, or the
     /// agent rejects the turn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host resources or host hooks lock is poisoned.
     pub async fn prompt_with_images(
         &self,
         text: &str,
@@ -168,6 +172,8 @@ impl AgentSession {
                             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
                 })
                 .map_or("", |_| host_inventory.prompt.as_str());
+            let mut start_rows = Vec::new();
+            let mut start_owner = None;
             // The host's `before_agent_start` sees native and discovered skill inventory.
             if let Some(hook) = self.host_hook(|hooks| hooks.before_agent_start.clone()) {
                 let owner = self
@@ -194,6 +200,16 @@ impl AgentSession {
                     .and_then(serde_json::Value::as_str)
                     .filter(|text| !text.trim().is_empty())
                     .map(str::to_string);
+                // Rows this hook returns ride this admission only, after its
+                // user rows (TS `_appendBeforeAgentStartMessages` order).
+                // Only a v1 host adds rows; its epoch is rechecked at delivery.
+                if let Some((epoch, expected)) = owner.as_ref() {
+                    start_rows = answer
+                        .as_ref()
+                        .map(super::host_hooks::admission_messages)
+                        .unwrap_or_default();
+                    start_owner = Some((std::sync::Arc::clone(epoch), *expected));
+                }
                 let replacement = owner
                     .is_some()
                     .then_some(answer.as_ref())
@@ -243,6 +259,16 @@ impl AgentSession {
                     row.text.clone()
                 };
                 prompt_messages.push(user_prompt_message(&row_text, &row.images));
+            }
+            // A host that detached during the hook or digest await adds nothing.
+            if start_owner.is_some_and(|(epoch, expected)| {
+                epoch.load(std::sync::atomic::Ordering::SeqCst) == expected
+            }) {
+                prompt_messages.extend(
+                    start_rows.into_iter().filter_map(|row| {
+                        session_message_to_loop(&SessionAgentMessage::Custom(row))
+                    }),
+                );
             }
             if options.return_after_accepted {
                 // `returnAfterAccepted`: this prompt never started, so its

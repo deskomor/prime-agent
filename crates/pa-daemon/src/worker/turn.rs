@@ -4,9 +4,9 @@ use super::{
     checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta,
     emit_refinement_event_for_session, emit_refinement_row, gather_delivery_batch, json, oneshot,
     session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify,
-    OutboundFrame, PromptRequest, QueueCheckpoint, QueuedItem, Result, SessionActionSnapshot,
-    SessionCore, SessionEngine, TurnSettle, Value, WorkerRecoveryJournal,
-    ABORTED_TURN_SETTLE_ERROR,
+    OutboundFrame, PromptRequest, QueueCheckpoint, QueuePriority, QueuedItem, Result,
+    SessionActionSnapshot, SessionCore, SessionEngine, TurnPolicy, TurnSettle, Value,
+    WorkerRecoveryJournal, ABORTED_TURN_SETTLE_ERROR,
 };
 
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,27 @@ pub(super) struct TurnRunner {
     /// runner reads it at every boundary so a create-time rebind is always
     /// current.
     pub(super) herdr: std::sync::Arc<std::sync::Mutex<crate::herdr::HerdrReporter>>,
+}
+
+/// One reserved background auto-refinement round (`SessionCore::auto_refine_rounds`):
+/// the drop releases it and wakes the idle waiters, after the round's rows were
+/// emitted, on a panic, or when the settle is cancelled before the spawn.
+struct AutoRefineReservation {
+    core: Arc<Mutex<SessionCore>>,
+    idle_notify: Arc<Notify>,
+}
+
+impl Drop for AutoRefineReservation {
+    fn drop(&mut self) {
+        {
+            let mut core = self
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core.auto_refine_rounds = core.auto_refine_rounds.saturating_sub(1);
+        }
+        self.idle_notify.notify_waiters();
+    }
 }
 
 /// The idle-passivation context on the turn runner: the worker token
@@ -92,7 +113,12 @@ impl TurnRunner {
                 // the queue projection BEFORE its turn starts (a stale row would
                 // reject a browse edit).
                 let visible_index = items.iter().position(|item| item.queue_visible);
-                let anchor = visible_index.map(|index| &items[index]);
+                // Direct human input needs a preview before core startup, but never joins the visible queue.
+                let anchor = visible_index.map(|index| &items[index]).or_else(|| {
+                    items.first().filter(|item| {
+                        item.policy == TurnPolicy::Direct && item.priority == QueuePriority::Human
+                    })
+                });
                 {
                     let mut core = self.core.lock().unwrap();
                     if let Some(anchor) = anchor {
@@ -427,9 +453,14 @@ impl TurnRunner {
         let abort_gate_armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let abort_gate_armed_seen = Arc::clone(&abort_gate_armed);
         let batch_len = items.len();
+        let accepted_custom = request.custom_message.clone();
+        let session_command =
+            crate::session_commands::parse_prompt_session_command(&request.message).is_some();
         // The accepted prefix must survive an engine panic after persistence.
         let accepted_prefix = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accepted_prefix_seen = Arc::clone(&accepted_prefix);
+        let persistence_error = Arc::new(std::sync::Mutex::new(None::<String>));
+        let persistence_error_seen = Arc::clone(&persistence_error);
         let turn = tokio::task::spawn_blocking(move || {
             // The engine's own terminal `turn_end` frame keeps the
             // trailing `Done` fallback silent.
@@ -447,6 +478,29 @@ impl TurnRunner {
             // (operator ruling 2026-09-23).
             let mut last_retry_error: Option<String> = None;
             let mut emit = |mut event: EngineEvent| -> bool {
+                let persistence_failure =
+                    if matches!(event, EngineEvent::Done(_) | EngineEvent::DoneAborted) {
+                        persistence_error_seen.lock().unwrap().take()
+                    } else {
+                        None
+                    };
+                if let Some(error) = persistence_failure {
+                    event = EngineEvent::Done(Err(error));
+                }
+                let engine_prefix = matches!(event, EngineEvent::PromptPrefix(_));
+                if let EngineEvent::PromptPrefix(message) = event {
+                    event = EngineEvent::CustomMessage(message);
+                }
+                let accepts_input = !engine_prefix
+                    && !emitting_prefix_rows.get()
+                    && accepted_rows < batch_len
+                    && match &event {
+                        EngineEvent::UserMessage(_) => accepted_custom.is_none(),
+                        EngineEvent::CustomMessage(message) => {
+                            accepted_custom.as_ref() == Some(message) || session_command
+                        }
+                        _ => false,
+                    };
                 // A cancelled turn stops consuming its own events, except the frames
                 // TS still broadcasts for an interrupted turn: aborted row/tool settle
                 // frames and the trailing `Done` (a dropped Done hung `prompt_and_wait`
@@ -615,8 +669,19 @@ impl TurnRunner {
                     EngineEvent::UserMessage(message)
                     | EngineEvent::AssistantMessage(message)
                     | EngineEvent::ToolResultMessage(message) => {
-                        if let Some(store) = core.store.as_mut() {
-                            let _ = store.persist_entry("message", json!({ "message": message }));
+                        let failure = core
+                            .store
+                            .as_mut()
+                            .and_then(|store| {
+                                store
+                                    .persist_entry("message", json!({ "message": message }))
+                                    .err()
+                            })
+                            .filter(|_| accepts_input);
+                        if let Some(error) = failure {
+                            *persistence_error_seen.lock().unwrap() =
+                                Some(format!("prompt persistence failed: {error:#}"));
+                            return false;
                         }
                     }
                     // The in-flight tool-call set, updated under the same core lock
@@ -633,7 +698,7 @@ impl TurnRunner {
                     }
                     EngineEvent::CustomMessage(message) => {
                         if let Some(store) = core.store.as_mut() {
-                            let _ = store.persist_entry(
+                            let persisted = store.persist_entry(
                                 "custom_message",
                                 json!({
                                     "customType": message.get("customType").cloned().unwrap_or(Value::Null),
@@ -642,6 +707,16 @@ impl TurnRunner {
                                     "details": message.get("details").cloned().unwrap_or(Value::Null),
                                 }),
                             );
+                            if let Some(error) = persisted.err().filter(|_| {
+                                engine_prefix
+                                    || emitting_prefix_rows.get()
+                                    || accepts_input
+                                    || (session_command && message["customType"] == "goal_context")
+                            }) {
+                                *persistence_error_seen.lock().unwrap() =
+                                    Some(format!("prompt persistence failed: {error:#}"));
+                                return false;
+                            }
                         }
                     }
                     EngineEvent::Compaction { entry, .. } => {
@@ -674,13 +749,7 @@ impl TurnRunner {
                 }
                 // The `committing`/`running` transitions ride the events that mark the moments.
                 let mut action_frame: Option<SessionActionSnapshot> = None;
-                if !emitting_prefix_rows.get()
-                    && accepted_rows < batch_len
-                    && matches!(
-                        event,
-                        EngineEvent::UserMessage(_) | EngineEvent::CustomMessage(_)
-                    )
-                {
+                if accepts_input {
                     accepted_rows += 1;
                     accepted_prefix_seen.store(accepted_rows, std::sync::atomic::Ordering::SeqCst);
                     if accepted_rows == 1 {
@@ -834,6 +903,7 @@ impl TurnRunner {
                         "isError": is_error,
                     })],
                     EngineEvent::ToolResultMessage(message)
+                    | EngineEvent::PromptPrefix(message)
                     | EngineEvent::CustomMessage(message) => vec![
                         json!({ "type": "message_start", "message": message }),
                         json!({ "type": "message_end", "message": message }),
@@ -1038,14 +1108,22 @@ impl TurnRunner {
                 std::mem::take(&mut core.pending_next_turn)
             };
             emitting_prefix_rows.set(!parked.is_empty());
-            for row in parked {
-                if !emit(EngineEvent::CustomMessage(row)) {
-                    break;
+            let mut parked = parked.into_iter();
+            while let Some(row) = parked.next() {
+                if !emit(EngineEvent::CustomMessage(row.clone())) {
+                    let mut core = core.lock().unwrap();
+                    let mut remaining = vec![row];
+                    remaining.extend(parked);
+                    remaining.append(&mut core.pending_next_turn);
+                    core.pending_next_turn = remaining;
+                    drop(core);
+                    emit(EngineEvent::DoneAborted);
+                    return;
                 }
             }
             emitting_prefix_rows.set(false);
-            // Sample the worker-owned leaf in memory before accepted rows
-            // persist. The engine stays lazy and the accepted event stays first.
+            // Sample the worker-owned leaf before core admission mirrors
+            // its prefix and accepted rows back into this store.
             let (file_backed, prompt_context_leaf) = {
                 let core = core.lock().unwrap();
                 core.store.as_ref().map_or((false, None), |store| {
@@ -1062,6 +1140,10 @@ impl TurnRunner {
                 engine.set_prompt_context_boundary(prompt_context_leaf);
             }
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
+            let persistence_failed = persistence_error_seen.lock().unwrap().is_some();
+            if persistence_failed {
+                emit(EngineEvent::DoneAborted);
+            }
         });
         let _ = turn.await;
         let accepted_rows = accepted_prefix.load(std::sync::atomic::Ordering::SeqCst);
@@ -1096,9 +1178,19 @@ impl TurnRunner {
                 settle_engine.clear_progress_note();
             }
             core.busy = false;
+            // Reserved with the idle transition, so no idle waiter can read this
+            // settle as finished before its background auto-refinement round
+            // (spawned below) is counted.
+            core.auto_refine_rounds += 1;
             core.active_action = None;
             core.running_admission_ids.clear();
             more_queued
+        };
+        // Owns that reservation: dropped when the round's task ends, or here if
+        // this settle is cancelled before the spawn.
+        let auto_refine_reservation = AutoRefineReservation {
+            core: Arc::clone(&self.core),
+            idle_notify: Arc::clone(&self.idle_notify),
         };
         self.push_roster_delta();
         // The fallback `agent_end` for runs that ended without a model
@@ -1190,6 +1282,7 @@ impl TurnRunner {
             let events = self.events.clone();
             let review_session_id = review_session_id.clone();
             tokio::spawn(async move {
+                let _reservation = auto_refine_reservation;
                 // The round takes the engine's session mutex on the blocking
                 // pool, never on this async task: a `blocking_lock` from the
                 // runtime thread deadlocks.

@@ -171,7 +171,11 @@ fn agent_engine_streams_updates_and_final_message() {
             true
         },
     );
-    assert!(matches!(&events[0], EngineEvent::UserMessage(_)));
+    assert!(matches!(
+        &events[..2],
+        [EngineEvent::PromptPrefix(prefix), EngineEvent::UserMessage(_)]
+            if prefix["customType"] == "harness_digest"
+    ));
     assert!(events
         .iter()
         .any(|event| matches!(event, EngineEvent::AssistantUpdate { .. })));
@@ -188,9 +192,8 @@ fn agent_engine_streams_updates_and_final_message() {
     assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
 }
 
-/// The worker persists the accepted row before the lazy core builds. Its
-/// pre-admission leaf must keep that row out of restored model history, while
-/// repeated text and image blocks remain distinct turns after a runtime rebuild.
+/// The lazy core restores the pre-delivery leaf before the worker mirrors the accepted row.
+/// Repeated text and image blocks remain distinct turns after a runtime rebuild.
 #[test]
 fn lazy_build_restores_only_the_pre_admission_prompt_context() {
     let _faux = FAUX_TEST_LOCK
@@ -249,12 +252,10 @@ fn lazy_build_restores_only_the_pre_admission_prompt_context() {
             &mut |event| {
                 match event {
                     EngineEvent::UserMessage(message) => {
-                        if prompt_index != 1 {
-                            assert!(
-                                engine.session.blocking_lock().is_none(),
-                                "accepted prompt must render before the lazy session builds"
-                            );
-                        }
+                        assert!(
+                            engine.session.blocking_lock().is_some(),
+                            "core history is restored before its delivered row is mirrored"
+                        );
                         accepted = true;
                         store
                             .persist_entry("message", json!({ "message": message }))

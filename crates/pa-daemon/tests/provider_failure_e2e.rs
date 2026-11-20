@@ -493,9 +493,40 @@ fn provider_failure_is_retried_then_surfaced_to_attached_clients() {
     // The accepted user message is a message_start + message_end pair (TS wire),
     // and an unchanged queue projection stays silent (TS `_emitQueueUpdate` dedup).
     let types = event_types(&client.events);
+    // The queue stays empty, so every update is the active turn's phase moving
+    // (preparing, committing, running, then idle); an unchanged projection stays
+    // silent (TS `_emitQueueUpdate` dedup), so no two updates in a row are equal.
+    let actions: Vec<&Value> = client
+        .events
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("session_action_update"))
+        .map(|event| &event["actions"])
+        .collect();
+    // The whole snapshot, frame by frame: the direct prompt is never queued, even across retries.
+    let turn = |phase: &str| json!({ "kind": "turn", "phase": phase, "label": "hi" });
+    assert_eq!(
+        actions
+            .iter()
+            .map(|actions| (*actions).clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!({ "queuedCount": 0, "steering": [], "followUps": [], "active": turn("preparing") }),
+            json!({ "queuedCount": 0, "steering": [], "followUps": [], "active": turn("committing") }),
+            json!({ "queuedCount": 0, "steering": [], "followUps": [], "active": turn("running") }),
+            json!({ "queuedCount": 0, "steering": [], "followUps": [] }),
+        ],
+        "events: {types:?}"
+    );
     assert!(
-        !types.iter().any(|t| t == "session_action_update"),
-        "an empty-to-empty queue is not an update, events: {types:?}"
+        actions.windows(2).all(|pair| pair[0] != pair[1]),
+        "an unchanged projection is not an update: {actions:?}"
+    );
+    // The settled turn leaves no active action at all, not a malformed one.
+    assert!(
+        actions
+            .last()
+            .is_some_and(|last| last.get("active").is_none()),
+        "the last update is idle: {actions:?}"
     );
     let user_pairs = client
         .events

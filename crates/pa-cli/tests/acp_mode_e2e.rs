@@ -241,6 +241,11 @@ fn daemon_attached_command(
         .arg("--daemon-socket")
         .arg(socket)
         .env("HOME", home)
+        .env("PRIME_AGENT_CODING_AGENT_DIR", home.join(".prime/agent"))
+        .env(
+            "PRIME_AGENT_SESSION_DIR",
+            home.join(".prime/agent/sessions"),
+        )
         .env("PRIME_AGENT_FAUX_SCRIPT", home.join("worker-script.json"))
         .env(
             pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
@@ -3107,6 +3112,360 @@ fn acp_host_call_hook_refuses_a_kernel_host_call() {
 /// session extension requests write a durable entry and pause
 /// auto-refinement.
 #[test]
+fn acp_python_failure_keeps_canonical_and_persisted_error_details() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let script = spawn_parent_script("raise ValueError('structured-error-fixture')");
+    let mut client = AcpChild::spawn_with_child_script(
+        &["--mode", "acp"],
+        &script,
+        &json!({"engine": "faux", "responses": [{"text": "unused child"}]}),
+        &kernel_python,
+    );
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({
+            "hostContract": {"version": 1}, "hooks": ["turn_end"],
+        })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the failing Python cell"}],
+        }),
+    );
+    let mut canonical = None;
+    let mut failed_calls = Vec::new();
+    loop {
+        let frame = client.wait_frame(TIMEOUT, |_| true);
+        if frame["method"] == "_ai.primeintellect.prime-agent/hook" {
+            assert_eq!(frame["params"]["hook"], "turn_end");
+            if let Some(exchange) = frame["params"]["payload"]["exchanges"]
+                .as_array()
+                .and_then(|items| items.first())
+            {
+                assert!(canonical.is_none(), "one executed Python call");
+                canonical = Some(exchange["result"].clone());
+            }
+            client.send(&json!({"jsonrpc": "2.0", "id": frame["id"], "result": {}}));
+        } else if frame["method"] == "session/update" {
+            let update = &frame["params"]["update"];
+            if update["sessionUpdate"] == "tool_call_update" && update["status"] == "failed" {
+                failed_calls.push(update["toolCallId"].clone());
+            }
+        } else if frame["id"] == prompt {
+            assert_end_turn(&frame);
+            break;
+        }
+    }
+    let canonical = canonical.expect("native finalized exchange");
+    assert_eq!(canonical["isError"], true);
+    assert_eq!(canonical["details"]["status"], "error");
+    assert_eq!(canonical["details"]["error"]["ename"], "ValueError");
+    assert!(canonical["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("structured-error-fixture"));
+    assert_eq!(failed_calls, vec![canonical["toolCallId"].clone()]);
+    let request = client.request(
+        "_ai.primeintellect.prime-agent/session_snapshot",
+        &json!({"sessionId": session_id}),
+    );
+    let (snapshot, _) = client.wait_response(request, TIMEOUT);
+    let rows: Vec<Value> = std::fs::read_to_string(
+        snapshot["result"]["sessionFile"]
+            .as_str()
+            .expect("session file"),
+    )
+    .expect("durable native transcript")
+    .lines()
+    .map(|line| serde_json::from_str(line).expect("session row"))
+    .collect();
+    let persisted = rows
+        .iter()
+        .filter_map(|row| row.get("message"))
+        .find(|message| {
+            message["role"] == "toolResult" && message["toolCallId"] == canonical["toolCallId"]
+        })
+        .expect("persisted Python result");
+    assert_eq!(
+        json!({"content": persisted["content"], "details": persisted["details"], "isError": persisted["isError"]}),
+        json!({"content": canonical["content"], "details": canonical["details"], "isError": canonical["isError"]})
+    );
+}
+
+/// A real multi-call Python turn reaches the host `turn_end` hook as
+/// sequential exchanges in assistant source order, matching the durable rows.
+#[test]
+fn acp_turn_end_exchanges_keep_native_source_order() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let script = json!({
+        "engine": "faux",
+        "responses": [
+            { "content": [
+                { "type": "toolCall", "name": "python_repl", "arguments": { "code": "print('first-cell')" } },
+                { "type": "toolCall", "name": "python_repl", "arguments": { "code": "print('second-cell')" } },
+            ] },
+            { "text": "both cells ran" },
+        ],
+    });
+    let mut client = AcpChild::spawn_with_child_script(
+        &["--mode", "acp"],
+        &script,
+        &json!({"engine": "faux", "responses": [{"text": "unused child"}]}),
+        &kernel_python,
+    );
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({
+            "hostContract": {"version": 1}, "hooks": ["turn_end"],
+        })),
+    );
+    let _ = client.wait_response(init, TIMEOUT);
+    let session_id = new_session(&mut client);
+    let prompt = client.request(
+        "session/prompt",
+        &json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run both Python cells"}],
+        }),
+    );
+    let mut batch = None;
+    loop {
+        let frame = client.wait_frame(TIMEOUT, |_| true);
+        if frame["method"] == "_ai.primeintellect.prime-agent/hook" {
+            let payload = &frame["params"]["payload"];
+            if payload["exchanges"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                assert!(batch.is_none(), "one tool batch");
+                batch = Some(payload.clone());
+            }
+            client.send(&json!({"jsonrpc": "2.0", "id": frame["id"], "result": {}}));
+        } else if frame["id"] == prompt {
+            assert_end_turn(&frame);
+            break;
+        }
+    }
+    let batch = batch.expect("turn_end for the tool batch");
+    // python_repl is a single-threaded resource: its batches run sequentially.
+    assert_eq!(batch["toolExecution"], "sequential");
+    let exchanges = batch["exchanges"].as_array().unwrap();
+    assert_eq!(exchanges.len(), 2);
+    for (index, (exchange, text)) in exchanges
+        .iter()
+        .zip(["first-cell", "second-cell"])
+        .enumerate()
+    {
+        assert_eq!(exchange["sourceOrder"], index);
+        assert_eq!(exchange["toolName"], "python_repl");
+        assert!(exchange["originalInput"]["code"]
+            .as_str()
+            .unwrap()
+            .contains(text));
+        assert_eq!(exchange["result"]["toolCallId"], exchange["toolCallId"]);
+        assert!(exchange["result"]["content"].to_string().contains(text));
+    }
+    let ids: Vec<&Value> = exchanges
+        .iter()
+        .map(|exchange| &exchange["toolCallId"])
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    let request = client.request(
+        "_ai.primeintellect.prime-agent/session_snapshot",
+        &json!({"sessionId": session_id}),
+    );
+    let (snapshot, _) = client.wait_response(request, TIMEOUT);
+    let rows: Vec<Value> = std::fs::read_to_string(
+        snapshot["result"]["sessionFile"]
+            .as_str()
+            .expect("session file"),
+    )
+    .expect("durable native transcript")
+    .lines()
+    .map(|line| serde_json::from_str(line).expect("session row"))
+    .collect();
+    let messages: Vec<&Value> = rows.iter().filter_map(|row| row.get("message")).collect();
+    let called: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "toolCall")
+        .map(|part| &part["id"])
+        .collect();
+    let persisted: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["role"] == "toolResult")
+        .map(|message| &message["toolCallId"])
+        .collect();
+    assert_eq!(called, ids, "exchanges follow the assistant's call order");
+    assert_eq!(persisted, ids, "durable results follow the same order");
+}
+
+#[test]
+fn acp_terminal_advice_continues_before_the_original_prompt_response() {
+    // Only explicit continuation steers now; the default still saves advice for a later prompt.
+    for explicit_continue in [true, false] {
+        let expected_calls = if explicit_continue { 2 } else { 1 };
+        let script = json!({"engine": "faux", "responses": ["TERMINAL-DRAFT", "TERMINAL-REVISED"]});
+        let mut client = AcpChild::spawn(&["--mode", "acp"], &script);
+        let init = client.request(
+            "initialize",
+            &hook_initialize_params(&json!({
+                "hostContract": {"version": 1}, "hooks": ["context", "turn_end"],
+            })),
+        );
+        let _ = client.wait_response(init, TIMEOUT);
+        let session_id = new_session(&mut client);
+        let prompt = client.request("session/prompt", &json!({
+            "sessionId": session_id, "prompt": [{"type": "text", "text": "revise this terminal answer"}],
+        }));
+        let advice_text = "TERMINAL-REVIEW-ADVICE";
+        let mut contexts = Vec::new();
+        let mut terminal_hooks = 0;
+        let mut assistant_text = String::new();
+        let mut boundaries = 0;
+        let mut quiescences = 0;
+        loop {
+            // Read every frame so an early prompt response cannot be discarded by a hook-only wait.
+            let frame = client.wait_frame(TIMEOUT, |_| true);
+            if frame["method"] == "_ai.primeintellect.prime-agent/hook" {
+                let payload = &frame["params"]["payload"];
+                let result = match frame["params"]["hook"].as_str() {
+                    Some("context") => {
+                        if payload["purpose"] == "provider" {
+                            contexts.push(payload["messages"].clone());
+                        }
+                        json!({})
+                    }
+                    Some("turn_end") => {
+                        terminal_hooks += 1;
+                        assert!(
+                            payload["toolResults"].as_array().unwrap().is_empty(),
+                            "terminal reply has no tool results"
+                        );
+                        if terminal_hooks == 1 {
+                            assert!(payload["message"].to_string().contains("TERMINAL-DRAFT"));
+                            let mut response = json!({"messages": [{
+                                "customType": "fixture.advice", "content": advice_text,
+                                "display": false, "details": {"kind": "terminal-fixture"},
+                            }]});
+                            if explicit_continue {
+                                response["continue"] = json!(true);
+                            }
+                            response
+                        } else {
+                            assert_eq!(terminal_hooks, 2);
+                            assert!(payload["message"].to_string().contains("TERMINAL-REVISED"));
+                            json!({})
+                        }
+                    }
+                    other => panic!("unexpected hook {other:?}: {frame}"),
+                };
+                client.send(&json!({"jsonrpc": "2.0", "id": frame["id"], "result": result}));
+            } else if frame["method"] == "session/update" {
+                let update = &frame["params"]["update"];
+                let meta = update_meta(&frame);
+                if update["sessionUpdate"] == "agent_message_chunk" {
+                    assert_eq!(
+                        meta["promptTurnId"], 1,
+                        "both answers belong to the original prompt"
+                    );
+                    assistant_text.push_str(update["content"]["text"].as_str().unwrap_or_default());
+                }
+                if meta["phase"] == "responseBoundary" {
+                    assert_eq!(meta["promptTurnId"], 1);
+                    boundaries += 1;
+                }
+                if meta["phase"] == "terminalQuiescence" {
+                    assert_eq!(meta["promptTurnId"], 1);
+                    quiescences += 1;
+                }
+            } else if frame["id"] == prompt {
+                assert_eq!(
+                    contexts.len(),
+                    expected_calls,
+                    "no completion before the advice's provider request"
+                );
+                assert_eq!(
+                    terminal_hooks, expected_calls,
+                    "no completion before the revised terminal answer"
+                );
+                assert_end_turn(&frame);
+                break;
+            }
+        }
+        assert!(!contexts[0].to_string().contains(advice_text));
+        if explicit_continue {
+            assert!(
+                contexts[1].to_string().contains(advice_text),
+                "advice reaches the second provider context"
+            );
+        }
+        assert_eq!(
+            assistant_text,
+            if explicit_continue {
+                "TERMINAL-DRAFTTERMINAL-REVISED"
+            } else {
+                "TERMINAL-DRAFT"
+            }
+        );
+        assert_eq!((boundaries, quiescences), (1, 1), "one prompt completion");
+        let snapshot = client.request(
+            "_ai.primeintellect.prime-agent/session_snapshot",
+            &json!({"sessionId": session_id}),
+        );
+        let (snapshot, late) = client.wait_response(snapshot, TIMEOUT);
+        assert!(
+            late.iter().all(|frame| frame["id"] != prompt),
+            "no duplicate original prompt response"
+        );
+        let rows: Vec<Value> =
+            std::fs::read_to_string(snapshot["result"]["sessionFile"].as_str().unwrap())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["message"]["role"] == "user")
+                .count(),
+            1,
+            "no second session/prompt"
+        );
+        let advice: Vec<&Value> = rows
+            .iter()
+            .filter_map(|row| {
+                if row["customType"] == "fixture.advice" {
+                    Some(row)
+                } else if row["message"]["customType"] == "fixture.advice" {
+                    Some(&row["message"])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if explicit_continue {
+            assert_eq!(advice.len(), 1, "one durable advice row");
+            assert_eq!(advice[0]["details"], json!({"kind": "terminal-fixture"}));
+            assert_eq!(advice[0]["display"], false);
+        } else {
+            assert!(
+                advice.is_empty(),
+                "default advice awaits the next admission"
+            );
+        }
+    }
+}
+
+#[test]
 fn acp_optional_hooks_and_session_extensions() {
     let script = json!({ "engine": "faux", "responses": [{ "text": "done" }] });
     let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
@@ -3168,6 +3527,80 @@ fn acp_optional_hooks_and_session_extensions() {
 
 /// Host-authorized Studio MCP servers survive the supervisor's child create
 /// payload and report the executing child's native identity over real stdio.
+#[test]
+fn acp_unopted_or_unmarked_session_mcp_stays_root_local() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let server = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../pa-daemon/tests/fixtures/mcp_echo_server.py");
+    assert!(server.is_file());
+    for negotiated_v1 in [false, true] {
+        // The existing positive test covers v1+inherit; these isolate each missing opt-in.
+        let inherit = !negotiated_v1;
+        let scratch = tempfile::TempDir::new().unwrap();
+        let root_receipt = scratch.path().join("root-mcp.json");
+        let child_receipt = scratch.path().join("child-mcp.json");
+        let root_code = format!(
+            "import json\ntools = await mcp.list_tools('session_only')\nassert [tool['name'] for tool in tools] == ['echo'], tools\nanswer = await mcp.call_tool('session_only', 'echo', {{'message': 'GENERIC-ROOT-MCP'}})\nassert 'GENERIC-ROOT-MCP' in str(answer), answer\nopen({:?}, 'w').write(json.dumps({{'answer': str(answer)}}))\n{}",
+            root_receipt.to_string_lossy(), spawn_cell(),
+        );
+        let child_code = format!(
+            "import json\nfrom rlm import host_request\nconfig = await host_request('mcp.config', {{'server': 'session_only'}})\nassert config == {{}}, config\ntry:\n    tools = await mcp.list_tools('session_only')\nexcept Exception as error:\n    tools = []\nassert tools == [], tools\nopen({:?}, 'w').write(json.dumps({{'config': config, 'tools': tools}}))",
+            child_receipt.to_string_lossy(),
+        );
+        let parent = spawn_parent_script(&root_code);
+        let child = json!({"engine": "faux", "responses": [
+            {"content": [{"type": "toolCall", "name": "python_repl", "arguments": {"code": child_code}}]},
+            {"text": "no inherited session server"},
+        ]});
+        let mut client =
+            AcpChild::spawn_with_child_script(&["--mode", "acp"], &parent, &child, &kernel_python);
+        let capabilities = if negotiated_v1 {
+            hook_initialize_params(&json!({"hostContract": {"version": 1}}))
+        } else {
+            initialize_params()
+        };
+        let init = client.request("initialize", &capabilities);
+        let _ = client.wait_response(init, TIMEOUT);
+        let mut server_config = json!({
+            "name": "session_only", "command": kernel_python.to_string_lossy(),
+            "args": [server.to_string_lossy()], "env": [],
+        });
+        if inherit {
+            server_config["_meta"] =
+                json!({"ai.primeintellect.prime-agent": {"inheritStudioMcp": true}});
+        }
+        let new = client.request("session/new", &json!({"mcpServers": [server_config]}));
+        let (new, _) = client.wait_response(new, TIMEOUT);
+        let session_id = new["result"]["sessionId"]
+            .as_str()
+            .expect("generic session server admitted");
+        let _ = assert_prompt_ends_turn(
+            &mut client,
+            session_id,
+            "use the root session server and spawn the child",
+        );
+        let root: Value = serde_json::from_str(
+            &std::fs::read_to_string(&root_receipt).expect("real root MCP call receipt"),
+        )
+        .unwrap();
+        assert!(root["answer"]
+            .as_str()
+            .unwrap()
+            .contains("GENERIC-ROOT-MCP"));
+        let child: Value = serde_json::from_str(
+            &std::fs::read_to_string(&child_receipt).expect("real child discovery receipt"),
+        )
+        .unwrap();
+        assert_eq!(
+            child,
+            json!({"config": {}, "tools": []}),
+            "v1={negotiated_v1},inherit={inherit}: no unauthorized inheritance"
+        );
+    }
+}
+
 #[test]
 fn acp_studio_mcp_reaches_spawned_child_kernel_with_its_native_binding() {
     let Some(kernel_python) = kernel_python() else {
@@ -3319,7 +3752,7 @@ fn acp_hooks_cover_a_subagent() {
             frame["method"] == "_ai.primeintellect.prime-agent/hook"
         });
         assert_eq!(hook["params"]["sessionId"], session_id.as_str());
-        let from_kid = hook["params"].get("origin").is_some();
+        let from_kid = hook["params"]["origin"]["rlmChildId"].is_string();
         let result = match (hook["params"]["hook"].as_str(), from_kid) {
             (Some("host_call"), false) => {
                 parent_host_calls += 1;
@@ -3349,4 +3782,169 @@ fn acp_hooks_cover_a_subagent() {
         result.contains("Subagents of a lead may not spawn."),
         "the refusal reached the subagent: {result}"
     );
+}
+
+/// Run one prompt to its response, answering `context` and `session_tree`
+/// hooks; returns the provider contexts seen during it.
+fn prompt_recording_contexts(client: &mut AcpChild, session_id: &str, text: &str) -> Vec<Value> {
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": text }] }),
+    );
+    let mut contexts = Vec::new();
+    loop {
+        let frame = client.wait_frame(TIMEOUT, |_| true);
+        if frame["method"] == "_ai.primeintellect.prime-agent/hook" {
+            let payload = &frame["params"]["payload"];
+            if frame["params"]["hook"] == "context" && payload["purpose"] == "provider" {
+                contexts.push(payload.clone());
+            }
+            client.send(&json!({"jsonrpc": "2.0", "id": frame["id"], "result": {}}));
+        } else if frame["id"] == prompt {
+            assert_end_turn(&frame);
+            return contexts;
+        }
+    }
+}
+
+/// An opted-in client moves the session leaf with `navigate_tree`; the host's
+/// `session_tree` hook runs before the reply, and the next provider context
+/// holds the chosen branch only.
+#[test]
+fn acp_navigate_tree_moves_the_leaf_and_refreshes_the_host() {
+    // Without the opt-in the initialize answer is unchanged.
+    let script = json!({"engine": "faux", "responses": ["unused"]});
+    let mut plain = AcpChild::spawn(&["--mode", "acp"], &script);
+    let init = plain.request("initialize", &initialize_params());
+    let (answer, _) = plain.wait_response(init, TIMEOUT);
+    assert!(answer["result"]["_meta"]["ai.primeintellect.prime-agent"]
+        .get("treeNavigation")
+        .is_none());
+
+    let script = json!({"engine": "faux", "responses": ["ONE-REPLY", "TWO-REPLY", "THREE-REPLY"]});
+    let mut client = AcpChild::spawn(&["--mode", "acp"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({
+            "hostContract": {"version": 1},
+            "hooks": ["context", "session_tree"],
+            "treeNavigation": true,
+        })),
+    );
+    let (answer, _) = client.wait_response(init, TIMEOUT);
+    assert_eq!(
+        answer["result"]["_meta"]["ai.primeintellect.prime-agent"]["treeNavigation"],
+        true
+    );
+    let session_id = new_session(&mut client);
+    prompt_recording_contexts(&mut client, &session_id, "BRANCH-ONE");
+    prompt_recording_contexts(&mut client, &session_id, "BRANCH-TWO");
+
+    let request = client.request(
+        "_ai.primeintellect.prime-agent/session_snapshot",
+        &json!({"sessionId": session_id}),
+    );
+    let (snapshot, _) = client.wait_response(request, TIMEOUT);
+    let session_file = snapshot["result"]["sessionFile"]
+        .as_str()
+        .expect("session file")
+        .to_string();
+    let rows = || -> Vec<Value> {
+        std::fs::read_to_string(&session_file)
+            .expect("durable native transcript")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("session row"))
+            .collect()
+    };
+    let target = rows()
+        .into_iter()
+        .find(|row| {
+            row["message"]["role"] == "assistant"
+                && row["message"].to_string().contains("ONE-REPLY")
+        })
+        .expect("first answer row")["id"]
+        .clone();
+
+    // Malformed input and descendant targets are refused before anything moves.
+    for params in [
+        json!({"sessionId": session_id, "targetId": target, "summarize": "yes"}),
+        json!({"sessionId": session_id, "targetId": target, "summarize": null}),
+        json!({"sessionId": session_id, "targetId": target, "targetActiveSessionId": "other"}),
+        json!({"sessionId": session_id, "targetId": ""}),
+    ] {
+        let bad = client.request("_ai.primeintellect.prime-agent/navigate_tree", &params);
+        let (refused, _) = client.wait_response(bad, TIMEOUT);
+        assert!(refused.get("error").is_some(), "{refused}");
+    }
+
+    let navigate = client.request(
+        "_ai.primeintellect.prime-agent/navigate_tree",
+        &json!({"sessionId": session_id, "targetId": target}),
+    );
+    let mut tree_hooks = Vec::new();
+    loop {
+        let frame = client.wait_frame(TIMEOUT, |_| true);
+        if frame["method"] == "_ai.primeintellect.prime-agent/hook" {
+            assert_eq!(frame["params"]["hook"], "session_tree", "{frame}");
+            tree_hooks.push(frame["params"]["payload"].clone());
+            client.send(&json!({"jsonrpc": "2.0", "id": frame["id"], "result": {}}));
+        } else if frame["id"] == navigate {
+            assert_eq!(frame["result"]["cancelled"], false, "{frame}");
+            break;
+        }
+    }
+    assert_eq!(tree_hooks.len(), 1, "session_tree ran before the reply");
+    assert_eq!(tree_hooks[0]["newLeafId"], target);
+    assert!(tree_hooks[0]["oldLeafId"].is_string());
+
+    let contexts = prompt_recording_contexts(&mut client, &session_id, "BRANCH-THREE");
+    let first = contexts.first().expect("provider context").to_string();
+    assert!(
+        first.contains("BRANCH-ONE") && first.contains("ONE-REPLY"),
+        "{first}"
+    );
+    assert!(
+        !first.contains("BRANCH-TWO") && !first.contains("TWO-REPLY"),
+        "{first}"
+    );
+    assert!(first.contains("BRANCH-THREE"));
+}
+
+/// An opted-in client drains the session's background auto-refinement after a
+/// prompt: with no round in flight the bounded wait answers `settled: true`.
+#[test]
+fn acp_wait_auto_refine_is_opt_in_and_settles_after_a_prompt() {
+    let script = json!({"engine": "faux", "responses": ["unused"]});
+    let mut plain = AcpChild::spawn(&["--mode", "acp"], &script);
+    let init = plain.request("initialize", &initialize_params());
+    let (answer, _) = plain.wait_response(init, TIMEOUT);
+    assert!(answer["result"]["_meta"]["ai.primeintellect.prime-agent"]
+        .get("autoRefineDrain")
+        .is_none());
+
+    let script = json!({"engine": "faux", "responses": ["DRAIN-REPLY"]});
+    let mut client = AcpChild::spawn(&["--mode", "acp"], &script);
+    let init = client.request(
+        "initialize",
+        &hook_initialize_params(&json!({ "autoRefineDrain": true })),
+    );
+    let (answer, _) = client.wait_response(init, TIMEOUT);
+    assert_eq!(
+        answer["result"]["_meta"]["ai.primeintellect.prime-agent"]["autoRefineDrain"],
+        true
+    );
+    let session_id = new_session(&mut client);
+    assert_prompt_ends_turn(&mut client, &session_id, "DRAIN-ONE");
+    let request = client.request(
+        "_ai.primeintellect.prime-agent/wait_auto_refine",
+        &json!({"sessionId": session_id, "timeoutMs": 5000}),
+    );
+    let (drained, _) = client.wait_response(request, TIMEOUT);
+    assert_eq!(drained["result"], json!({"settled": true}), "{drained}");
+    let request = client.request(
+        "_ai.primeintellect.prime-agent/wait_auto_refine",
+        &json!({"sessionId": session_id}),
+    );
+    let (refused, _) = client.wait_response(request, TIMEOUT);
+    assert!(refused.get("error").is_some(), "{refused}");
 }

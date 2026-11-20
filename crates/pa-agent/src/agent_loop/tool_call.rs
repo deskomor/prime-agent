@@ -27,10 +27,10 @@ pub(crate) async fn prepare_tool_call(
     signal: Option<&AbortSignal>,
 ) -> Preparation {
     let Some(tool) = find_tool(&current_context.tools, &tool_call.name) else {
-        return Preparation::Immediate {
-            result: AgentToolResult::error(format!("Tool {} not found", tool_call.name)),
-            is_error: true,
-        };
+        return Preparation::Immediate(AgentToolResult::error(format!(
+            "Tool {} not found",
+            tool_call.name
+        )));
     };
 
     let result = prepare_tool_call_inner(
@@ -44,10 +44,7 @@ pub(crate) async fn prepare_tool_call(
     .await;
     match result {
         Ok(preparation) => preparation,
-        Err(error) => Preparation::Immediate {
-            result: AgentToolResult::error(format!("{error:#}")),
-            is_error: true,
-        },
+        Err(error) => Preparation::Immediate(AgentToolResult::error(format!("{error:#}"))),
     }
 }
 
@@ -91,10 +88,7 @@ async fn prepare_tool_call_inner(
             let reason = before_result
                 .and_then(|r| r.reason)
                 .unwrap_or_else(|| "Tool execution was blocked".to_string());
-            return Ok(Preparation::Immediate {
-                result: AgentToolResult::error(reason),
-                is_error: true,
-            });
+            return Ok(Preparation::Immediate(AgentToolResult::error(reason)));
         }
     }
 
@@ -105,11 +99,6 @@ async fn prepare_tool_call_inner(
     }))
 }
 
-pub(crate) struct ExecutedToolCallOutcome {
-    result: AgentToolResult,
-    is_error: bool,
-}
-
 /// Race the tool against abort, stream `tool_execution_update` events
 /// through a background emitter task, and return an error tool result when
 /// the tool fails (or aborts, with the TS message "Tool execution aborted").
@@ -118,7 +107,7 @@ pub(crate) async fn execute_prepared_tool_call(
     progress: ToolProgressCadence,
     signal: Option<&AbortSignal>,
     emit: &AgentEventSink,
-) -> ExecutedToolCallOutcome {
+) -> AgentToolResult {
     let accepting_updates = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolResult>();
     let update_tx_for_callback = update_tx.clone();
@@ -188,15 +177,9 @@ pub(crate) async fn execute_prepared_tool_call(
             // updateEvents promise in TS; an aborted drain (the call itself
             // succeeded) settles cleanly.
             if let Err(error) = settle_success_drain(emit_updates, signal).await {
-                return ExecutedToolCallOutcome {
-                    result: error_tool_result(signal, &error, elapsed_ms),
-                    is_error: true,
-                };
+                return error_tool_result(signal, &error, elapsed_ms);
             }
-            ExecutedToolCallOutcome {
-                result,
-                is_error: false,
-            }
+            result
         }
         Err(error) => {
             // TS drains the pending update emissions on the error path,
@@ -211,10 +194,7 @@ pub(crate) async fn execute_prepared_tool_call(
                 signal,
             )
             .await;
-            ExecutedToolCallOutcome {
-                result: error_tool_result(signal, &error, elapsed_ms),
-                is_error: true,
-            }
+            error_tool_result(signal, &error, elapsed_ms)
         }
     }
 }
@@ -326,13 +306,10 @@ pub(crate) async fn finalize_executed_tool_call(
     current_context: &AgentContext,
     assistant_message: &AssistantMessage,
     prepared: &PreparedToolCall,
-    executed: ExecutedToolCallOutcome,
+    mut result: AgentToolResult,
     config: &AgentLoopConfig,
     signal: Option<&AbortSignal>,
 ) -> anyhow::Result<FinalizedToolCallOutcome> {
-    let mut result = executed.result;
-    let mut is_error = executed.is_error;
-
     if let Some(after_tool_call) = config.after_tool_call.as_ref() {
         let after_result = race_with_abort(
             after_tool_call(
@@ -341,7 +318,7 @@ pub(crate) async fn finalize_executed_tool_call(
                     tool_call: prepared.tool_call.clone(),
                     args: prepared.args.clone(),
                     result: result.clone(),
-                    is_error,
+                    is_error: result.is_error,
                     context: clone_context(current_context),
                 },
                 signal.cloned().unwrap_or_default(),
@@ -363,14 +340,13 @@ pub(crate) async fn finalize_executed_tool_call(
                     merged.terminate = Some(terminate);
                 }
                 if let Some(error) = overrides.is_error {
-                    is_error = error;
+                    merged.is_error = error;
                 }
                 result = merged;
             }
             Ok(None) => {}
             Err(error) => {
                 result = AgentToolResult::error(format!("{error:#}"));
-                is_error = true;
             }
         }
     }
@@ -378,7 +354,6 @@ pub(crate) async fn finalize_executed_tool_call(
     Ok(FinalizedToolCallOutcome {
         tool_call: prepared.tool_call.clone(),
         result,
-        is_error,
     })
 }
 
@@ -390,7 +365,7 @@ pub(crate) async fn emit_tool_execution_end(
         tool_call_id: finalized.tool_call.id.clone(),
         tool_name: finalized.tool_call.name.clone(),
         result: finalized.result.clone(),
-        is_error: finalized.is_error,
+        is_error: finalized.result.is_error,
     })
     .await
 }
@@ -407,7 +382,7 @@ pub(crate) fn create_tool_result_message(
         } else {
             Some(finalized.result.details.clone())
         },
-        is_error: finalized.is_error,
+        is_error: finalized.result.is_error,
         timestamp: crate::now_ms(),
     }
 }

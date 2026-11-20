@@ -1278,5 +1278,121 @@ class McpDiscoveryInventoryTest(unittest.TestCase):
         self.assertEqual(streams, ("read", "write"))
 
 
+_STUDIO_FIXTURE = r"""import asyncio, json, os, sys
+record = sys.argv[1]
+async def main():
+    while line := await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline):
+        request = json.loads(line)
+        if request.get("id") is None:
+            continue
+        if request.get("method") == "initialize":
+            with open(record, "a") as handle:
+                handle.write(json.dumps({"params": request["params"], "environ": dict(os.environ)}) + "\n")
+            result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "studio", "version": "1"}}
+        else:
+            result = {"tools": []}
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+asyncio.run(main())
+"""
+
+
+class StudioBindingTest(unittest.TestCase):
+    def setUp(self):
+        mcp._registry = mcp._Registry()
+
+    def test_studio_credential_rides_initialize_only_and_rebinds_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "studio.py"
+            fixture.write_text(_STUDIO_FIXTURE)
+            record = Path(tmp) / "initialize.jsonl"
+            descriptor = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": [str(fixture), str(record)],
+                "cwd": tmp,
+                "env": {"PRIME_STUDIO_NATIVE_SESSION": "{}"},
+                "credentialSource": "acp",
+            }
+            binding = {"credential": "c" * 64, "generation": 1}
+            requests = []
+
+            async def host_request(request_type, payload):
+                requests.append(request_type)
+                if request_type == "mcp.config":
+                    return {**descriptor, "studioBinding": True}
+                assert request_type == "mcp.studio_binding", request_type
+                return {"config": descriptor, **binding}
+
+            async def scenario():
+                with mock.patch.object(mcp, "host_request", host_request):
+                    first = await mcp._registry.get("studio_factory")
+                    again = await mcp._registry.get("studio_factory")
+                    binding.update(credential="d" * 64, generation=2)
+                    rebound = await mcp._registry.get("studio_factory")
+                    await mcp._registry.shutdown()
+                return first, again, rebound
+
+            first, again, rebound = run(scenario())
+            self.assertIs(first, again, "an unchanged binding reuses the sidecar")
+            self.assertIsNot(first, rebound, "a new generation reopens the sidecar")
+            self.assertNotIn("c" * 64, json.dumps(first.config), "the credential stays out of config")
+            self.assertEqual(first.config["_studioGeneration"], 1)
+            inits = [json.loads(line) for line in record.read_text().splitlines()]
+        self.assertEqual(len(inits), 2)
+        sent = [init["params"]["capabilities"]["extensions"][mcp._STUDIO_BINDING_EXTENSION] for init in inits]
+        self.assertEqual(sent, [{"credential": "c" * 64}, {"credential": "d" * 64}])
+        for init in inits:
+            self.assertNotIn("c" * 64, json.dumps(init["environ"]))
+            self.assertNotIn("d" * 64, json.dumps(init["environ"]))
+        self.assertEqual(requests.count("mcp.studio_binding"), 3)
+
+    def test_plain_acp_server_gets_no_bootstrap_or_extension(self):
+        async def host_request(request_type, payload):
+            self.assertEqual(request_type, "mcp.config")
+            return {"type": "stdio", "command": "run", "credentialSource": "acp"}
+
+        captured = {}
+
+        class FakeClientSession:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                raise RuntimeError("stop after construction")
+
+        async def fake_stdio(self):
+            return ("read", "write")
+
+        async def scenario():
+            with mock.patch.object(mcp, "host_request", host_request), mock.patch.object(
+                mcp._Generation, "_open_transport", fake_stdio
+            ), mock.patch("mcp.ClientSession", FakeClientSession):
+                with self.assertRaises(RuntimeError):
+                    await mcp._registry.get("other")
+
+        run(scenario())
+        self.assertNotIn("extensions", captured)
+
+    def test_credentialed_startup_failure_redacts_the_credential(self):
+        secret = "s" * 64
+
+        class FakeClientSession:
+            def __init__(self, *args, **kwargs):
+                raise ValueError(f"bad extensions {kwargs['extensions']}")
+
+        async def fake_stdio(self):
+            return ("read", "write")
+
+        async def scenario():
+            generation = mcp._Generation("studio_factory", {"type": "stdio"}, secret)
+            with mock.patch.object(mcp._Generation, "_open_transport", fake_stdio), mock.patch(
+                "mcp.ClientSession", FakeClientSession
+            ):
+                await generation.open()
+
+        with self.assertRaises(mcp.McpStartupError) as raised:
+            run(scenario())
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertIn("[REDACTED]", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

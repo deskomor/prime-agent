@@ -33,7 +33,7 @@ pub(crate) use queue::{
     SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
-mod create;
+pub(crate) mod create;
 mod turn;
 
 use create::{active_session_id_of, worker_server_capabilities};
@@ -309,6 +309,7 @@ impl Worker {
             shutdown_requested: false,
             last_activity_ms: 0,
             compacting: false,
+            auto_refine_rounds: 0,
             auto_compaction_enabled: true,
             // TS seeds `_lastSessionActionSnapshot` with the empty projection:
             // the first empty snapshot is not an update.
@@ -762,7 +763,7 @@ impl Worker {
             concrete.set_host_hooks(pa_core::session_engine::host_hooks::SessionHostHooks {
                 contract_v1: Some(host_hooks.contract_flag()),
                 contract_epoch: host_hooks.contract_epoch(),
-                context_projection: Default::default(),
+                context_projection: Arc::default(),
                 lifecycle: Some(host_hooks.lifecycle_hook()),
                 before_tool_call: Some(host_hooks.before_tool_call(tool_permissions.gate())),
                 after_tool_call: Some(host_hooks.after_tool_call()),
@@ -823,6 +824,13 @@ impl Worker {
             remote_source: None,
             probe_override: None,
         });
+        let acp_mcp = std::sync::Arc::new(std::sync::Mutex::new(acp_mcp));
+        // The same store the credential check and the registration resolve.
+        tree_navigation.set_studio_mcp(
+            engine
+                .acp_mcp_manager()
+                .unwrap_or_else(|| Arc::clone(&acp_mcp)),
+        );
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
@@ -857,7 +865,7 @@ impl Worker {
             tree_navigation,
             context_tree: std::sync::Arc::new(crate::context_tree_cache::ContextTreeCache::new()),
             exports,
-            acp_mcp: std::sync::Arc::new(std::sync::Mutex::new(acp_mcp)),
+            acp_mcp,
             user_bash,
             roster_pushes,
             agent_messages: crate::agent_message_ingest::AgentMessageIngest::new(),
@@ -870,6 +878,17 @@ impl Worker {
             create_gate: tokio::sync::Mutex::new(()),
             replacement_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The session's MCP store: the real agent engine's when it has one (admission and prompt
+    /// gating read it), else the worker-level store scripted harness engines use. Studio
+    /// registration, credential checks and replacement rotation all resolve it here.
+    pub(crate) fn session_mcp_manager(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>> {
+        self.engine
+            .acp_mcp_manager()
+            .unwrap_or_else(|| std::sync::Arc::clone(&self.acp_mcp))
     }
 
     /// The Herdr session reference the reports carry (TS
@@ -1205,6 +1224,8 @@ mod worker_resume_settings_tests;
 
 #[cfg(test)]
 mod agent_message_tests;
+#[cfg(test)]
+mod auto_refine_drain_tests;
 
 #[cfg(test)]
 mod prompt_image_tests;

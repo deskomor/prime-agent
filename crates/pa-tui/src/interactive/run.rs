@@ -28,6 +28,48 @@ const QUIET_TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// boundary is that interval's timer. The wake always precedes the
 /// phase change it observes — an off-by-one here parks the loop for a
 /// whole boundary instead of firing at the phase edge.
+/// Move the input already queued when the quiet tick runs onto the pending queue, in order,
+/// and report whether a key or paste is now ready to dispatch ahead of the tick's dropdown.
+/// Only the backlog present now is taken: the channel is unbounded, and a producer that keeps
+/// sending must not hold the tick branch. Only the dispatchable prefix counts: typing queued
+/// behind a barrier (a headless `WaitRender` that waits for this very dropdown, say) cannot
+/// run before the tick, so it must not keep the dropdown parked.
+fn typed_input_ready(
+    ui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiInput>,
+    pending: &mut std::collections::VecDeque<UiInput>,
+) -> bool {
+    for _ in 0..ui_rx.len() {
+        let Ok(input) = ui_rx.try_recv() else {
+            break;
+        };
+        pending.push_back(input);
+    }
+    pending
+        .iter()
+        .take_while(|input| {
+            !matches!(
+                input,
+                UiInput::WaitIdle { .. }
+                    | UiInput::SubmitAndSettle { .. }
+                    | UiInput::WaitRender { .. }
+                    | UiInput::WaitGone { .. }
+            )
+        })
+        .any(|input| matches!(input, UiInput::Key(_) | UiInput::Paste(_)))
+}
+
+/// The quiet tick's autocomplete step: the parked request materializes only when no typed
+/// input is ready to dispatch ahead of it (see [`typed_input_ready`]).
+fn quiet_tick_autocomplete(
+    ui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiInput>,
+    pending: &mut std::collections::VecDeque<UiInput>,
+    materialize: impl FnOnce(),
+) {
+    if !typed_input_ready(ui_rx, pending) {
+        materialize();
+    }
+}
+
 fn next_spinner_deadline(started: Instant, now: Instant) -> Instant {
     // The remainder form keeps the arithmetic bounded by one phase: a
     // wide phase counter would truncate through `as usize` on 32-bit
@@ -1913,7 +1955,12 @@ async fn run_interactive_surface(
                 }
             } => {
                 quiet_tick_deadline = None;
-                session.materialize_editor_autocomplete(&mut view);
+                // A busy loop can reach a due tick with typed input already waiting: that
+                // input dispatches first (in order), and the window restarts instead of
+                // opening a dropdown the waiting Enter would complete.
+                quiet_tick_autocomplete(&mut ui_rx, &mut pending, || {
+                    session.materialize_editor_autocomplete(&mut view);
+                });
                 session.selection_auto_scroll_tick(&mut view);
             }
             () = async {
@@ -2172,6 +2219,83 @@ async fn run_interactive_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_key(code: crossterm::event::KeyCode) -> UiInput {
+        UiInput::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    fn barrier() -> UiInput {
+        UiInput::WaitRender {
+            needle: "dropdown".to_string(),
+            timeout_ms: 1,
+        }
+    }
+
+    fn order(pending: &std::collections::VecDeque<UiInput>) -> Vec<&'static str> {
+        pending
+            .iter()
+            .map(|input| match input {
+                UiInput::Key(_) => "key",
+                UiInput::WaitRender { .. } => "barrier",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// Enter queued ahead of a barrier when the tick is due: it wins, and both inputs keep
+    /// their arrival order on the pending queue.
+    #[test]
+    fn a_due_tick_yields_to_typing_queued_before_a_barrier() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(queued_key(crossterm::event::KeyCode::Enter))
+            .unwrap();
+        tx.send(barrier()).unwrap();
+        let mut pending = std::collections::VecDeque::new();
+        let mut opened = false;
+        quiet_tick_autocomplete(&mut rx, &mut pending, || opened = true);
+        assert!(
+            !opened,
+            "the parked dropdown stays parked behind the queued Enter"
+        );
+        assert_eq!(order(&pending), ["key", "barrier"]);
+        assert!(
+            rx.try_recv().is_err(),
+            "the whole backlog moved, nothing more"
+        );
+    }
+
+    /// A key already received but still pending (no barrier ahead of it) also wins.
+    #[test]
+    fn a_due_tick_yields_to_a_pending_key() {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiInput>();
+        let mut pending =
+            std::collections::VecDeque::from([queued_key(crossterm::event::KeyCode::Char('e'))]);
+        let mut opened = false;
+        quiet_tick_autocomplete(&mut rx, &mut pending, || opened = true);
+        assert!(
+            !opened,
+            "the parked dropdown stays parked behind the pending key"
+        );
+        assert_eq!(order(&pending), ["key"]);
+    }
+
+    /// Typing queued behind a barrier cannot run before the tick: the dropdown the barrier
+    /// waits for may open, and the order stays intact.
+    #[test]
+    fn a_due_tick_ignores_typing_behind_a_barrier() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(barrier()).unwrap();
+        tx.send(queued_key(crossterm::event::KeyCode::Enter))
+            .unwrap();
+        let mut pending = std::collections::VecDeque::new();
+        let mut opened = false;
+        quiet_tick_autocomplete(&mut rx, &mut pending, || opened = true);
+        assert!(opened, "the dropdown the barrier waits for opens");
+        assert_eq!(order(&pending), ["barrier", "key"]);
+    }
 
     /// The boundary the select arms is always the current phase's
     /// 80ms edge — the wake must precede the phase change it observes

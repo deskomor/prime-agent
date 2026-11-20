@@ -100,6 +100,11 @@ saved row and model input contain the same expansion without a second callback.
 Busy steering uses the cached inventory without calling the host again. Disabling or replacing the host invalidates its additions
 without changing the native skill list or base prompt.
 
+The tool bridge preserves `ToolExecutionResult::is_error` in the loop's structured
+result, alongside content, details and termination hints. A flagged result remains
+an `Ok` payload rather than becoming a generic invocation error; final hook overrides
+and native tool-result messages retain the resulting flag.
+
 ## Depends on
 pa-types, pa-ai, pa-agent (one-way).
 

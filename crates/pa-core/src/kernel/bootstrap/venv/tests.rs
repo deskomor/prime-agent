@@ -45,8 +45,15 @@ use super::*;
 
 #[test]
 fn venv_dir_honors_override() {
+    let _guard = PRIME_AGENT_ENV_LOCK.blocking_lock();
+    let previous_venv = std::env::var_os("PRIME_AGENT_KERNEL_VENV");
+    std::env::remove_var("PRIME_AGENT_KERNEL_VENV");
     // The default path lives under $HOME.
     let base = kernel_venv_dir();
+    match previous_venv {
+        Some(value) => std::env::set_var("PRIME_AGENT_KERNEL_VENV", value),
+        None => std::env::remove_var("PRIME_AGENT_KERNEL_VENV"),
+    }
     assert!(base.ends_with("kernel-venv"));
 }
 
@@ -543,8 +550,6 @@ fn disk_memo_late_write_after_invalidate_is_benign() {
 }
 
 /// Env-mutating tests serialize on this lock: the process env is global.
-/// Unix only: its takers are the unix env-override tests.
-#[cfg(unix)]
 static PRIME_AGENT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A caller-owned `PRIME_AGENT_KERNEL_PYTHON` override resolves through

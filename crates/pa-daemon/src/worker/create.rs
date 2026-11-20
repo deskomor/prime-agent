@@ -758,15 +758,21 @@ impl Worker {
                 "parentSessionId": payload.get("studioMcpParentSessionId"),
             });
             let servers = bind_studio_mcp_servers(studio_servers, &binding);
-            let manager = self
-                .engine
-                .acp_mcp_manager()
-                .unwrap_or_else(|| Arc::clone(&self.acp_mcp));
+            let manager = self.session_mcp_manager();
             let owner = format!("studio-native:{}", self.config.active_session_id);
+            // Only the inherited Studio sidecar is enrolled for a credential.
+            let studio = if servers
+                .iter()
+                .any(|server| server.name() == pa_core::mcp::STUDIO_MCP_SERVER)
+            {
+                pa_core::mcp::StudioUpdate::Bind(pa_core::mcp::STUDIO_MCP_SERVER)
+            } else {
+                pa_core::mcp::StudioUpdate::Unbind
+            };
             if let Err(error) = manager
                 .lock()
                 .unwrap()
-                .replace_acp_servers(&servers, &owner)
+                .replace_acp_servers_with_studio(&servers, &owner, studio)
             {
                 return response_failure(None, "create", &error.to_string(), None);
             }
@@ -1059,6 +1065,40 @@ pub(super) fn bind_studio_mcp_servers(
     servers
 }
 
+/// The identity a Studio descriptor of this session carries (`PRIME_STUDIO_NATIVE_SESSION`).
+pub(crate) fn studio_session_identity(core: &super::SessionCore) -> Option<Value> {
+    let store = core.store.as_ref()?;
+    Some(json!({
+        "activeSessionId": core.active_session_id,
+        "sessionId": store.session_id(),
+        "sessionFile": store.path,
+        "cwd": core.cwd,
+        "parentSessionId": core.parent_session_id,
+        "parentActiveSessionId": core.parent_active_session_id,
+    }))
+}
+
+/// A session replacement inside this worker (new, switch, import, fork) rotates the Studio
+/// MCP binding onto the successor: fresh credential and generation, descriptor rebound to its
+/// identity and cwd. Called under the core lock right after the store swap, the lock the
+/// credential check reads the binding and the identity through.
+pub(crate) fn rotate_studio_mcp_for_successor(
+    manager: &std::sync::Mutex<pa_core::mcp::McpManager>,
+    core: &super::SessionCore,
+) {
+    let Some(identity) = studio_session_identity(core) else {
+        return;
+    };
+    let rotated = manager.lock().unwrap().rotate_studio_binding(|server| {
+        bind_studio_mcp_servers(vec![server.clone()], &identity)
+            .pop()
+            .unwrap_or_else(|| server.clone())
+    });
+    if let Err(error) = rotated {
+        eprintln!("pa-daemon: Studio MCP binding revoked on session replacement: {error:#}");
+    }
+}
+
 pub(super) fn active_session_id_of(payload: &[u8]) -> String {
     serde_json::from_slice::<Value>(payload)
         .ok()
@@ -1263,7 +1303,7 @@ mod studio_mcp_tests {
         let created = tokio::time::timeout(Duration::from_secs(5), worker.dispatch("create", &json!({
             "cwd":dir.path(), "sessionDir":dir.path().join("sessions"), "rlmDepth":1,
             "runtimeMetadata":{"kind":"subagent", "rlmChildId":"kid", "parentSessionId":"parent", "parentActiveSessionId":"parent-active"},
-            "hostHooksParent":{"activeSessionId":"parent-active", "hostContractVersion":1, "hooks":["session_start","session_shutdown"], "timeoutMs":150000},
+            "hostHooksParent":{"activeSessionId":"parent-active", "hostContractVersion":1, "hooks":["session_start","session_shutdown"], "timeoutMs":150_000},
             "studioHostContractVersion":1, "studioMcpParentSessionId":"parent",
             "studioMcpServers":[{"type":"stdio", "name":"studio", "command":"node", "args":["bridge.mjs"], "cwd":"/parent", "env":{"PRIME_STUDIO_NATIVE_SESSION":"parent"}}],
         }))).await.expect("create must return while startup awaits its answer");
@@ -1286,7 +1326,11 @@ mod studio_mcp_tests {
             "startup callback read must reenter: {snapshot:?}"
         );
         assert!(worker.input_pauses.paused());
-        let servers = worker.acp_mcp.lock().unwrap().get_acp_servers();
+        let servers = worker
+            .session_mcp_manager()
+            .lock()
+            .unwrap()
+            .get_acp_servers();
         let pa_core::mcp::AcpMcpServerConfig::Stdio { env, .. } = &servers[0] else {
             panic!("stdio binding");
         };

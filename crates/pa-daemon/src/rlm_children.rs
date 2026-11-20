@@ -539,6 +539,16 @@ impl SupervisorChildSessions {
     }
 
     /// Replace the host-authorized MCP configs inherited by future native children.
+    /// The Studio servers a new child inherits.
+    #[cfg(test)]
+    pub(crate) fn studio_mcp_servers(&self) -> Vec<pa_core::mcp::AcpMcpServerConfig> {
+        self.inner
+            .studio_mcp_servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn set_studio_mcp_servers(&self, servers: Vec<pa_core::mcp::AcpMcpServerConfig>) {
         *self
             .inner

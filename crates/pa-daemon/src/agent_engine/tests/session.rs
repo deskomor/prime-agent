@@ -694,3 +694,64 @@ fn an_unbuilt_engine_branch_summary_carries_the_request_session_id() {
     );
     assert_eq!(*seen.lock().unwrap(), [Some("durable-session".to_string())]);
 }
+
+#[test]
+fn host_advice_is_published_once_without_repeating_the_accepted_custom_row() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (engine, _dir) = faux_engine_with_settings(
+        &json!({ "responses": [{ "text": "draft" }, { "text": "revised" }] }),
+        1000,
+    );
+    let engine = std::sync::Arc::new(engine);
+    engine.register_arc();
+    engine.set_host_hooks(pa_core::session_engine::host_hooks::SessionHostHooks {
+        contract_v1: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        ))),
+        turn_end: Some(std::sync::Arc::new(|payload| {
+            Box::pin(async move {
+                (payload["message"]["content"][0]["text"] == "draft").then(|| {
+                    json!({ "continue": true, "messages": [{
+                        "customType": "advisory", "content": "correct the draft"
+                    }] })
+                })
+            })
+        })),
+        ..Default::default()
+    });
+    let mut events = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            message: String::new(),
+            images: Vec::new(),
+            batch: Vec::new(),
+            source: "user".to_string(),
+            agent_message_id: None,
+            custom_message: Some(json!({
+                "role": "custom", "customType": "accepted", "content": "start",
+                "display": true, "timestamp": 1
+            })),
+        },
+        &|| false,
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    );
+    assert_eq!(assistant_texts(&events), ["draft", "revised"]);
+    let rows: Vec<_> = custom_rows(&events)
+        .into_iter()
+        .filter(|row| row["customType"] == "accepted" || row["customType"] == "advisory")
+        .map(|row| (row["customType"].clone(), row["content"].clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (json!("accepted"), json!("start")),
+            (json!("advisory"), json!("correct the draft"))
+        ]
+    );
+}

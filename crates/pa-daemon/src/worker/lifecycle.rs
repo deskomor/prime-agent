@@ -288,20 +288,6 @@ impl Worker {
         }
     }
 
-    /// Rebind the worker onto the replacement session's cwd: the core's cwd
-    /// and the engine's cwd slot move onto the target's recorded directory
-    /// (nothing old observes the move).
-    pub(crate) fn rebind_worker_cwd(&self, cwd: &str) {
-        {
-            let mut core = self
-                .core
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            core.cwd = cwd.to_string();
-        }
-        self.engine.set_cwd(std::path::PathBuf::from(cwd));
-    }
-
     /// Refresh the replacement session's derived state (TS
     /// `refreshReplacedSessionState` on the `sessionReplaced` event): the
     /// moved-to session's depth re-seeds the worker core and the engine's
@@ -711,6 +697,42 @@ impl Worker {
     pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
         self.wait_until_quiescent(payload).await;
         response_success(None, "wait_for_idle", None)
+    }
+
+    /// `wait_for_auto_refine_idle`: wait until no background auto-refinement
+    /// round is reserved or running, for at most `timeoutMs` (clamped to five
+    /// minutes). Answers `{ settled }`; a deadline answers `settled: false`, so a
+    /// host that stays connected still tears down on time.
+    pub(crate) async fn handle_wait_for_auto_refine_idle(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("wait_for_auto_refine_idle") {
+            return response;
+        }
+        let Some(timeout_ms) = payload.get("timeoutMs").and_then(Value::as_u64) else {
+            return response_failure(
+                None,
+                "wait_for_auto_refine_idle",
+                "wait_for_auto_refine_idle requires a numeric timeoutMs",
+                None,
+            );
+        };
+        let deadline = std::time::Duration::from_millis(timeout_ms.min(300_000));
+        let settled = tokio::time::timeout(deadline, async {
+            loop {
+                // Register before the read: a release between the two still wakes it.
+                let notified = self.idle_notify.notified();
+                if self.core.lock().unwrap().auto_refine_rounds == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok();
+        response_success(
+            None,
+            "wait_for_auto_refine_idle",
+            Some(json!({ "settled": settled })),
+        )
     }
 
     /// `wait_for_headless_completion` (TS daemon command): settle the

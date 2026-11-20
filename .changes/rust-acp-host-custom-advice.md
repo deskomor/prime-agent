@@ -1,0 +1,1 @@
+- Keep Rust Studio transcripts ordered, preserve structured tool failure flags, keep streamed chats responsive, honor child collect wait budgets, and deliver host prompt-start messages with their prompt.

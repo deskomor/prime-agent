@@ -16,6 +16,12 @@ pub(crate) const SESSION_SNAPSHOT_METHOD: &str = "_ai.primeintellect.prime-agent
 pub(crate) const APPEND_CUSTOM_MESSAGE_METHOD: &str =
     "_ai.primeintellect.prime-agent/append_custom_message";
 pub(crate) const SET_ACTIVE_TOOLS_METHOD: &str = "_ai.primeintellect.prime-agent/set_active_tools";
+pub(crate) const VALIDATE_STUDIO_MCP_CREDENTIAL_METHOD: &str =
+    "_ai.primeintellect.prime-agent/validate_studio_mcp_credential";
+pub(crate) const NAVIGATE_TREE_METHOD: &str = "_ai.primeintellect.prime-agent/navigate_tree";
+/// Opt-in (`autoRefineDrain` in `initialize`): wait, bounded by `timeoutMs`, for the
+/// session's background auto-refinement after a prompt, before closing it.
+pub(crate) const WAIT_AUTO_REFINE_METHOD: &str = "_ai.primeintellect.prime-agent/wait_auto_refine";
 
 // Only authoritative native parent links establish membership. An ACP selector
 // cannot confer access to another root in the shared daemon.
@@ -60,6 +66,7 @@ pub(super) async fn handle_session_ext(
                     SESSION_SNAPSHOT_METHOD
                         | APPEND_CUSTOM_MESSAGE_METHOD
                         | SET_ACTIVE_TOOLS_METHOD
+                        | VALIDATE_STUDIO_MCP_CREDENTIAL_METHOD
                 )
             {
                 anyhow::ensure!(
@@ -74,6 +81,12 @@ pub(super) async fn handle_session_ext(
                 .map(|hosted| hosted.daemon_active_session_id.clone())
         }
         .ok_or_else(|| anyhow::anyhow!("Unknown ACP session: {session_id}"))?;
+        // A branch move is the ACP session's own: no descendant can be its target.
+        anyhow::ensure!(
+            !matches!(method, NAVIGATE_TREE_METHOD | WAIT_AUTO_REFINE_METHOD)
+                || params.get("targetActiveSessionId").is_none(),
+            "{method} applies only to the ACP session"
+        );
         let active_session_id = match params.get("targetActiveSessionId") {
             None => root.clone(),
             Some(target) => {
@@ -181,9 +194,58 @@ pub(super) async fn handle_session_ext(
                     rest: Map::default(),
                 }
             }
+            VALIDATE_STUDIO_MCP_CREDENTIAL_METHOD => DaemonCommand::ValidateStudioMcpCredential {
+                id: None,
+                active_session_id,
+                credential: pa_types::daemon::StudioCredential(
+                    params
+                        .get("credential")
+                        .and_then(Value::as_str)
+                        .filter(|credential| !credential.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("credential must be a non-empty string"))?
+                        .to_string(),
+                ),
+                rest: Map::default(),
+            },
+            NAVIGATE_TREE_METHOD => DaemonCommand::NavigateTree {
+                id: None,
+                active_session_id,
+                target_id: params
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .filter(|target| !target.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("targetId must be a non-empty string"))?
+                    .to_string(),
+                summarize: match params.get("summarize") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_bool()
+                            .ok_or_else(|| anyhow::anyhow!("summarize must be a boolean"))?,
+                    ),
+                },
+                custom_instructions: None,
+                replace_instructions: None,
+                label: None,
+                rest: Map::default(),
+            },
+            WAIT_AUTO_REFINE_METHOD => DaemonCommand::WaitForAutoRefineIdle {
+                id: None,
+                active_session_id,
+                timeout_ms: params
+                    .get("timeoutMs")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("timeoutMs must be a non-negative integer"))?,
+                rest: Map::default(),
+            },
             _ => anyhow::bail!("Unknown session extension: {method}"),
         };
-        let response = link.request(command).await?;
+        // The drain is bounded by the worker's own deadline, beyond the link's 30 s.
+        let response = if method == WAIT_AUTO_REFINE_METHOD {
+            link.request_until_close(command).await?
+        } else {
+            link.request(command).await?
+        };
         anyhow::ensure!(response.success, "{}", response.error.unwrap_or_default());
         let mut data = response.data.unwrap_or_else(|| json!({}));
         if method == SESSION_SNAPSHOT_METHOD {

@@ -270,6 +270,18 @@ impl SessionHostHooks {
 /// item is skipped: the hook is optional.
 #[must_use]
 pub fn hidden_messages(answer: &Value) -> Vec<pa_types::session::CustomMessage> {
+    custom_rows(answer, false)
+}
+
+/// The custom rows a `before_agent_start` answer adds to its own admission
+/// (`{messages: [...]}`, same item shapes as [`hidden_messages`]). Each item
+/// keeps an explicit boolean `display`; hidden is the default.
+#[must_use]
+pub fn admission_messages(answer: &Value) -> Vec<pa_types::session::CustomMessage> {
+    custom_rows(answer, true)
+}
+
+fn custom_rows(answer: &Value, keep_display: bool) -> Vec<pa_types::session::CustomMessage> {
     let Some(items) = answer.get("messages").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -281,8 +293,8 @@ pub fn hidden_messages(answer: &Value) -> Vec<pa_types::session::CustomMessage> 
     items
         .iter()
         .filter_map(|item| {
-            let (content, custom_type, details) = match item {
-                Value::String(text) => (Value::String(text.clone()), None, None),
+            let (content, custom_type, details, display) = match item {
+                Value::String(text) => (Value::String(text.clone()), None, None, false),
                 Value::Object(object) => (
                     object.get("content")?.clone(),
                     object.get("customType").and_then(Value::as_str),
@@ -290,13 +302,14 @@ pub fn hidden_messages(answer: &Value) -> Vec<pa_types::session::CustomMessage> 
                         .get("details")
                         .filter(|details| !details.is_null())
                         .cloned(),
+                    keep_display && object.get("display").and_then(Value::as_bool) == Some(true),
                 ),
                 _ => return None,
             };
             serde_json::from_value::<pa_types::session::CustomMessage>(serde_json::json!({
                 "customType": custom_type.unwrap_or(HOST_HOOK_CUSTOM_TYPE),
                 "content": content,
-                "display": false,
+                "display": display,
                 "details": details,
                 "timestamp": timestamp,
             }))

@@ -8,6 +8,18 @@ use super::{
     DaemonResumeCursor, Deserialize, JsonMap, Serialize, Value,
 };
 
+/// A Studio MCP credential on the wire: serialized as a plain string, never
+/// shown by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StudioCredential(pub String);
+
+impl std::fmt::Debug for StudioCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StudioCredential(<redacted>)")
+    }
+}
+
 /// One page of the display transcript (the branch in order, each compaction as its
 /// summary row), bounded by entry-id cursors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,8 +820,17 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
-    /// Append one durable custom entry (host state outside the model
-    /// context); answers its `entryId`.
+    /// Check a Studio MCP credential against the target session's current
+    /// binding (read-only): `{valid, generation}` plus the native identity.
+    ValidateStudioMcpCredential {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        credential: StudioCredential,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Read paged canonical entries and native session identity.
     SessionSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -821,6 +842,7 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Select the active tool names for a session.
     SetActiveTools {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -829,6 +851,8 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Append one durable custom entry (host state outside the model
+    /// context); answers its `entryId`.
     AppendSessionEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -836,6 +860,16 @@ pub enum DaemonCommand {
         custom_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Wait, at most `timeout_ms`, until no background auto-refinement round
+    /// of the session is reserved or running; answers `{ settled }`.
+    WaitForAutoRefineIdle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        timeout_ms: u64,
         #[serde(flatten)]
         rest: JsonMap,
     },

@@ -224,3 +224,91 @@ async fn a_parked_steer_delivers_only_after_the_navigation() {
     );
     drop(turn);
 }
+
+/// A write that moves the leaf after the move took its snapshot makes the move fail: nothing
+/// is moved and the newer row stays the leaf. The `session_before_tree` hook holds the move
+/// between its snapshot and its commit.
+#[tokio::test]
+async fn a_leaf_moved_after_the_snapshot_refuses_the_move() {
+    let dir = std::env::temp_dir().join(format!("pa-nav-stale-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = seeded_session(&dir);
+    let worker = navigation_worker(&dir, &path).await;
+    let turn = worker
+        .dispatch("prompt_and_wait", &json!({ "message": "run one" }))
+        .await;
+    assert!(turn.success, "prompt failed: {turn:?}");
+    worker
+        .host_hooks
+        .set_hooks(
+            &[crate::host_hooks::SESSION_BEFORE_TREE.to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+    let mut subscription = worker.events.subscribe();
+
+    let navigation = {
+        let worker = Arc::clone(&worker);
+        tokio::spawn(async move {
+            worker
+                .dispatch("navigate_tree", &json!({ "targetId": "m1" }))
+                .await
+        })
+    };
+    let request_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = subscription.recv().await.unwrap();
+            if frame.outbound_type != "session_event" {
+                continue;
+            }
+            let event = serde_json::from_slice::<Value>(&frame.payload).unwrap()["event"].clone();
+            if event["type"] == "host_hook_request"
+                && event["hook"] == crate::host_hooks::SESSION_BEFORE_TREE
+            {
+                break event["requestId"].as_str().unwrap().to_string();
+            }
+        }
+    })
+    .await
+    .expect("the navigation never asked session_before_tree");
+
+    let appended = worker
+        .dispatch(
+            "append_session_entry",
+            &json!({ "customType": "stale-leaf-mark" }),
+        )
+        .await;
+    assert!(appended.success, "append failed: {appended:?}");
+    let mark = appended.data.unwrap()["entryId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let leaf = || {
+        let core = worker.core.lock().unwrap();
+        core.store
+            .as_ref()
+            .and_then(|store| store.leaf_id().map(str::to_string))
+    };
+    assert_eq!(
+        leaf().as_deref(),
+        Some(mark.as_str()),
+        "the write moved the leaf"
+    );
+    assert!(worker.host_hooks.resolve(&request_id, Ok(json!({}))));
+
+    let navigated = navigation.await.expect("navigation task");
+    assert!(
+        !navigated.success,
+        "a stale move was applied: {navigated:?}"
+    );
+    assert!(
+        format!("{navigated:?}").contains("The conversation changed during the move"),
+        "unexpected failure: {navigated:?}"
+    );
+    assert_eq!(
+        leaf().as_deref(),
+        Some(mark.as_str()),
+        "the move changed the leaf"
+    );
+}

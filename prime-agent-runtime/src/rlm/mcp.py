@@ -160,9 +160,11 @@ class _StderrTail(io.TextIOBase):
 
 
 class _Generation:
-    def __init__(self, server: str, config: dict[str, Any]):
+    def __init__(self, server: str, config: dict[str, Any], studio_credential: str | None = None):
         self.server = server
         self.config = config
+        # Held only for this sidecar's initialize request; never in config or env.
+        self._studio_credential = studio_credential
         self.stack = AsyncExitStack()
         self.session: Any = None
         self.tools: dict[str, dict[str, Any]] = {}
@@ -210,7 +212,16 @@ class _Generation:
                     from mcp import ClientSession
 
                     self.session = await self.stack.enter_async_context(
-                        ClientSession(read, write, read_timeout_seconds=self.call_timeout)
+                        ClientSession(
+                            read,
+                            write,
+                            read_timeout_seconds=self.call_timeout,
+                            **(
+                                {"extensions": {_STUDIO_BINDING_EXTENSION: {"credential": self._studio_credential}}}
+                                if self._studio_credential
+                                else {}
+                            ),
+                        )
                     )
                     try:
                         await self.session.initialize()
@@ -223,7 +234,7 @@ class _Generation:
                         self._stderr.stop_capture()
             except BaseException as exc:
                 if not ready.done():
-                    ready.set_exception(exc)
+                    ready.set_exception(self._credential_safe(exc))
                 return
 
             if startup_failure is not None:
@@ -244,6 +255,19 @@ class _Generation:
                 if self._stderr is not None:
                     self._stderr.close()
                 self.closed = True
+
+    def _credential_safe(self, exc: BaseException) -> BaseException:
+        """An ordinary startup failure of a credentialed Studio sidecar, with
+        the credential removed from its message; cancellation passes through."""
+        if not self._studio_credential or not isinstance(exc, Exception):
+            return exc
+        detail = _sanitize_diagnostic(
+            f"{type(exc).__name__}: {exc}",
+            (self._studio_credential,),
+            (),
+            byte_limit=1024,
+        ) or type(exc).__name__
+        return McpStartupError(f"Studio MCP sidecar failed during startup ({detail}).")
 
     def _startup_error(self, exc: Exception) -> McpStartupError:
         assert self._stderr is not None
@@ -317,6 +341,9 @@ class _Generation:
             sorted({value for value in configured_values if len(value) >= 4}, key=len, reverse=True)
         )
         self._diagnostic_private_values = _private_config_values(self.config) + (os.getcwd(),)
+        if self._studio_credential:
+            self._stderr_secrets = (self._studio_credential, *self._stderr_secrets)
+            self._diagnostic_private_values = (self._studio_credential, *self._diagnostic_private_values)
         self._stderr = _StderrTail()
         params = StdioServerParameters(command=command, args=args, cwd=cwd, env=env)
         return await self.stack.enter_async_context(stdio_client(params, errlog=self._stderr))
@@ -459,6 +486,11 @@ class _Registry:
         self._accepting_work()
         current = self._generations.get(server)
         config = await _config(server)
+        studio_credential = None
+        if config.get("studioBinding") is True:
+            # The descriptor and its credential come from one native read; the
+            # generation in the config reopens the sidecar after any rebind.
+            config, studio_credential = await _studio_bootstrap(server)
         self._accepting_work()
         if current and current.config == config and not current.closed:
             return current
@@ -467,7 +499,7 @@ class _Registry:
             if self._generations.get(server) is current:
                 self._generations.pop(server, None)
         self._accepting_work()
-        generation = _Generation(server, config)
+        generation = _Generation(server, config, studio_credential)
         self._generations[server] = generation
         try:
             await generation.open()
@@ -871,6 +903,30 @@ def _validate_cursor(value: Any) -> None:
 def _validate_name(value: str, label: str) -> None:
     if not isinstance(value, str) or not value:
         raise TypeError(f"{label} must be a non-empty string")
+
+
+# The client-capability extension that carries a Studio sidecar's credential.
+_STUDIO_BINDING_EXTENSION = "ai.primeintellect/studio-binding"
+
+
+async def _studio_bootstrap(server: str) -> tuple[dict[str, Any], str]:
+    """The Studio sidecar descriptor and its own credential, read together.
+
+    The credential grants only this session; it stays out of the returned
+    config (which carries the non-secret generation) and out of env."""
+    try:
+        async with asyncio.timeout(_DEFAULT_STARTUP_TIMEOUT):
+            bound = await host_request("mcp.studio_binding", {"server": server})
+    except Exception as exc:
+        raise RuntimeError(f"Could not load the Studio binding for '{server}'") from exc
+    config = bound.get("config") if isinstance(bound, dict) else None
+    credential = bound.get("credential") if isinstance(bound, dict) else None
+    generation = bound.get("generation") if isinstance(bound, dict) else None
+    if not isinstance(config, dict) or not isinstance(credential, str) or not credential:
+        raise RuntimeError(f"Studio binding for '{server}' is incomplete")
+    if not isinstance(generation, int):
+        raise RuntimeError(f"Studio binding for '{server}' has no generation")
+    return {**config, "_studioGeneration": generation}, credential
 
 
 async def _config(server: str) -> dict[str, Any]:

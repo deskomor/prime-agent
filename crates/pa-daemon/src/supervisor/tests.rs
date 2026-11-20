@@ -904,6 +904,7 @@ async fn a_saved_session_listing_reads_each_sessions_harness_store_once() {
     // One project per session: sessions of one project share a local store.
     for specs in [&["a"][..], &["a", "b"][..]] {
         let cwd = root.join(format!("project-{}", specs.len()));
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
         let mut session =
             crate::session_store::SessionFile::create(&cwd.to_string_lossy(), None, 0);
         let path = sessions.join(format!("{}.jsonl", session.session_id()));

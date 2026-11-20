@@ -535,44 +535,52 @@ async fn mid_session_refresh_never_retargets() {
 async fn a_dropped_refresh_resolves_the_gate_and_the_next_refresh_starts_fresh() {
     let dir = tempfile::tempdir().unwrap();
     let server = common::MockServer::start_scripted(vec![
-        common::Scripted::Delayed(
-            common::ok_json(catalog_json(&["model-a"]), None),
-            std::time::Duration::from_secs(5),
-        ),
+        // Held until the test drops the driver (no reply races the fetch timeout).
+        common::Scripted::Hang,
         common::Scripted::Response(common::ok_json(catalog_json(&["model-b"]), None)),
     ])
     .await;
     let cache = Arc::new(models_cache(dir.path(), server.url("/catalog")));
 
     // A coalesced waiter joins the dropped driver: it must wake with a
-    // failed refresh (None), never hang on the abandoned gate. Both waits
-    // are bounded — the 2s bound fails the test instead of wedging it.
-    let dropped = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        cache.refresh(
-            PUBLIC_SCOPE,
-            RefreshOptions {
-                force: true,
-                ..Default::default()
-            },
-        ),
+    // failed refresh (None), never hang on the abandoned gate. The driver is
+    // dropped only once its fetch is held on the server and the waiter has
+    // joined it; a fixed delay would race the request under load.
+    let force = || RefreshOptions {
+        force: true,
+        ..Default::default()
+    };
+    let mut driver = Box::pin(cache.refresh(PUBLIC_SCOPE, force()));
+    let mut joined = Box::pin(cache.refresh(PUBLIC_SCOPE, force()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while server.request_count() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first fetch reached the server"
+        );
+        tokio::select! {
+            biased;
+            _ = &mut driver => panic!("the held fetch settled"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+    }
+    // The waiter, polled while the fetch is held, stays pending on the gate.
+    for _ in 0..3 {
+        tokio::select! {
+            biased;
+            _ = &mut joined => panic!("the coalesced waiter settled while the fetch is held"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the waiter joins the held fetch instead of fetching"
     );
-    let joined = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        cache.refresh(
-            PUBLIC_SCOPE,
-            RefreshOptions {
-                force: true,
-                ..Default::default()
-            },
-        ),
-    );
-    let (dropped, joined) = tokio::join!(dropped, joined);
-    assert!(
-        dropped.is_err(),
-        "the bounded wait must return while the fetch is held"
-    );
-    let joined = joined.expect("the coalesced waiter wakes on the abandoned gate");
+    drop(driver);
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(2), joined)
+        .await
+        .expect("the coalesced waiter wakes on the abandoned gate");
     assert!(
         joined.is_none(),
         "a dropped refresh resolves as a failed one"

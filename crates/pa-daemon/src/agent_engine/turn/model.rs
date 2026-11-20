@@ -14,6 +14,7 @@ impl AgentSessionEngine {
         &self,
         admission: TurnAdmission,
         prompt: &TurnPrompt,
+        accepted_rows: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<EngineEvent>>>,
         boundary_passed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
@@ -386,6 +387,7 @@ impl AgentSessionEngine {
                                 .run_turn_once(
                                     &agent,
                                     &prompt,
+                                    accepted_rows,
                                     admit_prompt,
                                     boundary_passed,
                                     &pending_model_changes,

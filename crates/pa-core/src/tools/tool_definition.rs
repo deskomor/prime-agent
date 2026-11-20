@@ -51,8 +51,8 @@ pub struct ToolUpdate {
     pub details: Option<serde_json::Value>,
 }
 
-/// The result of a tool execution. Errors are not a variant here: like the TS product, a
-/// failing tool call surfaces as an `Err` whose message is the model-facing text.
+/// A tool execution's structured result. `is_error` retains failures with content and details;
+/// an `Err` represents a thrown invocation failure.
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionResult {
     pub content: Vec<ToolContentBlock>,

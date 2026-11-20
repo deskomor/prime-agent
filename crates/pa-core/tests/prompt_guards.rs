@@ -148,6 +148,9 @@ const INTERNAL_HOST_REQUESTS: &[&str] = &[
     "mcp.config",
     "mcp.refresh",
     "mcp.begin_login",
+    // The runtime's private Studio credential bootstrap (`rlm.mcp` asks for it before
+    // `initialize`); the model must never see or call it.
+    "mcp.studio_binding",
     // The runtime's detached-bash notice pair (the kernel's bash module
     // fires them; the model never calls them).
     "bash.completed",
@@ -498,6 +501,18 @@ fn core_layer_documents_the_real_tool_surface() {
              update prompts/layers/core.md (and this test's token mapping)"
         );
     }
+
+    for internal in INTERNAL_HOST_REQUESTS {
+        assert!(
+            !documented.contains(*internal),
+            "host-internal request {internal:?} must not be documented in prompts/layers/core.md"
+        );
+    }
+    // The private Studio credential bootstrap never appears in the prompt, in any form.
+    assert!(
+        !CORE_LAYER.contains("mcp.studio_binding"),
+        "prompts/layers/core.md must not mention the private mcp.studio_binding bootstrap"
+    );
 
     for token in &required {
         let documented_form = documented.contains(token)

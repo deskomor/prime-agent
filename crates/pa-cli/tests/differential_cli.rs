@@ -304,6 +304,425 @@ const CORPUS: &[&[&str]] = &[
     &["mcp", "remove", "y"],
 ];
 
+/// The one stream an accepted case writes (the other one must stay empty).
+#[derive(Clone, Copy, Debug)]
+enum Stream {
+    Out,
+    Err,
+}
+
+/// A difference from TS 0.9.8 accepted as intended fork behavior (user
+/// decision, 2026-11-19). Each entry pins both results: the exit codes, the
+/// single stream each binary writes, and the exact edits that turn the
+/// normalized TS text into the normalized Rust text, applied in order. A
+/// regression on either side, or a revert to the TS output, still fails.
+struct Accepted {
+    argv: &'static [&'static str],
+    why: &'static str,
+    ts_exit: i32,
+    rs_exit: i32,
+    ts_stream: Stream,
+    rs_stream: Stream,
+    edits: &'static [(&'static str, &'static str)],
+}
+
+const TOP_HELP_EDITS: &[(&str, &str)] = &[
+    (
+        "\nTool and resource options:\n  -t, --tools <list>          Allowlist comma-separated tool names\n  -nt, --no-tools             Disable all tools by default\n  -nbt, --no-builtin-tools    Disable built-in tools by default\n  -e, --extension <source>    Load an extension (repeatable)\n  -ne, --no-extensions        Disable extension discovery",
+        "\nResource options:",
+    ),
+    (
+        "Commands:\n  help      Show command help\n  agents    Search and open sessions\n  list      List agents\n  sessions  Show agent status, activity, and usage\n  attach    Attach the interactive UI to an agent\n  stop      Stop an agent\n  rename    Rename an agent\n  send      Send a message to an agent\n  schedule  Manage prompts that run later or on a recurring schedule\n  status    Show background service status\n  doctor    Inspect and safely clean up background services\n  incident  Reconstruct a daemon incident from its logs\n  shutdown  Stop every agent and background service\n  mcp       Manage user MCP servers\n  package   Manage capability packages\n  update    Update Prime Agent\n  model     Inspect available models\n  session   Manage saved sessions\n  config    Configure package resources",
+        "Commands:\n  help          Show command help\n  agents        Search and open sessions\n  list          List agents\n  sessions      Show agent status, activity, and usage\n  attach        Attach the interactive UI to an agent\n  stop          Stop an agent\n  rename        Rename an agent\n  send          Send a message to an agent\n  schedule      Manage prompts that run later or on a recurring schedule\n  status        Show background service status\n  telemetry     Show or change usage telemetry\n  doctor        Inspect and safely clean up background services\n  incident      Reconstruct a daemon incident from its logs\n  shutdown      Stop every agent and background service\n  auth-gateway  Serve your logins as a local OpenAI chat-completions endpoint\n  harness       Move the global harness to and from a file tree\n  mcp           Manage user MCP servers\n  package       Manage capability packages\n  update        Update to the latest Rust build (uninstalls the TypeScript version)\n  model         Inspect available models\n  session       Manage saved sessions\n  config        Configure package resources\n  factory       Share and run factory machines from the machine library",
+    ),
+];
+
+const HELP_PACKAGE_EDITS: &[(&str, &str)] = &[(
+    "\nPackages can provide extensions, skills, prompts, and themes.",
+    "\nPackages can provide skills, prompts, and themes.",
+)];
+
+const HELP_UPDATE_EDITS: &[(&str, &str)] = &[
+    (
+        "Usage:\n  prime-agent update [--force] [--rollback] [--nightly|--stable]",
+        "Usage:\n  prime-agent update [--check] [--nightly|--stable]",
+    ),
+    (
+        "\nUpdate Prime Agent.",
+        "\nUpdate to the latest Rust build (uninstalls the TypeScript version).\n\nMove from the TypeScript version to the Rust port in one step: `prime-agent update` fetches the update channel's installer (stable: https://app.primeintellect.ai/prime-agent/install.sh; nightly: install-beta.sh from the release download base — never a GitHub raw or workflow URL) and runs it, which uninstalls the TypeScript version and installs the latest Rust build; your sessions and configuration (~/.prime/agent) are never touched. Restart prime-agent after the update to run the new build. This command exists only in the Rust binary — the TypeScript version does not have it; the move happens when you run the installer's curl|sh URL (the README's Install section) or `prime-agent update` (after the Rust install exists).",
+    ),
+    (
+        "Options:\n  --force     Reinstall even if the current version is the latest on the channel\n  --rollback  Restore the previous compiled release\n  --nightly   Switch updates to the nightly channel (unreleased builds, may be broken)",
+        "Options:\n  --check  Print the update channel's latest release vs the running version, without installing\n  --force     Reinstall the latest build of the channel\n  --rollback  Restore the previous version the last update kept\n  --nightly   Switch updates to the nightly channel (the latest main build)",
+    ),
+    (
+        "  --stable    Return updates to the stable channel",
+        "  --stable    Return updates to the stable channel\n  --archive <path>  Install a local release archive\n  --source <url>     The https:// origin recorded as the release's install source (managed installs; required there with --archive)",
+    ),
+];
+
+const MAX_TURNS_RANGE_EDITS: &[(&str, &str)] = &[(
+    "Error: --autonomous-max-turns must be a positive integer",
+    "Error: --autonomous-max-turns must be a positive integer between 1 and u32::MAX (4294967295)",
+)];
+
+const FILE_ARG_MODES_EDITS: &[(&str, &str)] = &[(
+    "Error: @file arguments are not supported in RPC or daemon mode",
+    "Error: @file arguments are not supported in RPC, daemon, or ACP mode",
+)];
+
+const MODEL_LIST_JSON_EDITS: &[(&str, &str)] = &[
+    (
+        "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md",
+        "Error: Unknown option: --json",
+    ),
+];
+
+const UPDATE_SELF_EDITS: &[(&str, &str)] = &[(
+    "Error: An update target is no longer needed.\nUse \"prime-agent update [--force]\".",
+    "Error: Unknown option for update: --self\nRun \"prime-agent help update\" for usage.",
+)];
+
+const UPDATE_PACKAGE_EDITS: &[(&str, &str)] = &[
+    (
+        "Error: Package updates moved to the package command.\nUse \"prime-agent package update [source]\".",
+        "Error: Unknown option for update: package\nRun \"prime-agent help update\" for usage.",
+    ),
+];
+
+const UPDATE_EXTENSIONS_EDITS: &[(&str, &str)] = &[
+    (
+        "Error: Package updates moved to the package command.\nUse \"prime-agent package update [source]\".",
+        "Error: Unknown option for update: --extensions\nRun \"prime-agent help update\" for usage.",
+    ),
+];
+
+const UPDATE_SELF_PACKAGE_EDITS: &[(&str, &str)] = &[
+    (
+        "Error: Prime Agent and package updates are now separate.\nRun \"prime-agent update [--force]\" and \"prime-agent package update [source]\" separately.",
+        "Error: Unknown option for update: --self\nRun \"prime-agent help update\" for usage.",
+    ),
+];
+
+const UPDATE_SELF_PKG_EDITS: &[(&str, &str)] = &[
+    (
+        "Error: Prime Agent and package updates are now separate.\nRun \"prime-agent update [--force]\" and \"prime-agent package update [source]\" separately.",
+        "Error: Unknown option for update: self\nRun \"prime-agent help update\" for usage.",
+    ),
+];
+
+const PACKAGE_UPDATE_HINT_EDITS: &[(&str, &str)] = &[
+    (
+        "Error: Package updates accept only an optional source. Use \"prime-agent update --force\" to update Prime Agent.",
+        "Error: Package updates accept only an optional source. Use \"prime-agent update\" to update Prime Agent.",
+    ),
+];
+
+const ACCEPTED: &[Accepted] = &[
+    Accepted {
+        argv: &["--version"],
+        why: "the version prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["-v"],
+        why: "the version prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["--help"],
+        why: "help prints on stdout; Rust removed the tool and extension flags (#3211, #3189) and adds commands",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: TOP_HELP_EDITS,
+    },
+    Accepted {
+        argv: &["-h"],
+        why: "help prints on stdout; Rust removed the tool and extension flags (#3211, #3189) and adds commands",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: TOP_HELP_EDITS,
+    },
+    Accepted {
+        argv: &["help"],
+        why: "Rust removed the tool and extension flags (#3211, #3189) and adds commands",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Out,
+        rs_stream: Stream::Out,
+        edits: TOP_HELP_EDITS,
+    },
+    Accepted {
+        argv: &["help", "package"],
+        why: "Rust has no user extensions (#3189)",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Out,
+        rs_stream: Stream::Out,
+        edits: HELP_PACKAGE_EDITS,
+    },
+    Accepted {
+        argv: &["help", "update"],
+        why: "Rust update installs the Rust build and adds --check, --archive and --source",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Out,
+        rs_stream: Stream::Out,
+        edits: HELP_UPDATE_EDITS,
+    },
+    Accepted {
+        argv: &["--autonomous-max-turns", "0"],
+        why: "the Rust error names the valid range",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: MAX_TURNS_RANGE_EDITS,
+    },
+    Accepted {
+        argv: &["--autonomous-max-turns", "abc"],
+        why: "the Rust error names the valid range",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: MAX_TURNS_RANGE_EDITS,
+    },
+    Accepted {
+        argv: &["--mode", "rpc", "@file.txt"],
+        why: "the Rust error also names ACP mode",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: FILE_ARG_MODES_EDITS,
+    },
+    Accepted {
+        argv: &["--mode", "daemon", "@file.txt"],
+        why: "the Rust error also names ACP mode",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: FILE_ARG_MODES_EDITS,
+    },
+    Accepted {
+        argv: &["model", "list"],
+        why: "model list prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["model", "list", "gpt"],
+        why: "model list prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["model", "list", "claude"],
+        why: "model list prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["model", "list", "z-ai"],
+        why: "model list prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["model", "list", "zzz-nomatch-xyz"],
+        why: "model list prints on stdout",
+        ts_exit: 0,
+        rs_exit: 0,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Out,
+        edits: &[],
+    },
+    Accepted {
+        argv: &["model", "list", "--json"],
+        why: "Rust rejects the unknown --json option",
+        ts_exit: 0,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: MODEL_LIST_JSON_EDITS,
+    },
+    Accepted {
+        argv: &["update", "--self"],
+        why: "Rust dropped the TS migration hints for old update targets",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: UPDATE_SELF_EDITS,
+    },
+    Accepted {
+        argv: &["update", "package"],
+        why: "Rust dropped the TS migration hints for old update targets",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: UPDATE_PACKAGE_EDITS,
+    },
+    Accepted {
+        argv: &["update", "--extensions"],
+        why: "Rust dropped the TS migration hints for old update targets",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: UPDATE_EXTENSIONS_EDITS,
+    },
+    Accepted {
+        argv: &["update", "--self", "package"],
+        why: "Rust dropped the TS migration hints for old update targets",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: UPDATE_SELF_PACKAGE_EDITS,
+    },
+    Accepted {
+        argv: &["update", "self", "pkg"],
+        why: "Rust dropped the TS migration hints for old update targets",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: UPDATE_SELF_PKG_EDITS,
+    },
+    Accepted {
+        argv: &["update", "--force", "--self"],
+        why: "Rust dropped the TS migration hints for old update targets",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: UPDATE_SELF_EDITS,
+    },
+    Accepted {
+        argv: &["package", "update", "--self"],
+        why: "the Rust hint points at plain update, which replaces update --force",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: PACKAGE_UPDATE_HINT_EDITS,
+    },
+    Accepted {
+        argv: &["package", "update", "--force"],
+        why: "the Rust hint points at plain update, which replaces update --force",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: PACKAGE_UPDATE_HINT_EDITS,
+    },
+    Accepted {
+        argv: &["package", "update", "--extension", "x", "--self"],
+        why: "the Rust hint points at plain update, which replaces update --force",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: PACKAGE_UPDATE_HINT_EDITS,
+    },
+    Accepted {
+        argv: &["package", "update", "--extension", "x", "y"],
+        why: "the Rust hint points at plain update, which replaces update --force",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: PACKAGE_UPDATE_HINT_EDITS,
+    },
+    Accepted {
+        argv: &["package", "update", "--extensions", "--rollback"],
+        why: "the Rust hint points at plain update, which replaces update --force",
+        ts_exit: 1,
+        rs_exit: 1,
+        ts_stream: Stream::Err,
+        rs_stream: Stream::Err,
+        edits: PACKAGE_UPDATE_HINT_EDITS,
+    },
+];
+
+/// Check one accepted case against its pinned TS and Rust results.
+fn check_accepted(
+    entry: &Accepted,
+    ts: &InvocationOutput,
+    rs: &InvocationOutput,
+    rust_stdout: &str,
+    roots: &[&Path],
+) -> Result<(), String> {
+    if ts.exit_code != Some(entry.ts_exit) || rs.exit_code != Some(entry.rs_exit) {
+        return Err(format!(
+            "exit codes: ts {:?} rs {:?}, accepted ts {} rs {}",
+            ts.exit_code, rs.exit_code, entry.ts_exit, entry.rs_exit
+        ));
+    }
+    let pick = |stream: Stream, out: &str, err: &str| match stream {
+        Stream::Out => (out.to_string(), err.to_string()),
+        Stream::Err => (err.to_string(), out.to_string()),
+    };
+    let (ts_text, ts_other) = pick(entry.ts_stream, &ts.stdout, &ts.stderr);
+    let (rs_text, rs_other) = pick(entry.rs_stream, rust_stdout, &rs.stderr);
+    for (side, text, other) in [("ts", &ts_text, &ts_other), ("rs", &rs_text, &rs_other)] {
+        if text.is_empty() {
+            return Err(format!("{side} wrote nothing on its accepted stream"));
+        }
+        if !other.is_empty() {
+            return Err(format!("{side} wrote to the other stream too: {other:?}"));
+        }
+    }
+    let ts_text = normalize(&ts_text, roots);
+    let mut expected = String::new();
+    let mut rest = ts_text.as_str();
+    for (from, to) in entry.edits {
+        let Some(at) = rest.find(from) else {
+            return Err(format!(
+                "TS output lacks the accepted text {from:?}:\n{ts_text}"
+            ));
+        };
+        expected.push_str(&rest[..at]);
+        expected.push_str(to);
+        rest = &rest[at + from.len()..];
+    }
+    expected.push_str(rest);
+    let actual = normalize(&rs_text, roots);
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(format!("Rust output is not the accepted change:\n  expected: {expected:?}\n  actual:   {actual:?}"))
+    }
+}
+
 fn ts_binary() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PA_TS_BINARY") {
         return Some(PathBuf::from(path));
@@ -458,6 +877,14 @@ fn differential_corpus_matches_ts_binary() {
     let rs_sandbox = sandbox("rs");
     let sandbox_roots: Vec<&Path> = vec![&ts_sandbox, &rs_sandbox];
 
+    for entry in ACCEPTED {
+        assert!(
+            CORPUS.contains(&entry.argv),
+            "accepted case {:?} is not in the corpus",
+            entry.argv
+        );
+    }
+
     let mut failures: Vec<String> = Vec::new();
     for case in CORPUS {
         let ts_out = run(&ts, case, &ts_sandbox);
@@ -468,6 +895,17 @@ fn differential_corpus_matches_ts_binary() {
         } else {
             rs_out.stdout.clone()
         };
+        if let Some(entry) = ACCEPTED.iter().find(|entry| entry.argv == *case) {
+            if let Err(reason) =
+                check_accepted(entry, &ts_out, &rs_out, &rust_stdout, &sandbox_roots)
+            {
+                failures.push(format!(
+                    "argv: {case:?} (accepted: {})\n  {reason}",
+                    entry.why
+                ));
+            }
+            continue;
+        }
         let ok = ts_out.exit_code == rs_out.exit_code
             && normalize(&ts_out.stdout, &sandbox_roots) == normalize(&rust_stdout, &sandbox_roots)
             && normalize(&ts_out.stderr, &sandbox_roots)
@@ -615,17 +1053,22 @@ fn differential_session_export_matches_ts_binary() {
         &["session", "export", fixture, "out.html"],
         &rs_sandbox,
     );
-    assert_eq!(ts_out.exit_code, rs_out.exit_code, "exit codes");
+    assert_eq!(ts_out.exit_code, Some(0), "TS exit code");
+    assert_eq!(rs_out.exit_code, Some(0), "Rust exit code");
+    // Accepted fork difference against TS 0.9.8: both print the same single
+    // success line, TS on stderr and Rust on stdout.
+    assert_eq!(ts_out.stdout, "", "TS stdout");
     assert_eq!(
-        normalize(&ts_out.stdout, &sandbox_roots),
-        normalize(&rs_out.stdout, &sandbox_roots),
-        "stdout"
+        ts_out.stderr.lines().collect::<Vec<_>>(),
+        ["Exported to: out.html"],
+        "TS stderr"
     );
     assert_eq!(
-        normalize(&ts_out.stderr, &sandbox_roots),
-        normalize(&rs_out.stderr, &sandbox_roots),
-        "stderr"
+        rs_out.stdout.lines().collect::<Vec<_>>(),
+        ["Exported to: out.html"],
+        "Rust stdout"
     );
+    assert_eq!(rs_out.stderr, "", "Rust stderr");
     assert!(
         rs_out.stdout.contains("Exported to: out.html"),
         "success line: {}",

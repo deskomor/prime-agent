@@ -14,7 +14,15 @@ for the daemon worker: every compaction arm plus the manual `compact`
 command arm the pa-core trigger, and the quiescent turn boundaries /
 the command path consume the gated review - TS
 `_scheduleAutoRefineAfterCompaction` plus the background
-`_maybeAutoRefine("compact")`).
+`_maybeAutoRefine("compact")`). Each turn reserves its background round
+(`SessionCore::auto_refine_rounds`, a drop guard releases it) at its idle
+transition; the `wait_for_auto_refine_idle` command (ACP session extension
+`wait_auto_refine`, opt-in `autoRefineDrain` at `initialize`) waits that count
+down to zero within its `timeoutMs` (at most five minutes) and answers
+`{ settled }`. It gives a host that closes the session after each prompt a
+way to let a successful round finish and emit its rows; `settled: true` means
+no round is left (none, declined or done), not that a card was written, and
+`settled: false` leaves the round to the host's teardown. `autoRefine.turnInterval` is parsed but is not a trigger here.
 Supervisor process (one worker process per active session), restart/backoff
 supervision, session registry/roster + worker self-registration (session
 identity survives supervisor restarts: workers re-register with backoff and
@@ -243,6 +251,26 @@ broadcast owns its surface here too (the worker's cron-store
 to every client, so any heartbeat mutation anywhere in the daemon reaches
 attached UIs daemon-wide).
 
+Positive-timeout `rlm.collect` waits for the existing native settle funnel within one shared
+budget, including a child whose prompt has not yet been admitted; zero timeout remains a snapshot.
+Child prompts still wait for the spawning parent's terminal turn boundary. A caller cannot wait
+for those children to finish inside that same turn before allowing the boundary to occur.
+
+Prompt admission mirrors core-delivered digest and next-turn prefix rows before
+its raw accepted primary and batch rows. The loop waits for the worker's append
+acknowledgement before proceeding to the model. Prefixes never accept queued
+input; saved host `entryId` rows are not appended again. Setup refusals and aborts before
+prefix delivery retain the raw input; a failed started delivery leaves its untouched batch
+uncommitted. A refused admission write fails without automatic replay into the resident
+live context. `EngineEvent::PromptPrefix` adds a Rust enum variant, not a wire frame.
+`rlm_child_usage_attribution_e2e` checks durable digest/kickoff/reply order and
+spawn-task usage attribution after reopen. Direct human input uses the existing preparing-turn
+label for its Starting preview without joining the visible queue or changing its execution policy.
+The preview clears on primary delivery or terminal refusal; `queue_delivery_e2e` holds a real
+before-start hook to check the preview independently of the prompt RPC acknowledgement.
+The CLI's `interactive_daemon_e2e` also holds that hook until the production submit path
+renders Starting and restores its captured draft after the successful prompt ACK.
+
 Host state access (`agent_engine/host_session.rs`) uses the mirrored live agent
 rather than holding the core-session mutex across an awaited host request.
 The worker owns custom-message persistence; injection adds its canonical row only
@@ -343,6 +371,16 @@ The durable child create payload retains the v1 marker, server configs and paren
 session ID, so initial launch and replay both reach the child's identity binding.
 A child never inherits a parent's native identity. Generic manager ownership and
 non-Studio server behavior remain unchanged.
+
+The inherited `studio_factory` server also gets a per-session credential (host feature
+`studio_mcp_binding`). The session kernel reads it with its descriptor from
+`mcp.studio_binding` and sends it only in the MCP `initialize` capabilities;
+`validate_studio_mcp_credential` answers its generation and native identity, read-only.
+A session replacement inside one worker (`new_session`, `switch_session`, `import_jsonl`,
+`fork`) rotates it under the core lock of the store swap: fresh credential and generation,
+descriptor rebound to the successor, the predecessor's credential refused. The credential
+check and `replace_acp_mcp_servers` take the same core-then-store order. This binds the
+protocol, not the user: a same-user daemon-socket client keeps its power.
 
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.

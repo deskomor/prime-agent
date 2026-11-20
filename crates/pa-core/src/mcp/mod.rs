@@ -310,6 +310,61 @@ pub struct McpManager {
     connection_store: std::sync::Arc<std::sync::Mutex<connection_store::McpConnectionStore>>,
     acp_servers: std::sync::Arc<std::sync::Mutex<HashMap<String, AcpMcpServerConfig>>>,
     acp_owner_id: std::sync::Mutex<Option<String>>,
+    /// The credential of the Studio server this session's ACP owner bound. Lock
+    /// `acp_servers` first, so one read sees a descriptor and its own credential.
+    studio_binding: std::sync::Arc<std::sync::Mutex<Option<StudioBinding>>>,
+}
+
+/// One Studio MCP registration: the bound server, its private credential and
+/// the registration generation. The credential never enters env, snapshots,
+/// `mcp.config` or child templates.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StudioBinding {
+    pub server: String,
+    pub credential: String,
+    pub generation: u64,
+}
+
+impl std::fmt::Debug for StudioBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StudioBinding")
+            .field("server", &self.server)
+            .field("credential", &"<redacted>")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// The Studio sidecar's MCP server name: the one inherited server that is
+/// enrolled for a credential.
+pub const STUDIO_MCP_SERVER: &str = "studio_factory";
+
+/// How a replacement treats the Studio binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StudioUpdate<'a> {
+    /// Keep the binding while its server stays exactly as bound.
+    Keep,
+    /// Bind this stdio server (one of the replacement) to a fresh credential.
+    Bind(&'a str),
+    /// Revoke the binding.
+    Unbind,
+}
+
+/// Registration generations are unique per process, so a revoked binding's
+/// generation is never reused.
+static STUDIO_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn studio_credential() -> anyhow::Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("Studio MCP credential randomness failed: {error}"))?;
+    Ok(bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        }))
 }
 
 impl McpManager {
@@ -365,6 +420,7 @@ impl McpManager {
             connection_store,
             acp_servers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             acp_owner_id: std::sync::Mutex::new(None),
+            studio_binding: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         manager.resolve_integrations();
         manager
@@ -434,23 +490,69 @@ impl McpManager {
 
     /// Replace the ACP-supplied session servers, fenced by owner. `false`
     /// when nothing changed (or the owner does not own what is cleared).
+    /// A change revokes any Studio binding.
     ///
     /// # Errors
     ///
     /// Returns an error when `owner_id` is empty, or two servers share a name.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the ACP owner or ACP server mutexes are poisoned.
     pub fn replace_acp_servers(
         &self,
         servers: &[AcpMcpServerConfig],
         owner_id: &str,
     ) -> anyhow::Result<bool> {
+        self.replace_acp_servers_with_studio(servers, owner_id, StudioUpdate::Keep)
+    }
+
+    /// [`McpManager::replace_acp_servers`] with an explicit Studio binding
+    /// update. `Bind(name)` gives that stdio server (bound by the trusted
+    /// Studio launch) a fresh credential unless the same registration is
+    /// already bound; `Unbind` revokes; `Keep` keeps the binding only while its
+    /// server stays exactly as bound. A clear revokes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `owner_id` is empty, two servers share a name, or
+    /// `studio_server` is not a stdio server in `servers`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ACP owner, ACP server or Studio binding mutexes are poisoned.
+    pub fn replace_acp_servers_with_studio(
+        &self,
+        servers: &[AcpMcpServerConfig],
+        owner_id: &str,
+        studio: StudioUpdate<'_>,
+    ) -> anyhow::Result<bool> {
         if owner_id.is_empty() {
             anyhow::bail!("ACP MCP owner id is required");
         }
-        let owner_fence = self.acp_owner_id.lock().unwrap().clone();
+        let studio_server = match studio {
+            StudioUpdate::Bind(name) => Some(name),
+            StudioUpdate::Keep | StudioUpdate::Unbind => None,
+        };
+        if let Some(name) = studio_server {
+            anyhow::ensure!(
+                servers.iter().any(|server| server.name() == name
+                    && matches!(server, AcpMcpServerConfig::Stdio { .. })),
+                "Studio MCP server {name} is not a stdio server in this registration"
+            );
+        }
+        let mut next: HashMap<String, AcpMcpServerConfig> = HashMap::new();
+        for server in servers {
+            if next.contains_key(server.name()) {
+                anyhow::bail!("Duplicate ACP MCP server: {}", server.name());
+            }
+            next.insert(server.name().to_string(), server.clone());
+        }
+        // Drawn before any lock: a randomness failure changes nothing.
+        let credential = studio_server.map(|_| studio_credential()).transpose()?;
+        let same = |current: &AcpMcpServerConfig, config: &AcpMcpServerConfig| {
+            serde_json::to_value(current).ok() == serde_json::to_value(config).ok()
+        };
+        // One transaction: servers, then binding, then owner, held through the commit.
+        let mut acp_servers = self.acp_servers.lock().unwrap();
+        let mut binding = self.studio_binding.lock().unwrap();
+        let mut owner_fence = self.acp_owner_id.lock().unwrap();
         if servers.is_empty() && owner_fence.as_deref() != Some(owner_id) {
             return Ok(false);
         }
@@ -461,26 +563,104 @@ impl McpManager {
         {
             anyhow::bail!("ACP MCP configuration is owned by another client");
         }
-        let mut next: HashMap<String, AcpMcpServerConfig> = HashMap::new();
-        for server in servers {
-            if next.contains_key(server.name()) {
-                anyhow::bail!("Duplicate ACP MCP server: {}", server.name());
-            }
-            next.insert(server.name().to_string(), server.clone());
-        }
-        let mut acp_servers = self.acp_servers.lock().unwrap();
-        let unchanged = next.len() == acp_servers.len()
+        let servers_unchanged = next.len() == acp_servers.len()
             && next.iter().all(|(name, config)| {
-                acp_servers.get(name).is_some_and(|current| {
-                    serde_json::to_value(current).ok() == serde_json::to_value(config).ok()
-                })
+                acp_servers
+                    .get(name)
+                    .is_some_and(|current| same(current, config))
             });
-        if unchanged {
+        let bound_server = binding.as_ref().map(|bound| bound.server.clone());
+        let binding_unchanged = match studio {
+            StudioUpdate::Keep => true,
+            StudioUpdate::Bind(name) => bound_server.as_deref() == Some(name),
+            StudioUpdate::Unbind => bound_server.is_none(),
+        };
+        if servers_unchanged && binding_unchanged {
             return Ok(false);
         }
+        // Keep holds a binding only while its own server stays exactly as bound.
+        let keeps_binding = matches!(studio, StudioUpdate::Keep)
+            && bound_server.as_deref().is_some_and(|name| {
+                matches!((acp_servers.get(name), next.get(name)), (Some(a), Some(b)) if same(a, b))
+            });
         *acp_servers = next;
-        *self.acp_owner_id.lock().unwrap() = (!servers.is_empty()).then(|| owner_id.to_string());
+        *owner_fence = (!servers.is_empty()).then(|| owner_id.to_string());
+        if !keeps_binding {
+            *binding = studio_server
+                .zip(credential)
+                .map(|(server, credential)| StudioBinding {
+                    server: server.to_string(),
+                    credential,
+                    generation: STUDIO_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1,
+                });
+        }
         Ok(true)
+    }
+
+    /// Give the bound Studio server a fresh credential and generation, and its descriptor
+    /// through `rebind` (the successor's identity and cwd): a session replacement inside one
+    /// worker hands the successor its own binding, so the predecessor's stops validating.
+    /// Unbound stays unbound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no fresh credential can be drawn; the binding is then revoked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ACP server or Studio binding mutexes are poisoned.
+    pub fn rotate_studio_binding(
+        &self,
+        rebind: impl FnOnce(&AcpMcpServerConfig) -> AcpMcpServerConfig,
+    ) -> anyhow::Result<bool> {
+        // Drawn before any lock, as in a registration.
+        let credential = studio_credential();
+        let mut acp_servers = self.acp_servers.lock().unwrap();
+        let mut binding = self.studio_binding.lock().unwrap();
+        let Some(bound) = binding.as_mut() else {
+            return Ok(false);
+        };
+        let credential = match credential {
+            Ok(credential) => credential,
+            Err(error) => {
+                *binding = None;
+                return Err(error);
+            }
+        };
+        if let Some(server) = acp_servers.get_mut(&bound.server) {
+            *server = rebind(server);
+        }
+        bound.credential = credential;
+        bound.generation = STUDIO_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(true)
+    }
+
+    /// The current Studio binding: its server, credential and generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Studio binding mutex is poisoned.
+    #[must_use]
+    pub fn studio_binding(&self) -> Option<StudioBinding> {
+        self.studio_binding.lock().unwrap().clone()
+    }
+
+    /// The generation of the current binding when `credential` matches it,
+    /// compared in constant time. `None` for an unknown or revoked credential.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Studio binding mutex is poisoned.
+    #[must_use]
+    pub fn validate_studio_credential(&self, credential: &str) -> Option<u64> {
+        use subtle::ConstantTimeEq;
+        let binding = self.studio_binding.lock().unwrap();
+        let bound = binding.as_ref()?;
+        // The length is public; the bytes compare in constant time.
+        let same = bound.credential.len() == credential.len()
+            && bool::from(bound.credential.as_bytes().ct_eq(credential.as_bytes()));
+        same.then_some(bound.generation)
     }
 
     /// True when valid credentials exist for the integration (drives enablement).
@@ -641,6 +821,48 @@ impl McpManager {
                 manager.begin_login.clone(),
             )
         };
+        let (studio_servers, studio_binding) = {
+            let manager = manager.lock().unwrap();
+            (manager.acp_servers.clone(), manager.studio_binding.clone())
+        };
+        let studio_binding_for_config = studio_binding.clone();
+        // The owning kernel's own sidecar descriptor and credential, read
+        // together, so a replacement can never pair one generation's secret
+        // with another generation's command.
+        handlers.register(
+            "mcp.studio_binding",
+            host_handler(move |payload| {
+                let studio_servers = studio_servers.clone();
+                let studio_binding = studio_binding.clone();
+                Box::pin(async move {
+                    let server = payload
+                        .data
+                        .get("server")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let servers = studio_servers.lock().unwrap();
+                    let binding = studio_binding.lock().unwrap();
+                    let bound = binding
+                        .as_ref()
+                        .filter(|bound| bound.server == server)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("No Studio binding for MCP server {server}")
+                        })?;
+                    let config = servers.get(server).ok_or_else(|| {
+                        anyhow::anyhow!("No Studio binding for MCP server {server}")
+                    })?;
+                    let mut config = serde_json::to_value(config).map_err(anyhow::Error::new)?;
+                    if let Value::Object(map) = &mut config {
+                        map.insert("credentialSource".to_string(), json!("acp"));
+                    }
+                    Ok(json!({
+                        "config": config,
+                        "credential": bound.credential,
+                        "generation": bound.generation,
+                    }))
+                })
+            }),
+        );
         handlers.register(
             "mcp.refresh",
             host_handler(move |payload| {
@@ -687,6 +909,7 @@ impl McpManager {
             host_handler(move |payload| {
                 let manager = std::sync::Arc::clone(&manager_for_config);
                 let acp_servers = acp_servers_for_config.clone();
+                let studio_binding = studio_binding_for_config.clone();
                 let usage_config = usage_config.clone();
                 Box::pin(async move {
                     let server = payload
@@ -698,11 +921,22 @@ impl McpManager {
                     if server.is_empty() {
                         return Err(anyhow::anyhow!("mcp.config requires a server"));
                     }
-                    let acp = acp_servers.lock().unwrap().get(&server).cloned();
+                    let (acp, studio) = {
+                        let servers = acp_servers.lock().unwrap();
+                        let binding = studio_binding.lock().unwrap();
+                        (
+                            servers.get(&server).cloned(),
+                            binding.as_ref().is_some_and(|bound| bound.server == server),
+                        )
+                    };
                     if let Some(acp) = acp {
                         let mut config = serde_json::to_value(acp).unwrap_or(Value::Null);
                         if let Value::Object(map) = &mut config {
                             map.insert("credentialSource".to_string(), json!("acp"));
+                            // The credential itself only comes from `mcp.studio_binding`.
+                            if studio {
+                                map.insert("studioBinding".to_string(), json!(true));
+                            }
                         }
                         if let Some(report) = &usage_config {
                             report("config", &server);
@@ -1230,6 +1464,205 @@ mod tests {
         assert!(manager.replace_acp_servers(&[], "client-a").unwrap());
         assert_eq!(manager.get_acp_servers().len(), 0);
         assert!(manager.replace_acp_servers(&servers, "").is_err());
+    }
+
+    fn studio_stdio(name: &str, command: &str) -> AcpMcpServerConfig {
+        AcpMcpServerConfig::Stdio {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn studio_rotation_replaces_the_credential_and_rebinds_the_descriptor() {
+        let manager = manager_with(None);
+        assert!(!manager
+            .rotate_studio_binding(AcpMcpServerConfig::clone)
+            .unwrap());
+        let studio = studio_stdio("studio_factory", "node");
+        manager
+            .replace_acp_servers_with_studio(
+                &[studio],
+                "client-a",
+                StudioUpdate::Bind("studio_factory"),
+            )
+            .unwrap();
+        let first = manager.studio_binding().expect("bound");
+        assert!(manager
+            .rotate_studio_binding(|server| match server {
+                AcpMcpServerConfig::Stdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                    ..
+                } => AcpMcpServerConfig::Stdio {
+                    name: name.clone(),
+                    command: command.clone(),
+                    args: args.clone(),
+                    cwd: "/successor".to_string(),
+                    env: env.clone(),
+                },
+                other @ AcpMcpServerConfig::Http { .. } => other.clone(),
+            })
+            .unwrap());
+        let second = manager.studio_binding().expect("still bound");
+        assert_eq!(second.server, "studio_factory");
+        assert_ne!(second.credential, first.credential);
+        assert!(second.generation > first.generation);
+        assert_eq!(manager.validate_studio_credential(&first.credential), None);
+        assert_eq!(
+            manager.validate_studio_credential(&second.credential),
+            Some(second.generation)
+        );
+        let servers = manager.get_acp_servers();
+        assert!(matches!(
+            servers.iter().find(|server| server.name() == "studio_factory"),
+            Some(AcpMcpServerConfig::Stdio { cwd, .. }) if cwd == "/successor"
+        ));
+    }
+
+    #[test]
+    fn studio_binding_follows_the_effective_registration() {
+        let manager = manager_with(None);
+        let studio = studio_stdio("studio_factory", "node");
+        let other = studio_stdio("other", "run");
+        let bind = StudioUpdate::Bind("studio_factory");
+        assert!(manager
+            .replace_acp_servers_with_studio(std::slice::from_ref(&studio), "client-a", bind)
+            .unwrap());
+        let first = manager.studio_binding().expect("bound");
+        assert_eq!(first.server, "studio_factory");
+        assert_eq!(first.credential.len(), 64);
+        assert!(
+            !format!("{first:?}").contains(&first.credential),
+            "Debug redacts"
+        );
+        assert_eq!(
+            manager.validate_studio_credential(&first.credential),
+            Some(first.generation)
+        );
+        assert_eq!(manager.validate_studio_credential("wrong"), None);
+        let mut flipped = first.credential.clone();
+        flipped.replace_range(0..1, if flipped.starts_with('0') { "1" } else { "0" });
+        assert_eq!(manager.validate_studio_credential(&flipped), None);
+
+        // Same registration and binding: a no-op keeps the generation.
+        assert!(!manager
+            .replace_acp_servers_with_studio(std::slice::from_ref(&studio), "client-a", bind)
+            .unwrap());
+        assert!(!manager
+            .replace_acp_servers(std::slice::from_ref(&studio), "client-a")
+            .unwrap());
+        assert_eq!(manager.studio_binding(), Some(first.clone()));
+        // Keep across an unrelated change: the bound server stays exactly as bound.
+        assert!(manager
+            .replace_acp_servers(&[studio.clone(), other.clone()], "client-a")
+            .unwrap());
+        assert_eq!(manager.studio_binding(), Some(first.clone()));
+        // Another owner cannot rebind or clear it.
+        assert!(manager
+            .replace_acp_servers_with_studio(std::slice::from_ref(&studio), "client-b", bind)
+            .is_err());
+        assert!(!manager.replace_acp_servers(&[], "client-b").unwrap());
+        assert_eq!(manager.studio_binding(), Some(first.clone()));
+
+        // A changed Studio command under Keep revokes; a fresh Bind rotates.
+        let moved = studio_stdio("studio_factory", "other-node");
+        assert!(manager
+            .replace_acp_servers(std::slice::from_ref(&moved), "client-a")
+            .unwrap());
+        assert_eq!(manager.studio_binding(), None);
+        assert_eq!(manager.validate_studio_credential(&first.credential), None);
+        assert!(manager
+            .replace_acp_servers_with_studio(std::slice::from_ref(&moved), "client-a", bind)
+            .unwrap());
+        let second = manager.studio_binding().expect("rebound");
+        assert!(second.generation > first.generation);
+        assert_ne!(second.credential, first.credential);
+
+        // An explicit unbind and a clear both revoke.
+        assert!(manager
+            .replace_acp_servers_with_studio(
+                std::slice::from_ref(&moved),
+                "client-a",
+                StudioUpdate::Unbind
+            )
+            .unwrap());
+        assert_eq!(manager.studio_binding(), None);
+        manager
+            .replace_acp_servers_with_studio(std::slice::from_ref(&moved), "client-a", bind)
+            .unwrap();
+        assert!(manager.replace_acp_servers(&[], "client-a").unwrap());
+        assert_eq!(manager.studio_binding(), None);
+        // Binding a missing or non-stdio server fails without changing anything.
+        assert!(manager
+            .replace_acp_servers_with_studio(std::slice::from_ref(&other), "client-a", bind)
+            .is_err());
+        assert!(manager.get_acp_servers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn studio_credential_comes_only_from_its_own_bootstrap_request() {
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(manager_with(None)));
+        let studio = studio_stdio("studio_factory", "node");
+        manager
+            .lock()
+            .unwrap()
+            .replace_acp_servers_with_studio(
+                &[studio.clone(), studio_stdio("other", "run")],
+                "client-a",
+                StudioUpdate::Bind("studio_factory"),
+            )
+            .unwrap();
+        let bound = manager.lock().unwrap().studio_binding().unwrap();
+        let mut handlers = HostRequestHandlers::default();
+        McpManager::register_host_handlers(&manager, &mut handlers);
+        let config = handlers.get("mcp.config").unwrap().clone();
+        let generic = config(crate::kernel::shared::HostRequestPayload {
+            data: json!({ "server": "studio_factory" }),
+        })
+        .await
+        .unwrap();
+        assert_eq!(generic["studioBinding"], true);
+        assert!(!generic.to_string().contains(&bound.credential));
+        let other = config(crate::kernel::shared::HostRequestPayload {
+            data: json!({ "server": "other" }),
+        })
+        .await
+        .unwrap();
+        assert!(other.get("studioBinding").is_none());
+        let bootstrap = handlers.get("mcp.studio_binding").unwrap().clone();
+        let answer = bootstrap(crate::kernel::shared::HostRequestPayload {
+            data: json!({ "server": "studio_factory" }),
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer["credential"], bound.credential);
+        assert_eq!(answer["generation"], bound.generation);
+        assert_eq!(answer["config"]["command"], "node");
+        assert!(answer["config"].get("studioBinding").is_none());
+        assert!(bootstrap(crate::kernel::shared::HostRequestPayload {
+            data: json!({ "server": "other" }),
+        })
+        .await
+        .is_err());
+        manager
+            .lock()
+            .unwrap()
+            .replace_acp_servers(&[], "client-a")
+            .unwrap();
+        assert!(
+            bootstrap(crate::kernel::shared::HostRequestPayload {
+                data: json!({ "server": "studio_factory" }),
+            })
+            .await
+            .is_err(),
+            "a revoked binding has no bootstrap"
+        );
     }
 
     #[tokio::test]

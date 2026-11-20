@@ -65,6 +65,53 @@ pub fn assistant_stop(event: &Value) -> Option<AssistantStop> {
     })
 }
 
+/// The card fields of a saved refinement row (`refinement_outcome` or `refinement_notice`),
+/// copied field by field from its `details`; anything else answers `None`.
+fn refinement_row(message: Option<&Value>) -> Option<super::meta::PrimeAgentRefinementRowMeta> {
+    let message = message?;
+    if message.get("role").and_then(Value::as_str) != Some("custom") {
+        return None;
+    }
+    let custom_type = message.get("customType").and_then(Value::as_str)?;
+    if !matches!(custom_type, "refinement_outcome" | "refinement_notice") {
+        return None;
+    }
+    let details = message.get("details");
+    let text = |value: Option<&Value>, key: &str| {
+        value
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let edits = details
+        .and_then(|details| details.get("edits"))
+        .and_then(Value::as_array)
+        .map(|edits| {
+            edits
+                .iter()
+                .take(50)
+                .map(|edit| super::meta::PrimeAgentRefinementEditMeta {
+                    action: text(Some(edit), "action"),
+                    kind: text(Some(edit), "kind"),
+                    id: text(Some(edit), "id"),
+                    // The same precedence as the reopened card (`entry.title`, then `title`).
+                    title: text(edit.get("entry"), "title").or_else(|| text(Some(edit), "title")),
+                    applied: edit.get("applied").and_then(Value::as_bool),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(super::meta::PrimeAgentRefinementRowMeta {
+        custom_type: custom_type.to_string(),
+        refinement_id: text(details, "refinementId"),
+        summary: text(details, "summary"),
+        scope: text(details, "scope"),
+        source: text(details, "source"),
+        rollback_of: text(details, "rollbackOf"),
+        edits,
+    })
+}
+
 /// Map one daemon session event to zero or more ACP updates.
 pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessionUpdate> {
     let event_type = event
@@ -125,7 +172,16 @@ pub fn wire_updates(event: &Value, state: &mut WireMappingState) -> Vec<AcpSessi
             {
                 state.active_assistant_message_id = None;
             }
-            Vec::new()
+            refinement_row(event.get("message"))
+                .map(|row| {
+                    vec![AcpSessionUpdate::SessionInfoUpdate {
+                        meta: prime_agent_meta(&PrimeAgentSessionMeta {
+                            refinement_row: Some(row),
+                            ..Default::default()
+                        }),
+                    }]
+                })
+                .unwrap_or_default()
         }
         "tool_execution_start" => {
             let tool_call_id = event
@@ -784,6 +840,59 @@ mod tests {
             namespaced(&updates[0])["refinement"],
             json!({ "status": "complete", "summary": "no edits" })
         );
+    }
+
+    #[test]
+    fn saved_refinement_rows_map_their_card_fields_only() {
+        let mut state = WireMappingState::default();
+        let row = |custom_type: &str, source: Option<&str>| {
+            let mut details = json!({
+                "refinementId": "ref-1",
+                "summary": "applied 1 edit",
+                "scope": "local",
+                "rollbackOf": "ref-0",
+                "edits": [{
+                    "action": "create", "kind": "memory", "id": "m1", "applied": true,
+                    "title": "Planned title",
+                    "entry": { "title": "Fixture memory", "content": "SECRET-BODY" },
+                    "before": "SECRET-BEFORE",
+                }],
+            });
+            if let Some(source) = source {
+                details["source"] = json!(source);
+            }
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "custom", "customType": custom_type, "display": true,
+                    "content": "Refinement complete: applied 1 edit", "details": details,
+                },
+            })
+        };
+        let updates = wire_updates(&row("refinement_outcome", None), &mut state);
+        let meta = namespaced(&updates[0])["refinementRow"].clone();
+        assert_eq!(
+            meta,
+            json!({
+                "customType": "refinement_outcome",
+                "refinementId": "ref-1",
+                "summary": "applied 1 edit",
+                "scope": "local",
+                "rollbackOf": "ref-0",
+                "edits": [{
+                    "action": "create", "kind": "memory", "id": "m1",
+                    "title": "Fixture memory", "applied": true,
+                }],
+            })
+        );
+        assert!(!meta.to_string().contains("SECRET"), "{meta}");
+        let notice = wire_updates(&row("refinement_notice", Some("auto")), &mut state);
+        assert_eq!(namespaced(&notice[0])["refinementRow"]["source"], "auto");
+        let other = json!({
+            "type": "message_end",
+            "message": { "role": "custom", "customType": "other", "details": {} },
+        });
+        assert!(wire_updates(&other, &mut state).is_empty());
     }
 
     #[test]

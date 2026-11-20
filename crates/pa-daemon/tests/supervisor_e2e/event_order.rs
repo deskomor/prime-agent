@@ -31,19 +31,20 @@ fn slow_client_reads_turn_events_before_the_reply() {
     let socket = dir.path().join("daemon.sock");
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    // ~15 MB of coalesced `message_update` snapshots over ~3 s at 12000
-    // tokens/s, each growing toward the full 150 KB text: the wire volume
-    // far exceeds any socket buffer, so the write blocks early and most
-    // of the turn's ~200 events start past the slack - still far under
-    // the session-event queue's 4096-frame capacity, so no frame is
-    // dropped.
+    // Coalesced `message_update` snapshots growing toward the full 50 KB text. The
+    // faux provider streams it in 3-5 token chunks, so the turn takes seconds, not
+    // the nominal tokens/rate time. Measured in a debug build: the assistant
+    // message saved ~8 s after the prompt, ~3 MB reached this client, and 47
+    // events started past the slack - far over any socket buffer and the >= 8
+    // floor below, and far under the session-event queue's 4096-frame
+    // capacity. A 150 KB text took ~20 s, past the 20 s reply bound.
     let script_path = dir.path().join("script.json");
     std::fs::write(
         &script_path,
         serde_json::json!({
             "engine": "faux",
             "tokensPerSecond": 12000,
-            "responses": [{ "text": "y".repeat(150_000) }],
+            "responses": [{ "text": "y".repeat(50_000) }],
         })
         .to_string(),
     )

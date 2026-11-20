@@ -27,7 +27,6 @@ pub(crate) struct ExecutedToolCallBatch {
 pub(crate) struct FinalizedToolCallOutcome {
     pub(crate) tool_call: ToolCall,
     pub(crate) result: AgentToolResult,
-    pub(crate) is_error: bool,
 }
 
 /// Tool lookup by name; exact matches win over alias-based dispatch.
@@ -114,10 +113,9 @@ async fn execute_tool_calls_sequential(
         .await;
         let mut executed_input = tool_call.arguments.clone();
         let finalized = match preparation {
-            Preparation::Immediate { result, is_error } => FinalizedToolCallOutcome {
+            Preparation::Immediate(result) => FinalizedToolCallOutcome {
                 tool_call: tool_call.clone(),
                 result,
-                is_error,
             },
             Preparation::Prepared(prepared) => {
                 executed_input = prepared.args.clone();
@@ -162,6 +160,14 @@ async fn execute_tool_calls_sequential(
     })
 }
 
+enum ParallelToolEntry {
+    Task(tokio::task::JoinHandle<anyhow::Result<(FinalizedToolCallOutcome, serde_json::Value)>>),
+    // Boxed: the finalized outcome holds the tool call's ordered
+    // argument map (insertion-ordered for wire parity), which dwarfs
+    // the join handle and would trip `large_enum_variant`.
+    Outcome(Box<FinalizedToolCallOutcome>, serde_json::Value),
+}
+
 /// `tool_execution_end` is emitted in completion order (from inside the
 /// concurrent tasks), while tool-result message events are emitted afterwards
 /// in assistant source order, matching the TS reference.
@@ -173,17 +179,7 @@ async fn execute_tool_calls_parallel(
     signal: Option<&AbortSignal>,
     emit: &AgentEventSink,
 ) -> anyhow::Result<ExecutedToolCallBatch> {
-    enum TaskOrOutcome {
-        Task(
-            tokio::task::JoinHandle<anyhow::Result<(FinalizedToolCallOutcome, serde_json::Value)>>,
-        ),
-        // Boxed: the finalized outcome holds the tool call's ordered
-        // argument map (insertion-ordered for wire parity), which dwarfs
-        // the join handle and would trip `large_enum_variant`.
-        Outcome(Box<FinalizedToolCallOutcome>, serde_json::Value),
-    }
-
-    let mut entries: Vec<TaskOrOutcome> = Vec::new();
+    let mut entries: Vec<ParallelToolEntry> = Vec::new();
 
     for tool_call in tool_calls {
         emit(AgentEvent::ToolExecutionStart {
@@ -202,14 +198,13 @@ async fn execute_tool_calls_parallel(
         )
         .await;
         match preparation {
-            Preparation::Immediate { result, is_error } => {
+            Preparation::Immediate(result) => {
                 let finalized = FinalizedToolCallOutcome {
                     tool_call: tool_call.clone(),
                     result,
-                    is_error,
                 };
                 emit_tool_execution_end(&finalized, emit).await?;
-                entries.push(TaskOrOutcome::Outcome(
+                entries.push(ParallelToolEntry::Outcome(
                     Box::new(finalized),
                     tool_call.arguments.clone(),
                 ));
@@ -220,11 +215,6 @@ async fn execute_tool_calls_parallel(
                 let context = clone_context(current_context);
                 let config = config.clone();
                 let signal = signal.cloned().unwrap_or_default();
-                let prepared = PreparedToolCall {
-                    tool_call: prepared.tool_call.clone(),
-                    tool: Arc::clone(&prepared.tool),
-                    args: prepared.args.clone(),
-                };
                 let handle = tokio::spawn(async move {
                     let executed = execute_prepared_tool_call(
                         &prepared,
@@ -245,7 +235,7 @@ async fn execute_tool_calls_parallel(
                     emit_tool_execution_end(&finalized, &sink).await?;
                     Ok((finalized, prepared.args))
                 });
-                entries.push(TaskOrOutcome::Task(handle));
+                entries.push(ParallelToolEntry::Task(handle));
             }
         }
     }
@@ -255,8 +245,8 @@ async fn execute_tool_calls_parallel(
     let mut executed_inputs = Vec::new();
     for entry in entries {
         let (finalized, executed_input) = match entry {
-            TaskOrOutcome::Outcome(finalized, executed_input) => (*finalized, executed_input),
-            TaskOrOutcome::Task(handle) => handle.await.map_err(|error| {
+            ParallelToolEntry::Outcome(finalized, executed_input) => (*finalized, executed_input),
+            ParallelToolEntry::Task(handle) => handle.await.map_err(|error| {
                 anyhow::anyhow!("Parallel tool execution task failed: {error}")
             })??,
         };
@@ -294,10 +284,7 @@ async fn execute_tool_calls_parallel(
 
 pub(crate) enum Preparation {
     Prepared(PreparedToolCall),
-    Immediate {
-        result: AgentToolResult,
-        is_error: bool,
-    },
+    Immediate(AgentToolResult),
 }
 
 pub(crate) struct PreparedToolCall {

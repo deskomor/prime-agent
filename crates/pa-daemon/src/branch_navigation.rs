@@ -33,6 +33,8 @@ pub(crate) struct TreeNavigation {
     abort: Mutex<Option<Arc<AbortController>>>,
     /// The host's `session_before_tree` hook (`crate::host_hooks`).
     host_hooks: std::sync::OnceLock<Arc<crate::host_hooks::HostHookBroker>>,
+    /// The session's MCP store: a fork rotates its Studio binding onto the successor.
+    studio_mcp: std::sync::OnceLock<Arc<Mutex<pa_core::mcp::McpManager>>>,
 }
 
 impl TreeNavigation {
@@ -47,7 +49,13 @@ impl TreeNavigation {
             idle_notify,
             abort: Mutex::new(None),
             host_hooks: std::sync::OnceLock::new(),
+            studio_mcp: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bind the session's MCP store (`studio_binding` rotation on fork).
+    pub(crate) fn set_studio_mcp(&self, manager: Arc<Mutex<pa_core::mcp::McpManager>>) {
+        let _ = self.studio_mcp.set(manager);
     }
 
     /// Bind the worker's host hooks (`session_before_tree`).
@@ -154,7 +162,41 @@ impl TreeNavigation {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // Snapshot the tree state under one lock pass; the model call below runs without it.
+        // Early rejection and the no-op check only; the move itself reads the store again below.
+        let (current_leaf, requested_session) = {
+            let core = self.core.lock().unwrap();
+            let Some(store) = core.store.as_ref() else {
+                return response_failure(
+                    None,
+                    "navigate_tree",
+                    "Session is still initializing",
+                    None,
+                );
+            };
+            if store.entry(target_id).is_none() {
+                return response_failure(
+                    None,
+                    "navigate_tree",
+                    &format!("Entry {target_id} not found"),
+                    None,
+                );
+            }
+            (
+                store.leaf_id().map(str::to_string),
+                store.session_id().to_string(),
+            )
+        };
+        // No-op when already at the target (TS checks before pausing work).
+        if Some(target_id) == current_leaf.as_deref() {
+            return response_success(None, "navigate_tree", Some(json!({ "cancelled": false })));
+        }
+        // A navigation interrupts the running turn first (TS
+        // `acquireQueuedWorkPause` + `waitForIdle`).
+        self.wait_turn_end().await;
+
+        // The tree state the move commits against, read after the interrupted turn ended so
+        // the summary and `oldLeafId` include that turn's rows. The model call below runs
+        // without the lock; the commit refuses a leaf that moved meanwhile.
         let (target, old_leaf, entries, session_id) = {
             let core = self.core.lock().unwrap();
             let Some(store) = core.store.as_ref() else {
@@ -173,17 +215,26 @@ impl TreeNavigation {
                     None,
                 );
             };
-            let old_leaf = store.leaf_id().map(str::to_string);
-            let entries = store.entries().to_vec();
-            (target, old_leaf, entries, store.session_id().to_string())
+            (
+                target,
+                store.leaf_id().map(str::to_string),
+                store.entries().to_vec(),
+                store.session_id().to_string(),
+            )
         };
-        // No-op when already at the target (TS checks before pausing work).
+        // A replacement during the wait installed another session, which may share entry IDs
+        // (a fork); the move was asked of the session read above, never of its successor.
+        if session_id != requested_session {
+            return response_failure(
+                None,
+                "navigate_tree",
+                "The conversation changed during the move; nothing was moved.",
+                None,
+            );
+        }
         if Some(target_id) == old_leaf.as_deref() {
             return response_success(None, "navigate_tree", Some(json!({ "cancelled": false })));
         }
-        // A navigation interrupts the running turn first (TS
-        // `acquireQueuedWorkPause` + `waitForIdle`).
-        self.wait_turn_end().await;
 
         let (new_leaf, editor_text) = navigation_point(&target);
 
@@ -248,6 +299,7 @@ impl TreeNavigation {
                 let outcome = {
                     let engine = Arc::clone(&self.engine);
                     let signal = controller.signal();
+                    let session_id = session_id.clone();
                     tokio::task::spawn_blocking(move || {
                         engine.run_branch_summary(
                             BranchSummaryRequest {
@@ -306,6 +358,16 @@ impl TreeNavigation {
                     None,
                 );
             };
+            // A prompt admitted during the hooks or the summary moved the leaf, or a replacement
+            // installed another session; moving now would apply the old snapshot to it.
+            if store.session_id() != session_id || store.leaf_id() != old_leaf.as_deref() {
+                return response_failure(
+                    None,
+                    "navigate_tree",
+                    "The conversation changed during the move; nothing was moved.",
+                    None,
+                );
+            }
             let mut summary_entry = None;
             if let Some((summary, usage, details, model)) = summary {
                 match store.append_branch_summary(
@@ -519,7 +581,11 @@ impl TreeNavigation {
                     });
                 forked.trace_upload.clone_from(&transferred);
             }
-            (core.store.replace(forked), transferred)
+            let previous = core.store.replace(forked);
+            if let Some(studio_mcp) = self.studio_mcp.get() {
+                crate::worker::create::rotate_studio_mcp_for_successor(studio_mcp, &core);
+            }
+            (previous, transferred)
         };
         if let Some(traces) = &transferred {
             // The fork was rewritten before its controller existed; the

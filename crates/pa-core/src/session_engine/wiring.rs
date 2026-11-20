@@ -135,6 +135,10 @@ impl AgentSession {
     }
 
     /// The exact latest context representation a provider or budget consumer applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host hooks lock is poisoned.
     #[must_use]
     pub fn context_projection_snapshot(&self, purpose: &str) -> Option<serde_json::Value> {
         self.host_hooks

@@ -26,5 +26,12 @@ canonical `entryId`: idle rows append to live context; active rows enter steerin
 Run settlement retains any host row arriving after the last steering poll in the
 idle transcript rather than leaving it queued for an unrelated turn.
 
+
+Tools may return structured failures through `AgentToolResult::is_error` without losing
+content, details or termination hints. The flag defaults false; `after_tool_call`
+overrides update the result itself, and final events, messages and exchanges derive
+their error flag from that result. This adds a public Rust result field; successful
+serialized results keep their previous shape.
+
 ## Depends on
 No workspace dependencies.

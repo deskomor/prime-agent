@@ -175,6 +175,11 @@ impl Stage {
     }
 }
 
+/// Whether the stage after `index` writes the kitty capability reply.
+fn answers_next(stages: &[Stage], index: usize) -> bool {
+    matches!(stages.get(index + 1), Some(Stage::Write(payload)) if *payload == KITTY_ANSWER)
+}
+
 /// The stage list per route, from spawn to exit. The late-answer route
 /// answers only after the exit's pop; the force-quit route stalls the drain.
 fn route_stages(route: Route, known_terminal: bool) -> Vec<Stage> {
@@ -274,7 +279,10 @@ fn run_route(route: Route, known_terminal: bool) {
                     harness.write(b"\x03");
                     std::thread::sleep(Duration::from_millis(400));
                     harness.write(b"\x03");
-                } else if !last {
+                } else if !(last || needle == KITTY_QUERY && answers_next(&stages, index)) {
+                    // The capability reply goes out at once after the query: a quiet-window
+                    // drain there (>= 150 ms, reset by every redraw) can outlast the probe's
+                    // 250 ms.
                     harness.drain_until_quiet(6);
                 }
             }

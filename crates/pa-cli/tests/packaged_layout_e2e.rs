@@ -330,8 +330,7 @@ fn packaged_binary_reports_manifest_version() {
     let build = pa_daemon::protocol::build_identity();
     let dirty = build["dirty"]
         .as_bool()
-        .map(|dirty| dirty.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |dirty| dirty.to_string());
     let expected = format!(
         "build: {} dirty: {dirty}",
         build["commit"].as_str().unwrap_or("unknown")

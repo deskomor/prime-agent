@@ -106,7 +106,7 @@ mod worker;
 pub use command::{
     CycleDirection, DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType,
     DaemonCommandWire, DaemonSessionLifecycle, ForkPosition, PromptInput, StreamingBehavior,
-    TranscriptPage,
+    StudioCredential, TranscriptPage,
 };
 pub use outbound::{
     DaemonClosingReason, DaemonErrorInfo, DaemonEventEnvelope, DaemonOutbound,

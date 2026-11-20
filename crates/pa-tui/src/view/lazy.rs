@@ -460,6 +460,7 @@ impl AgentView {
         let mut touched = Vec::new();
         let mut splash: Option<std::sync::Arc<Vec<Line>>> = None;
         let mut tail: Option<std::sync::Arc<Vec<Line>>> = None;
+        let mut entry_rows: Option<(usize, EntryRows)> = None;
         let last = self.chat.len() + 1;
         let (mut section, mut row, mut movement) = if let Some((section, row)) = window.cursor {
             (section, row, window.pending)
@@ -503,7 +504,16 @@ impl AgentView {
                 return EntryRows::Fresh(tail.clone());
             }
             touched.push(section - 1);
-            view.sparse_entry_rows(section - 1, width)
+            // Reuse the measured entry when this walk paints the same revision.
+            let rows = entry_rows
+                .take()
+                .filter(|(cached_section, _)| *cached_section == section)
+                .map_or_else(
+                    || view.sparse_entry_rows(section - 1, width),
+                    |(_, rows)| rows,
+                );
+            entry_rows = Some((section, rows.clone()));
+            rows
         };
         while movement < 0 {
             let step = row.min(movement.unsigned_abs());

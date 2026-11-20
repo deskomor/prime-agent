@@ -70,6 +70,7 @@ impl AgentSessionEngine {
         &self,
         agent: &std::sync::Arc<pa_agent::agent::Agent>,
         prompt: &TurnPrompt,
+        accepted_rows: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<EngineEvent>>>,
         first_attempt: bool,
         boundary_passed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         pending_model_changes: &std::sync::Arc<
@@ -78,7 +79,22 @@ impl AgentSessionEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+        // One FIFO preserves event order; prompt deliveries await worker persistence.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+            EngineEvent,
+            Option<tokio::sync::oneshot::Sender<bool>>,
+        )>();
+        let accepted_rows = std::sync::Arc::clone(accepted_rows);
+        // Match the injected primary exactly once; unrelated custom rows still forward.
+        let accepted_echo = std::sync::Arc::new(std::sync::Mutex::new(
+            match (prompt, accepted_rows.lock().unwrap().is_empty()) {
+                (TurnPrompt::Injected(message), false) => {
+                    serde_json::to_value(pa_types::session::AgentMessage::Custom(message.clone()))
+                        .ok()
+                }
+                (TurnPrompt::User { .. }, _) | (TurnPrompt::Injected(_), true) => None,
+            },
+        ));
         // Goal usage accounting at the message_end hook: each settled non-error
         // assistant message records its token delta, from the engine mirror.
         let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
@@ -89,6 +105,7 @@ impl AgentSessionEngine {
         let boundary_passed = std::sync::Arc::clone(boundary_passed);
         let subscription = {
             let tx = tx.clone();
+            let accepted_rows = std::sync::Arc::clone(&accepted_rows);
             let pending_model_changes = pending_model_changes.clone();
             let boundary_passed = std::sync::Arc::clone(&boundary_passed);
             let autonomous_state = std::sync::Arc::clone(&self.autonomous);
@@ -101,12 +118,14 @@ impl AgentSessionEngine {
             agent
                 .subscribe(move |event, _signal| {
                     let tx = tx.clone();
+                    let accepted_rows = std::sync::Arc::clone(&accepted_rows);
                     let pending_model_changes = pending_model_changes.clone();
                     let boundary_passed = std::sync::Arc::clone(&boundary_passed);
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
                     let goal_runtime = goal_runtime.clone();
                     let goal_budget_crossed = goal_budget_crossed.clone();
+                    let accepted_echo = std::sync::Arc::clone(&accepted_echo);
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
                         if let AgentEvent::MessageEnd {
@@ -171,10 +190,10 @@ impl AgentSessionEngine {
                                     )
                                 ) {
                                     if let Some(value) = session_wire_value(agent_message) {
-                                        let _ = tx.send(EngineEvent::AssistantUpdate {
+                                        let _ = tx.send((EngineEvent::AssistantUpdate {
                                             message: AssistantSnapshot::Wire(value),
                                             stream_event: Some(json!({ "type": "start" })),
-                                        });
+                                        }, None));
                                     }
                                 }
                             }
@@ -188,12 +207,12 @@ impl AgentSessionEngine {
                                         pa_agent::types::Message::Assistant(_)
                                     )
                                 ) {
-                                    let _ = tx.send(EngineEvent::AssistantUpdate {
+                                    let _ = tx.send((EngineEvent::AssistantUpdate {
                                         message: AssistantSnapshot::Loop(std::sync::Arc::clone(
                                             agent_message,
                                         )),
                                         stream_event: stream_event_value(stream_event),
-                                    });
+                                    }, None));
                                 }
                             }
                             AgentEvent::MessageEnd {
@@ -218,28 +237,67 @@ impl AgentSessionEngine {
                                             } else {
                                                 EngineEvent::AssistantMessage(value)
                                             };
-                                            let _ = tx.send(event);
+                                            let _ = tx.send((event, None));
                                             for change in pending_model_changes.lock()
                                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                                 .drain(..) {
-                                                let _ = tx.send(EngineEvent::ModelChange(change));
+                                                let _ = tx.send((EngineEvent::ModelChange(change), None));
                                             }
                                         }
                                     }
-                                    // An in-run continuation's user row: the
-                                    // `boundary_passed` gate separates it from
-                                    // the admitted prompt's row, which the loop
-                                    // already emitted.
-                                    pa_agent::types::AgentMessage::Standard(
-                                        pa_agent::types::Message::User(_),
-                                    ) if boundary_passed
-                                        .load(std::sync::atomic::Ordering::SeqCst) =>
-                                    {
+                                    pa_agent::types::AgentMessage::Custom(custom) => {
                                         if let Some(value) = session_wire_value(agent_message) {
-                                            let _ = tx.send(EngineEvent::UserMessage(value));
+                                            let is_echo = {
+                                                let mut echo = accepted_echo.lock().unwrap();
+                                                if echo.as_ref() == Some(&value) {
+                                                    echo.take();
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            };
+                                            let delivery = {
+                                                let mut accepted = accepted_rows.lock().unwrap();
+                                                if is_echo {
+                                                    accepted.pop_front()
+                                                } else if custom.payload.get("entryId").is_some() {
+                                                    // Host append already persisted and broadcast this row.
+                                                    None
+                                                } else if !accepted.is_empty() {
+                                                    Some(EngineEvent::PromptPrefix(value))
+                                                } else {
+                                                    Some(EngineEvent::CustomMessage(value))
+                                                }
+                                            };
+                                            if let Some(delivery) = delivery {
+                                                let (ack, received) = tokio::sync::oneshot::channel();
+                                                tx.send((delivery, Some(ack)))?;
+                                                if !received.await.unwrap_or(false) {
+                                                    anyhow::bail!("prompt message persistence refused");
+                                                }
+                                            }
                                         }
                                     }
-                                    _ => {}
+                                    pa_agent::types::AgentMessage::Standard(
+                                        pa_agent::types::Message::User(_),
+                                    ) => {
+                                        // Digest and next-turn prefixes are Custom loop rows.
+                                        // The first User is the primary, then its batch follows.
+                                        let accepted = accepted_rows.lock().unwrap().pop_front();
+                                        if let Some(delivery) = accepted {
+                                            let (ack, received) = tokio::sync::oneshot::channel();
+                                            tx.send((delivery, Some(ack)))?;
+                                            if !received.await.unwrap_or(false) {
+                                                anyhow::bail!("prompt message persistence refused");
+                                            }
+                                        } else if boundary_passed
+                                            .load(std::sync::atomic::Ordering::SeqCst)
+                                        {
+                                            if let Some(value) = session_wire_value(agent_message) {
+                                                let _ = tx.send((EngineEvent::UserMessage(value), None));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             // The loop-boundary frames: the run-opening frames stay with the
@@ -247,12 +305,12 @@ impl AgentSessionEngine {
                             // the terminal message plus tool results, `agent_end` the whole set.
                             AgentEvent::TurnStart => {
                                 if boundary_passed.load(std::sync::atomic::Ordering::SeqCst) {
-                                    let _ = tx.send(EngineEvent::TurnStart);
+                                    let _ = tx.send((EngineEvent::TurnStart, None));
                                 }
                             }
                             AgentEvent::AgentStart => {
                                 if boundary_passed.load(std::sync::atomic::Ordering::SeqCst) {
-                                    let _ = tx.send(EngineEvent::AgentStart);
+                                    let _ = tx.send((EngineEvent::AgentStart, None));
                                 }
                             }
                             AgentEvent::AgentEnd { messages } => {
@@ -261,7 +319,7 @@ impl AgentSessionEngine {
                                     .filter_map(session_wire_value)
                                     .collect::<Vec<Value>>();
                                 boundary_passed.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = tx.send(EngineEvent::AgentEnd { messages });
+                                let _ = tx.send((EngineEvent::AgentEnd { messages }, None));
                             }
                             AgentEvent::TurnEnd {
                                 message,
@@ -278,10 +336,10 @@ impl AgentSessionEngine {
                                         .collect::<Vec<Value>>();
                                     boundary_passed
                                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    let _ = tx.send(EngineEvent::TurnEnd {
+                                    let _ = tx.send((EngineEvent::TurnEnd {
                                         message,
                                         tool_results,
-                                    });
+                                    }, None));
                                 }
                             }
                             AgentEvent::ToolExecutionStart {
@@ -289,11 +347,11 @@ impl AgentSessionEngine {
                                 tool_name,
                                 args,
                             } => {
-                                let _ = tx.send(EngineEvent::ToolExecutionStart {
+                                let _ = tx.send((EngineEvent::ToolExecutionStart {
                                     tool_call_id: tool_call_id.clone(),
                                     tool_name: tool_name.clone(),
                                     args: args.clone(),
-                                });
+                                }, None));
                             }
                             AgentEvent::ToolExecutionProgress { .. } => {}
                             AgentEvent::ToolExecutionUpdate {
@@ -301,10 +359,10 @@ impl AgentSessionEngine {
                                 partial_result,
                                 ..
                             } => {
-                                let _ = tx.send(EngineEvent::ToolExecutionUpdate {
+                                let _ = tx.send((EngineEvent::ToolExecutionUpdate {
                                     tool_call_id: tool_call_id.clone(),
                                     partial_result: tool_result_wire_value(partial_result),
-                                });
+                                }, None));
                             }
                             AgentEvent::ToolExecutionEnd {
                                 tool_call_id,
@@ -312,11 +370,11 @@ impl AgentSessionEngine {
                                 is_error,
                                 ..
                             } => {
-                                let _ = tx.send(EngineEvent::ToolExecutionEnd {
+                                let _ = tx.send((EngineEvent::ToolExecutionEnd {
                                     tool_call_id: tool_call_id.clone(),
                                     result: tool_result_wire_value(result),
                                     is_error: *is_error,
-                                });
+                                }, None));
                             }
                         }
                         Ok(())
@@ -394,12 +452,27 @@ impl AgentSessionEngine {
         let mut aborted = false;
         let mut admission_error: Option<anyhow::Error> = None;
         let mut settled = false;
+        let mut deliver = |event, admission: bool| {
+            if admission {
+                tokio::task::block_in_place(|| emit(event))
+            } else {
+                emit(event)
+            }
+        };
         loop {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Some(event) => {
-                            if !emit(event) {
+                        Some((event, ack)) => {
+                            let persisted = if aborted && ack.is_some() {
+                                false
+                            } else {
+                                deliver(event, ack.is_some())
+                            };
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
+                            }
+                            if !persisted {
                                 aborted = true;
                             }
                         }
@@ -412,29 +485,42 @@ impl AgentSessionEngine {
                         Ok(()) => {}
                         Err(error) => admission_error = Some(error),
                     }
-                    while let Ok(event) = rx.try_recv() {
-                        if !emit(event) {
+                    while let Ok((event, ack)) = rx.try_recv() {
+                        let persisted = if aborted && ack.is_some() {
+                            false
+                        } else {
+                            deliver(event, ack.is_some())
+                        };
+                        if let Some(ack) = ack {
+                            let _ = ack.send(persisted);
+                        }
+                        if !persisted {
                             aborted = true;
                             break;
                         }
                     }
                 }
             }
-            if aborted || settled {
+            if settled {
                 break;
             }
-        }
-        if aborted && !settled {
-            // The emit callback cancelled the turn: stop the still-running
-            // admission and wait out its abort path. A settled admission
-            // must not be re-polled (pinned futures panic after completion).
-            agent.abort();
-            let _ = (&mut admitted).await;
+            if aborted {
+                // Keep draining the FIFO during abort: listeners must receive
+                // refusals, while the worker still accepts abort-settle frames.
+                agent.abort();
+            }
         }
         // The settled run's tail still holds the aborted assistant row: drain
         // every queued event.
-        while let Ok(event) = rx.try_recv() {
-            let _ = emit(event);
+        while let Ok((event, ack)) = rx.try_recv() {
+            let persisted = if aborted && ack.is_some() {
+                false
+            } else {
+                deliver(event, ack.is_some())
+            };
+            if let Some(ack) = ack {
+                let _ = ack.send(persisted);
+            }
         }
         let () = subscription.unsubscribe().await;
         if aborted {

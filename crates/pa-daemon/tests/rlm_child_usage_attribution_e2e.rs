@@ -410,6 +410,37 @@ fn child_usage_attributed_row_reaches_the_parent_transcript() {
         std::thread::sleep(Duration::from_millis(200));
     };
 
+    let child_rows = transcript_rows(&child_session_file);
+    let digest_index = child_rows
+        .iter()
+        .position(|entry| {
+            entry["type"] == "custom_message" && entry["customType"] == "harness_digest"
+        })
+        .expect("the child's durable harness digest");
+    let kickoffs: Vec<usize> = child_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry["type"] == "custom_message"
+                && entry["customType"] == "agent_message"
+                && entry["details"]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("spawn:"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let [kickoff_index] = kickoffs[..] else {
+        panic!("exactly one durable spawn kickoff: {child_rows:?}");
+    };
+    let assistant_index = child_rows
+        .iter()
+        .position(|entry| entry["type"] == "message" && entry["message"]["role"] == "assistant")
+        .expect("the child's durable assistant reply");
+    assert!(
+        digest_index < kickoff_index && kickoff_index < assistant_index,
+        "the durable child order is digest, kickoff, assistant: {child_rows:?}"
+    );
+
     // The target names an assistant message row in the same file, and that
     // row is the spawn's issuer (the ipython tool call that ran the cell).
     let rows = transcript_rows(Path::new(&parent_session_file));

@@ -928,15 +928,41 @@ async fn a_collect_while_the_task_prompt_is_in_flight_does_not_settle_the_child(
         in_flight[0].status
     );
 
+    let budget_ms = 100;
+    let started = Instant::now();
+    let timed_out = sessions
+        .collect(vec![handle.rlm_child_id.clone()], budget_ms)
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(budget_ms),
+        "pre-admission idle must not end a positive collect budget"
+    );
+    assert!(!timed_out[0].settled);
+
+    let wake_started = Instant::now();
+    let mut collecting = sessions.collect(vec![handle.rlm_child_id.clone()], 10_000);
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(collecting.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
     gate.release.notify_one();
+    let settled = collecting
+        .await
+        .expect("collect after the prompt is released");
+    assert!(
+        wake_started.elapsed() < Duration::from_secs(10),
+        "settlement must wake collect before its deadline"
+    );
     tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
         .await
         .expect("the run settles once the prompt lands")
         .expect("follow_up channel open");
-    let settled = sessions
-        .collect(vec![handle.rlm_child_id.clone()], 0)
-        .await
-        .expect("collect after the settle");
+    assert!(
+        settled[0].settled,
+        "positive collect waits for the native settle funnel"
+    );
     assert_eq!(settled[0].status, "done");
     assert_eq!(
         settled[0].answer_text.as_deref(),

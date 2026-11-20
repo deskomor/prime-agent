@@ -32,7 +32,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
 /// How long one request waits for an answer before it is denied.
-pub(crate) const TOOL_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const TOOL_PERMISSION_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// The reason the model reads when the host denies a call.
 pub(crate) const TOOL_PERMISSION_DENIED: &str = "The user denied this tool call.";

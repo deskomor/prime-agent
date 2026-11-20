@@ -33,6 +33,9 @@ pub(crate) struct SessionCore {
     pub(crate) shutdown_requested: bool,
     /// True while a compaction run is in flight (TS `isCompacting`).
     pub(crate) compacting: bool,
+    /// Background auto-refinement rounds reserved at a turn's idle transition
+    /// and not finished yet (`wait_for_auto_refine_idle` waits them down to 0).
+    pub(crate) auto_refine_rounds: usize,
     /// The turn's tool calls in flight, keyed by tool-call id: the
     /// roster summary derives `isRunningTools` from its size.
     pub(crate) running_tool_calls: std::collections::HashSet<String>,
@@ -133,6 +136,7 @@ impl SessionCore {
             shutdown_requested: false,
             last_activity_ms: 0,
             compacting: false,
+            auto_refine_rounds: 0,
             running_tool_calls: std::collections::HashSet::new(),
             running_admission_ids: std::collections::HashSet::new(),
             tool_use_count: 0,

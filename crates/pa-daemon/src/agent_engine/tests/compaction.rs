@@ -1087,16 +1087,19 @@ fn compact_session_command_emits_the_result_on_success() {
         serde_json::json!({ "readFiles": [], "modifiedFiles": [] })
     );
     assert!(result.get("usage").is_none());
-    // The durable rows stay minimal (TS's queued `/compact` catch arm
-    // records no result row): the echo row is the only custom row —
-    // except the kernel-dependent `ipython_state` notice, scoped out of
-    // this assertion.
+    // The harness digest and command echo persist as custom messages, as in TS.
+    // Compaction adds no result row; the kernel-dependent ipython notice is separate.
     let rows: Vec<_> = custom_rows(&events)
         .into_iter()
         .filter(|row| row["customType"] != "ipython_state")
         .collect();
-    assert_eq!(rows.len(), 1, "the /compact echo only: {rows:?}");
-    assert_eq!(rows[0]["customType"], "session_slash_command");
+    assert_eq!(
+        rows.iter()
+            .map(|row| &row["customType"])
+            .collect::<Vec<_>>(),
+        vec![&json!("harness_digest"), &json!("session_slash_command")],
+        "the harness digest and /compact echo only: {rows:?}"
+    );
 }
 
 #[test]

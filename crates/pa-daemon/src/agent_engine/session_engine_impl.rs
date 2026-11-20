@@ -1300,7 +1300,8 @@ impl SessionEngine for AgentSessionEngine {
         let model = self.resolve_model()?;
         self.ensure_core_session(&model)?;
         let api_key = self.resolve_request_api_key(&model);
-        let global_harness_dir = self.config.agent_dir.clone();
+        let global_harness_dir =
+            pa_core::refinement::get_global_harness_state_dir(&self.config.agent_dir);
         // The lock covers the clone only; the model call below must not ride it.
         let core = self
             .session
@@ -1396,7 +1397,7 @@ impl SessionEngine for AgentSessionEngine {
         if request.message.starts_with("/skill:") {
             request.message = self.expand_skill_submission(&request.message);
         }
-        // The batched rows expand in place BEFORE the accepted rows emit:
+        // The batched rows expand in place before admission:
         // the core's batch admission re-expands each row itself, so the raw
         // command must never reach it.
         for row in &mut request.batch {
@@ -1427,12 +1428,15 @@ impl SessionEngine for AgentSessionEngine {
             // turn it drives — one representation (unchanged `/goal` stays
             // silent).
             if let Some(message) = execution.continuation_message {
-                if !emit(EngineEvent::CustomMessage(
+                let accepted = EngineEvent::CustomMessage(
                     crate::session_commands::custom_message_value(&message),
-                )) {
-                    return;
-                }
-                self.run_turns(TurnPrompt::Injected(message), aborted, &mut emit);
+                );
+                self.run_turns(
+                    TurnPrompt::Injected(message),
+                    vec![accepted],
+                    aborted,
+                    &mut emit,
+                );
             } else {
                 emit(EngineEvent::Done(Ok(())));
             }
@@ -1460,8 +1464,8 @@ impl SessionEngine for AgentSessionEngine {
             }
             None => None,
         };
-        // The accepted turn row: an injected custom row replaces the user
-        // message; the plain turn records the accepted row, images after.
+        // Retain the raw accepted rows until core admission delivers them,
+        // after its digest and next-turn prefixes. Images keep their wire shape.
         let accepted = if let Some(custom) = &request.custom_message {
             EngineEvent::CustomMessage(custom.clone())
         } else {
@@ -1482,9 +1486,7 @@ impl SessionEngine for AgentSessionEngine {
                 "timestamp": now_millis(),
             }))
         };
-        if !emit(accepted) {
-            return;
-        }
+        let mut accepted_rows = vec![accepted];
         // The batched co-delivery rows: one accepted user row per batched
         // message, in delivery order, already expanded above.
         for row in &request.batch {
@@ -1500,13 +1502,11 @@ impl SessionEngine for AgentSessionEngine {
                 }
                 content.push(block);
             }
-            if !emit(EngineEvent::UserMessage(json!({
+            accepted_rows.push(EngineEvent::UserMessage(json!({
                 "role": "user",
                 "content": content,
                 "timestamp": now_millis(),
-            }))) {
-                return;
-            }
+            })));
         }
         let turn_prompt = match injected {
             Some(custom) => TurnPrompt::Injected(custom),
@@ -1526,10 +1526,15 @@ impl SessionEngine for AgentSessionEngine {
             TurnPrompt::Injected(message) => Self::custom_message_carries_images(message),
         };
         if let Err(refusal) = self.arm_image_turn_route(carries_images) {
+            for row in accepted_rows {
+                if !emit(row) {
+                    return;
+                }
+            }
             emit(EngineEvent::Done(Err(refusal)));
             return;
         }
-        self.run_turns(turn_prompt, aborted, &mut emit);
+        self.run_turns(turn_prompt, accepted_rows, aborted, &mut emit);
         self.clear_image_route();
     }
 

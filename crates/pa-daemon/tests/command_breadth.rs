@@ -557,6 +557,18 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         r#"{"type": "respond_host_hook", "activeSessionId": "sess", "requestId": "h1", "result": {"allow": true}}"#,
     ),
     (
+        "session_snapshot",
+        r#"{"type":"session_snapshot","activeSessionId":"sess","offset":0,"limit":1}"#,
+    ),
+    (
+        "validate_studio_mcp_credential",
+        r#"{"type":"validate_studio_mcp_credential","activeSessionId":"sess","credential":"c"}"#,
+    ),
+    (
+        "set_active_tools",
+        r#"{"type":"set_active_tools","activeSessionId":"sess","tools":["python_repl"]}"#,
+    ),
+    (
         "append_session_entry",
         r#"{"type": "append_session_entry", "activeSessionId": "sess", "customType": "prime-context", "data": {"k": 1}}"#,
     ),
@@ -567,6 +579,10 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
     (
         "request_host_hook",
         r#"{"type": "request_host_hook", "activeSessionId": "sess", "hook": "host_call", "payload": {"type": "rlm.run"}, "origin": {"rlmChildId": "kid"}}"#,
+    ),
+    (
+        "wait_for_auto_refine_idle",
+        r#"{"type": "wait_for_auto_refine_idle", "activeSessionId": "sess", "timeoutMs": 1000}"#,
     ),
 ];
 
@@ -605,9 +621,13 @@ fn known_command_types_match_the_ts_list() {
                     | "request_tool_permission"
                     | "set_host_hooks"
                     | "respond_host_hook"
+                    | "session_snapshot"
+                    | "validate_studio_mcp_credential"
+                    | "set_active_tools"
                     | "append_session_entry"
                     | "set_auto_refine"
                     | "request_host_hook"
+                    | "wait_for_auto_refine_idle"
             ),
             "unexpected non-TS command type: {extra}"
         );

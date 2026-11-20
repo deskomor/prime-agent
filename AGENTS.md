@@ -135,6 +135,9 @@ launch path must keep that test red-first.
 
 ## Merge gates
 
+- Use the CI-pinned compiler for local gates: currently Rust 1.98.1. In
+  `.github/workflows/continuous.yml`, the rust-toolchain action SHA pins the compiler;
+  a `toolchain:` input is ignored by that action version.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` must pass before every merge. Run `make check` — the local mirror of
   the same gates; CI runs on the org's billing (`.github/workflows/continuous.yml` on `main`
