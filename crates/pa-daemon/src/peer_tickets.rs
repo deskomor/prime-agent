@@ -135,8 +135,16 @@ impl Supervisor {
         if self.is_stopping(resident) {
             return Err(anyhow!("Supervisor is shutting down"));
         }
-        anyhow::ensure!(!resident.descriptor.lock().await.create_command.rest.contains_key(crate::plan_mode::EXPLORER),
-            "Native Plan explorer is not an interactive session");
+        anyhow::ensure!(
+            !resident
+                .descriptor
+                .lock()
+                .await
+                .create_command
+                .rest
+                .contains_key(crate::plan_mode::EXPLORER),
+            "Native Plan explorer is not an interactive session"
+        );
         if !resident.peer_transport_capable.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "Session worker does not support direct peer transport"

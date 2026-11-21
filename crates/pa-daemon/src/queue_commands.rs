@@ -5,9 +5,9 @@
 
 use serde_json::Value;
 
-use crate::protocol::{DaemonResponse, response_failure, response_success};
+use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::worker::Lane;
-use crate::worker::{TurnSettle, Worker, parse_prompt_images};
+use crate::worker::{parse_prompt_images, TurnSettle, Worker};
 
 /// The wire lane names: `"steering"` and `"followUp"`.
 fn wire_lane(value: Option<&Value>) -> Option<Lane> {

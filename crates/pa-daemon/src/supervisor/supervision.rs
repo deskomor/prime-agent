@@ -250,7 +250,14 @@ impl Supervisor {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as u64);
-            if resident.descriptor.lock().await.create_command.rest.contains_key(crate::plan_mode::EXPLORER) {
+            if resident
+                .descriptor
+                .lock()
+                .await
+                .create_command
+                .rest
+                .contains_key(crate::plan_mode::EXPLORER)
+            {
                 let _ = self.stop_worker(&resident).await;
                 return;
             }

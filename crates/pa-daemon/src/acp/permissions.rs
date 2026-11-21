@@ -20,10 +20,10 @@
 //! error goes back as `respond_host_hook`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::meta::PRIME_AGENT_META_NAMESPACE;
 use super::types::AcpToolKind;
@@ -126,7 +126,10 @@ impl PermissionRelay {
             contract.is_some_and(crate::plan_mode::opted_in),
             Ordering::SeqCst,
         );
-        self.plan_explore.store(contract.is_some_and(crate::plan_mode::explore_opted_in), Ordering::SeqCst);
+        self.plan_explore.store(
+            contract.is_some_and(crate::plan_mode::explore_opted_in),
+            Ordering::SeqCst,
+        );
         let field = |key: &str| {
             contract
                 .and_then(|contract| contract.get(key))
@@ -268,9 +271,7 @@ impl PermissionRelay {
             .expect("hook opt-in lock")
             .hooks
             .iter()
-            .any(|listed| {
-                listed == crate::plan_mode::configured_hook(hook)
-            })
+            .any(|listed| listed == crate::plan_mode::configured_hook(hook))
         {
             return None;
         }
@@ -542,8 +543,8 @@ mod tests {
                 timeout_ms: Some(150_000)
             }
         );
-        params["clientCapabilities"]["_meta"][PRIME_AGENT_META_NAMESPACE]["hostContract"]["version"] =
-            json!(2);
+        params["clientCapabilities"]["_meta"][PRIME_AGENT_META_NAMESPACE]["hostContract"]
+            ["version"] = json!(2);
         relay.observe_initialize(&params);
         assert!(!relay.host_contract());
         assert_eq!(relay.hook_opt_in(), HookOptIn::default());

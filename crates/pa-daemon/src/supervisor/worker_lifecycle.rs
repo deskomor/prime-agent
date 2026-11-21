@@ -409,7 +409,10 @@ impl Supervisor {
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, descriptor_path.clone());
         // Claim before registration can observe the newly inserted resident.
         resident.roster_family_seed_owned_by_create.store(
-            matches!(family_seed_owner, RosterFamilySeedOwner::Create | RosterFamilySeedOwner::PlanExplorer),
+            matches!(
+                family_seed_owner,
+                RosterFamilySeedOwner::Create | RosterFamilySeedOwner::PlanExplorer
+            ),
             Ordering::SeqCst,
         );
         // TS stores `worker.launchEnv` before the spawn.

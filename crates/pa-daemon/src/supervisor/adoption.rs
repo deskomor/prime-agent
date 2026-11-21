@@ -212,7 +212,11 @@ impl Supervisor {
             ));
             return AdoptionOutcome::AdoptedLive;
         }
-        if descriptor.create_command.rest.contains_key(crate::plan_mode::EXPLORER) {
+        if descriptor
+            .create_command
+            .rest
+            .contains_key(crate::plan_mode::EXPLORER)
+        {
             descriptor.stop_requested_at = Some(crate::util::now_iso());
         }
         let socket_path = PathBuf::from(&descriptor.socket_path);
@@ -632,8 +636,16 @@ impl Supervisor {
         if token != descriptor.authentication_token.as_str() {
             return Err(anyhow!("Session worker authentication failed"));
         }
-        if descriptor.create_command.rest.contains_key(crate::plan_mode::EXPLORER) {
-            return Err(anyhow!("{}: {}", crate::registration::UNKNOWN_SESSION_WORKER_PREFIX, registration.active_session_id));
+        if descriptor
+            .create_command
+            .rest
+            .contains_key(crate::plan_mode::EXPLORER)
+        {
+            return Err(anyhow!(
+                "{}: {}",
+                crate::registration::UNKNOWN_SESSION_WORKER_PREFIX,
+                registration.active_session_id
+            ));
         }
         // The same boot-load backfill: a pre-upgrade descriptor wires its
         // orphan journal here too, so a relaunch of this worker journals.

@@ -1,7 +1,7 @@
 use super::slash_commands::parse_session_command;
 use super::{
-    AgentSession, PromptOptions, PromptOutcome, SessionAgentMessage, SessionSlashCommand,
-    StreamingBehavior, session_message_to_loop, user_prompt_message,
+    session_message_to_loop, user_prompt_message, AgentSession, PromptOptions, PromptOutcome,
+    SessionAgentMessage, SessionSlashCommand, StreamingBehavior,
 };
 
 impl AgentSession {

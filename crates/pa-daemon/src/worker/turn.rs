@@ -1,12 +1,12 @@
 //! One agent turn: the runner that admits queued input, drives the
 //! engine, and settles the result.
 use super::{
-    ABORTED_TURN_SETTLE_ERROR, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane,
-    Map, Notify, OutboundFrame, PromptRequest, QueueCheckpoint, QueuePriority, QueuedItem, Result,
+    checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta,
+    emit_refinement_event_for_session, emit_refinement_row, gather_delivery_batch, json, oneshot,
+    session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify,
+    OutboundFrame, PromptRequest, QueueCheckpoint, QueuePriority, QueuedItem, Result,
     SessionActionSnapshot, SessionCore, SessionEngine, TurnPolicy, TurnSettle, Value,
-    WorkerRecoveryJournal, checkpoint_queue_recovery, compact_action_label,
-    create_daemon_event_meta, emit_refinement_event_for_session, emit_refinement_row,
-    gather_delivery_batch, json, oneshot, session_snapshot,
+    WorkerRecoveryJournal, ABORTED_TURN_SETTLE_ERROR,
 };
 
 use std::sync::{Arc, Mutex};
@@ -360,7 +360,10 @@ impl TurnRunner {
                 / 2
         };
         let plan = first.plan.clone();
-        let explorer = self.plan_explorer.load(std::sync::atomic::Ordering::Acquire) == 2;
+        let explorer = self
+            .plan_explorer
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 2;
         let plan_run = plan.is_some() || explorer;
         let restricted = match plan {
             Some(scope) => {
@@ -369,14 +372,22 @@ impl TurnRunner {
                     self.host_hooks.abort_plan();
                 }
                 let explore = crate::plan_mode::native_explore(
-                    Arc::clone(&self.passivation.link), self.passivation.worker_token.clone(), scope.admission.clone(), signal.clone());
+                    Arc::clone(&self.passivation.link),
+                    self.passivation.worker_token.clone(),
+                    scope.admission.clone(),
+                    signal.clone(),
+                );
                 scope
                     .start(Arc::clone(&self.host_hooks), signal, Some(explore))
                     .await
                     .map(Some)
             }
-            None if explorer => Ok(Some(crate::plan_mode::child_run(crate::plan_mode::native_read(
-                Arc::clone(&self.passivation.link), self.passivation.worker_token.clone())))),
+            None if explorer => Ok(Some(crate::plan_mode::child_run(
+                crate::plan_mode::native_read(
+                    Arc::clone(&self.passivation.link),
+                    self.passivation.worker_token.clone(),
+                ),
+            ))),
             None => Ok(None),
         };
         let plan_error = restricted.as_ref().err().map(ToString::to_string);

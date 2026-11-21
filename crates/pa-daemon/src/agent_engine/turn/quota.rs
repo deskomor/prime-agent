@@ -1,7 +1,7 @@
 //! The quota-park machinery: the park policies, the resume-job lifecycle,
 //! the wake recovery, and the durable park/resume entries.
 use super::{
-    AgentSessionEngine, QUOTA_WAKE_MAX_RETRIES, QUOTA_WAKE_RETRY_DELAY_MS, QuotaParkState,
+    AgentSessionEngine, QuotaParkState, QUOTA_WAKE_MAX_RETRIES, QUOTA_WAKE_RETRY_DELAY_MS,
 };
 
 impl AgentSessionEngine {
@@ -91,8 +91,8 @@ impl AgentSessionEngine {
         abort: &str,
     ) -> Option<pa_core::session_engine::provider_park::ProviderParkOutcome> {
         use pa_core::session_engine::provider_park::{
-            NoParkReason, ProviderParkDecision, ProviderParkOutcome, is_quota_block_failure,
-            provider_park_decision, quota_failure_reset_ms, quota_parked_final_error,
+            is_quota_block_failure, provider_park_decision, quota_failure_reset_ms,
+            quota_parked_final_error, NoParkReason, ProviderParkDecision, ProviderParkOutcome,
         };
         let error = message
             .error_message

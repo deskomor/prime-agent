@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::abort::{AbortSignal, is_abort_error};
+use crate::abort::{is_abort_error, AbortSignal};
 use crate::stream::{LlmContext, StreamFn, StreamRequestOptions, ToolDefinition};
 use crate::types::{AgentContext, AgentEvent, AgentMessage, AssistantMessage};
 

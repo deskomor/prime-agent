@@ -1,8 +1,9 @@
 //! Queued input: the item model, the lanes, admission, delivery batching,
 //! and queue recovery.
 use super::{
-    AGENT_MESSAGE_SOURCE, AUTONOMOUS_QUEUE_KEY, Arc, Duration, EventPump, Mutex, Notify, Result,
-    SessionCore, Value, VecDeque, WorkerRecoveryJournal, emit_worker_event_with, json, oneshot,
+    emit_worker_event_with, json, oneshot, Arc, Duration, EventPump, Mutex, Notify, Result,
+    SessionCore, Value, VecDeque, WorkerRecoveryJournal, AGENT_MESSAGE_SOURCE,
+    AUTONOMOUS_QUEUE_KEY,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

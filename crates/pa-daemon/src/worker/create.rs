@@ -128,9 +128,12 @@ impl Worker {
         let _create_gate = self.create_gate.lock().await;
         let explorer = payload[crate::plan_mode::EXPLORER] == true;
         if explorer {
-            self.plan_explorer.store(1, std::sync::atomic::Ordering::Release);
+            self.plan_explorer
+                .store(1, std::sync::atomic::Ordering::Release);
             if let Some(engine) = &self.agent_engine {
-                engine.kernel_prewarm_disabled.store(true, std::sync::atomic::Ordering::Release);
+                engine
+                    .kernel_prewarm_disabled
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
         let existing_summary = {

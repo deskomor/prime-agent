@@ -1236,7 +1236,11 @@ impl AgentSessionEngine {
             daemonless: false,
             model_info: Some(model.clone()),
             // Prewarm; the depth gate keeps subagent workers lazy.
-            prewarm_ipython_kernel: Some(!self.kernel_prewarm_disabled.load(std::sync::atomic::Ordering::Acquire)),
+            prewarm_ipython_kernel: Some(
+                !self
+                    .kernel_prewarm_disabled
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
             on_background_work_settled,
             bash_notice_wake: None,
             // The worker-installed purge withdraws queued minted continuations.

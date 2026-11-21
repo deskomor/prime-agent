@@ -1,11 +1,11 @@
 //! The once-runner: one model-turn attempt with its retry/failover
 //! selection and the wire-shape serializers for stream events, tool
 //! results, and agent messages.
-use crate::engine::{AssistantSnapshot, session_wire_value};
+use crate::engine::{session_wire_value, AssistantSnapshot};
 
 use super::{
-    AgentSessionEngine, DaemonAllowlist, EngineEvent, TurnOnce, TurnPrompt, Value, json,
-    json_round_trip,
+    json, json_round_trip, AgentSessionEngine, DaemonAllowlist, EngineEvent, TurnOnce, TurnPrompt,
+    Value,
 };
 
 impl AgentSessionEngine {

@@ -35,7 +35,7 @@ use pa_agent::agent_loop::AfterToolCallFn;
 use pa_agent::types::{AfterToolCallResult, ToolResultContent};
 use pa_core::kernel::shared::{HostHandlerFn, HostRequestPayload};
 use pa_core::session_engine::host_hooks::HostCallGateFn;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 /// The tool-result override hook (optional).
@@ -322,12 +322,21 @@ impl HostHookBroker {
     }
 
     pub(crate) async fn call_child_plan_read(
-        &self, hook: &str, payload: Value, owner: &str, actor: &str,
+        &self,
+        hook: &str,
+        payload: Value,
+        owner: &str,
+        actor: &str,
     ) -> HookAnswer {
         let signal = if hook == crate::plan_mode::EXPLORER && payload["action"] == "finished" {
             None
         } else {
-            let signal = self.state.lock().expect("host hook lock").plan_abort.as_ref()
+            let signal = self
+                .state
+                .lock()
+                .expect("host hook lock")
+                .plan_abort
+                .as_ref()
                 .map(pa_agent::abort::AbortController::signal);
             let Some(signal) = signal.filter(|signal| !signal.is_aborted()) else {
                 return Err("root Plan turn ended".into());
@@ -335,7 +344,8 @@ impl HostHookBroker {
             Some(signal)
         };
         let origin = (hook != crate::plan_mode::EXPLORER).then(|| json!({"activeSessionId":actor,"parentActiveSessionId":payload["scope"]["rootActiveSessionId"]}));
-        self.call_bound(hook, payload, signal, origin, Some(owner)).await
+        self.call_bound(hook, payload, signal, origin, Some(owner))
+            .await
             .unwrap_or_else(|| Err("required host hook not enabled".to_string()))
     }
 
@@ -382,8 +392,9 @@ impl HostHookBroker {
             && self.contract_v1.load(std::sync::atomic::Ordering::SeqCst);
         let route = {
             let mut state = self.state.lock().expect("host hook lock");
-            if owner.is_some_and(|owner| state.owner_token.as_deref() != Some(owner) || state.upstream.is_some())
-            {
+            if owner.is_some_and(|owner| {
+                state.owner_token.as_deref() != Some(owner) || state.upstream.is_some()
+            }) {
                 return Some(Err("bound Plan host is no longer the session owner".into()));
             }
             if !state
@@ -807,11 +818,9 @@ mod tests {
             .await
             .unwrap();
         assert!(events.lock().unwrap().is_empty());
-        assert!(
-            broker
-                .set_hooks(&["before_everything".to_string()], None, None)
-                .is_err()
-        );
+        assert!(broker
+            .set_hooks(&["before_everything".to_string()], None, None)
+            .is_err());
     }
 
     #[tokio::test]
@@ -1073,11 +1082,9 @@ mod tests {
         child.set_family_reader(pa_core::kernel::shared::host_handler(|_| async {
             anyhow::bail!("native roster unavailable")
         }));
-        assert!(
-            gate("agent_observe.list".to_string(), json!({}))
-                .await
-                .is_err()
-        );
+        assert!(gate("agent_observe.list".to_string(), json!({}))
+            .await
+            .is_err());
         assert!(events.lock().unwrap().is_empty());
     }
 
@@ -1107,11 +1114,9 @@ mod tests {
             })
         }));
         // The enforcement gate refuses without a parent answer.
-        assert!(
-            broker.host_call_gate()("rlm.spawn".to_string(), json!({}))
-                .await
-                .is_err()
-        );
+        assert!(broker.host_call_gate()("rlm.spawn".to_string(), json!({}))
+            .await
+            .is_err());
         // An optional hook the parent has off is no answer.
         assert!(broker.optional(TURN_END, json!({})).await.is_none());
         // Off in the child too: the parent is never asked.

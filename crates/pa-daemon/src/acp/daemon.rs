@@ -25,12 +25,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pa_types::daemon::{
-    DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION, DaemonCommand, DaemonCommandEnvelope,
-    DaemonCommandFrameType, DaemonProtocolInfo, DaemonResponse, DaemonSessionLifecycle,
+    DaemonCommand, DaemonCommandEnvelope, DaemonCommandFrameType, DaemonProtocolInfo,
+    DaemonResponse, DaemonSessionLifecycle, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::jsonrpc::{self, Incoming};
 use super::meta::{self, PrimeAgentEventPhase, PrimeAgentOutcome, PrimeAgentSessionMeta};
@@ -38,8 +38,8 @@ use super::permissions::{PermissionRelay, RelayAnswer};
 use super::producer::{self, UpdateProducer};
 use super::types;
 use super::wire_config::{
-    HostedConfig, fetch_available_models, fetch_connection_state, handle_set_config_option,
-    picker_options_from_state, refresh_wire_config,
+    fetch_available_models, fetch_connection_state, handle_set_config_option,
+    picker_options_from_state, refresh_wire_config, HostedConfig,
 };
 use super::wire_events::{self, WireMappingState};
 
@@ -172,11 +172,9 @@ impl DaemonLink {
     pub(crate) async fn request_ok(&self, command: DaemonCommand) -> anyhow::Result<()> {
         let response = self.request(command).await?;
         if !response.success {
-            anyhow::bail!(
-                response
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
+            anyhow::bail!(response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string()));
         }
         Ok(())
     }
@@ -373,9 +371,14 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             if let Some(stop) = wire_events::assistant_stop(&event) {
                                 current.assistant_stop_reason = stop.stop_reason;
                             }
-                            if let (Some(cancel), Some(tx)) = (permissions.plan_question_cancelled(
-                                &event, &current.acp_session_id, &current.daemon_active_session_id,
-                            ), permission_tx.upgrade()) {
+                            if let (Some(cancel), Some(tx)) = (
+                                permissions.plan_question_cancelled(
+                                    &event,
+                                    &current.acp_session_id,
+                                    &current.daemon_active_session_id,
+                                ),
+                                permission_tx.upgrade(),
+                            ) {
                                 let _ = tx.send(cancel);
                             }
                             if let Some(mut request) = permissions.client_request(
@@ -676,11 +679,9 @@ async fn bind_daemon_session(
             if response.success {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!(
-                    response
-                        .error
-                        .unwrap_or_else(|| "unknown error".to_string())
-                ))
+                Err(anyhow::anyhow!(response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())))
             }
         });
     if let Err(error) = attached {
@@ -1035,11 +1036,9 @@ async fn acquire_stop_input_pause(
         })
         .await?;
     if !response.success {
-        anyhow::bail!(
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        );
+        anyhow::bail!(response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string()));
     }
     let pause_id = response
         .data
@@ -1152,13 +1151,16 @@ fn handle_initialize(id: &Value, params: &Value, product_version: &str, tx: &pro
             .expect("contract features")
             .push(json!(crate::plan_mode::FEATURE));
     }
-    if params.pointer("/clientCapabilities/_meta")
+    if params
+        .pointer("/clientCapabilities/_meta")
         .and_then(|meta| meta.get(super::meta::PRIME_AGENT_META_NAMESPACE))
         .and_then(|meta| meta.get("hostContract"))
         .is_some_and(crate::plan_mode::explore_opted_in)
     {
         result["_meta"][super::meta::PRIME_AGENT_META_NAMESPACE]["hostContract"]["features"]
-            .as_array_mut().expect("contract features").push(json!(crate::plan_mode::EXPLORE_FEATURE));
+            .as_array_mut()
+            .expect("contract features")
+            .push(json!(crate::plan_mode::EXPLORE_FEATURE));
     }
     // Opt-in, so the default answer stays unchanged: the client may move the
     // session leaf with the navigate_tree session extension.
@@ -1690,8 +1692,9 @@ async fn prompt_turn(
         .cloned();
     if let Some(plan) = &plan {
         let state = state.lock().await;
-        if !state.permissions.plan_mode() || !crate::plan_mode::Activation::parse(plan)
-            .is_ok_and(|plan| !plan.explore_enabled || state.permissions.plan_explore())
+        if !state.permissions.plan_mode()
+            || !crate::plan_mode::Activation::parse(plan)
+                .is_ok_and(|plan| !plan.explore_enabled || state.permissions.plan_explore())
         {
             return jsonrpc::error_response(
                 &id,
@@ -2019,11 +2022,9 @@ async fn fetch_autonomous_status(
         })
         .await?;
     if !response.success {
-        anyhow::bail!(
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        );
+        anyhow::bail!(response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string()));
     }
     Ok(serde_json::from_value(
         response.data.unwrap_or(Value::Null),
@@ -2050,11 +2051,9 @@ async fn fetch_rlm_children(
         })
         .await?;
     if !response.success {
-        anyhow::bail!(
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        );
+        anyhow::bail!(response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string()));
     }
     response
         .data

@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::backpressure::RouteAdmission;
-use crate::protocol::{DaemonResponse, response_failure, response_line, response_success};
+use crate::protocol::{response_failure, response_line, response_success, DaemonResponse};
 use crate::supervisor::{
-    ROUTE_TIMEOUT_MS, Supervisor, client_command_payload, client_route_timeout,
+    client_command_payload, client_route_timeout, Supervisor, ROUTE_TIMEOUT_MS,
 };
 use crate::worker::Worker;
 
@@ -340,14 +340,27 @@ impl Supervisor {
         } else {
             None
         };
-        let _explore = if let Some(activation) = payload.get("requiredPlanMode")
+        let _explore = if let Some(activation) = payload
+            .get("requiredPlanMode")
             .and_then(|value| crate::plan_mode::Activation::parse(value).ok())
             .filter(|activation| activation.explore_enabled)
         {
-            Some(crate::supervisor::plan_explore::ExploreGuard::register(self, &resident,
-                crate::plan_mode::Scope { activation, actor: active_session_id.to_string(),
-                    admission: worker_admission_id.clone(), owner: payload["trustedPlanOwner"].as_str().unwrap_or_default().to_string() }))
-        } else { None };
+            Some(crate::supervisor::plan_explore::ExploreGuard::register(
+                self,
+                &resident,
+                crate::plan_mode::Scope {
+                    activation,
+                    actor: active_session_id.to_string(),
+                    admission: worker_admission_id.clone(),
+                    owner: payload["trustedPlanOwner"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+            ))
+        } else {
+            None
+        };
         payload["admissionId"] = json!(worker_admission_id);
         if let Some(current) = &rebound_to {
             payload["activeSessionId"] = json!(current);

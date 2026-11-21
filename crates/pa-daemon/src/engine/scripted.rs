@@ -2,10 +2,10 @@
 //! integration harness, its script records, the `SessionEngine` impl, and
 //! the abortable delay helper.
 use super::{
-    AbortSignal, AssistantSnapshot, BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun,
-    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, PromptRequest,
-    ProviderRetryPolicy, Result, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
-    SideQuestionSink, UNBOUNDED_BACKOFF_MS, Value, json,
+    json, AbortSignal, AssistantSnapshot, BranchSummaryOutcome, BranchSummaryRequest,
+    BranchSummaryRun, CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent,
+    PromptRequest, ProviderRetryPolicy, Result, SessionEngine, SideQuestionOutcome,
+    SideQuestionRequest, SideQuestionSink, Value, UNBOUNDED_BACKOFF_MS,
 };
 
 /// A scripted faux session: replays a deterministic sequence of assistant
@@ -473,10 +473,10 @@ impl SessionEngine for ScriptedEngine {
         sink: &SideQuestionSink,
     ) -> SideQuestionOutcome {
         use pa_core::session_engine::provider_retry::{
-            DEFAULT_PROVIDER_RETRY_POLICY, complete_with_provider_retry,
+            complete_with_provider_retry, DEFAULT_PROVIDER_RETRY_POLICY,
         };
-        use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
 
         // Unscripted side questions echo, like the prompt fallback.
         if self.side_question.responses.is_empty() {

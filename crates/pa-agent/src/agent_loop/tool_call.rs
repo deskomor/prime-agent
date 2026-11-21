@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::abort::{AbortSignal, is_abort_error};
+use crate::abort::{is_abort_error, AbortSignal};
 use crate::types::{
     AfterToolCallContext, AgentContext, AgentEvent, AgentMessage, AgentTool, AgentToolResult,
     AgentToolUpdateCallback, AssistantMessage, BeforeToolCallContext, ToolCall,
@@ -13,7 +13,7 @@ use crate::types::{
 
 use super::abort::race_with_abort;
 use super::run::clone_context;
-use super::tools::{FinalizedToolCallOutcome, Preparation, PreparedToolCall, find_tool};
+use super::tools::{find_tool, FinalizedToolCallOutcome, Preparation, PreparedToolCall};
 use super::{AgentEventSink, AgentLoopConfig};
 
 /// Tool lookup, `prepareArguments`, schema validation, and the

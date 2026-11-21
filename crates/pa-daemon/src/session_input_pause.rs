@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::protocol::{DaemonResponse, response_failure, response_success};
+use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::worker::Worker;
 
 /// One held pause: the session it gates, the owning client identity, and

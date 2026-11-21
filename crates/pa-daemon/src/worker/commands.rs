@@ -1,9 +1,9 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
-    KillCloseReason, Lane, PROMPT_ABORTED_BEFORE_DELIVERY, QueueCheckpoint, QueuedItem, Result,
-    SIDE_QUESTION_SETTLE_TIMEOUT, SessionFile, TurnSettle, VecDeque, Worker,
     clear_withdrawn_progress_note, json, persist_custom_row, response_failure, response_success,
+    KillCloseReason, Lane, QueueCheckpoint, QueuedItem, Result, SessionFile, TurnSettle, VecDeque,
+    Worker, PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 use serde_json::Value;
@@ -13,10 +13,21 @@ use crate::session_store::SessionMessagesQuery;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
-        if self.plan_explorer.load(std::sync::atomic::Ordering::Acquire) != 0
-            && !matches!(command_type, "get_state" | "shutdown" | "abort" | "plan_explorer_prompt")
+        if self
+            .plan_explorer
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            && !matches!(
+                command_type,
+                "get_state" | "shutdown" | "abort" | "plan_explorer_prompt"
+            )
         {
-            return response_failure(None, command_type, "Native Plan explorer is not an interactive session", None);
+            return response_failure(
+                None,
+                command_type,
+                "Native Plan explorer is not an interactive session",
+                None,
+            );
         }
         // Only operations that inspect or change historical branches need hydration.
         // Cancellation is deliberately excluded: it must reach the live turn immediately.
@@ -1079,19 +1090,50 @@ impl Worker {
     async fn handle_plan_explorer_prompt(&self, payload: &Value) -> DaemonResponse {
         use std::sync::atomic::Ordering;
         const COMMAND: &str = "plan_explorer_prompt";
-        let Some(task) = payload["task"].as_str().filter(|task| crate::plan_mode::valid_task(task)) else {
+        let Some(task) = payload["task"]
+            .as_str()
+            .filter(|task| crate::plan_mode::valid_task(task))
+        else {
             return response_failure(None, COMMAND, "Invalid Plan explorer task", None);
         };
-        if self.plan_explorer.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return response_failure(None, COMMAND, "Plan explorer kickoff was already consumed or is unbound", None);
+        if self
+            .plan_explorer
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return response_failure(
+                None,
+                COMMAND,
+                "Plan explorer kickoff was already consumed or is unbound",
+                None,
+            );
         }
-        let response = self.handle_prompt(&json!({"message":format!("[Plan explorer task from parent]\n\n{task}")}), /*wait*/ true).await;
-        if !response.success { return response; }
-        let text = self.handle_get_last_assistant_text().data.unwrap_or_default();
-        let Some(report) = text["text"].as_str().filter(|report| !report.trim().is_empty()) else {
+        let response = self
+            .handle_prompt(
+                &json!({"message":format!("[Plan explorer task from parent]\n\n{task}")}),
+                /*wait*/ true,
+            )
+            .await;
+        if !response.success {
+            return response;
+        }
+        let text = self
+            .handle_get_last_assistant_text()
+            .data
+            .unwrap_or_default();
+        let Some(report) = text["text"]
+            .as_str()
+            .filter(|report| !report.trim().is_empty())
+        else {
             return response_failure(None, COMMAND, "Plan explorer returned no report", None);
         };
-        response_success(None, COMMAND, Some(json!({"report": &report[..report.floor_char_boundary(crate::plan_mode::MAX_REPORT)]})))
+        response_success(
+            None,
+            COMMAND,
+            Some(
+                json!({"report": &report[..report.floor_char_boundary(crate::plan_mode::MAX_REPORT)]}),
+            ),
+        )
     }
 
     async fn handle_plan_explorer_hook(&self, payload: &Value) -> DaemonResponse {
@@ -1100,14 +1142,31 @@ impl Worker {
             let scope: crate::plan_mode::Scope = serde_json::from_value(payload["scope"].clone())?;
             {
                 let core = self.core.lock().unwrap();
-                anyhow::ensure!(core.active_session_id == scope.actor, "Wrong Plan root worker");
-                anyhow::ensure!(payload["hook"] == crate::plan_mode::EXPLORER && payload["payload"]["action"] == "finished"
-                    || core.running_admission_ids.contains(&scope.admission), "Plan root admission ended");
+                anyhow::ensure!(
+                    core.active_session_id == scope.actor,
+                    "Wrong Plan root worker"
+                );
+                anyhow::ensure!(
+                    payload["hook"] == crate::plan_mode::EXPLORER
+                        && payload["payload"]["action"] == "finished"
+                        || core.running_admission_ids.contains(&scope.admission),
+                    "Plan root admission ended"
+                );
             }
-            let actor = payload["actor"].as_str().filter(|actor| *actor != scope.actor)
+            let actor = payload["actor"]
+                .as_str()
+                .filter(|actor| *actor != scope.actor)
                 .ok_or_else(|| anyhow::anyhow!("Invalid Plan explorer actor"))?;
-            scope.child_read_hook(&self.host_hooks, actor, payload["hook"].as_str().unwrap_or_default(), payload["payload"].clone()).await
-        }.await;
+            scope
+                .child_read_hook(
+                    &self.host_hooks,
+                    actor,
+                    payload["hook"].as_str().unwrap_or_default(),
+                    payload["payload"].clone(),
+                )
+                .await
+        }
+        .await;
         match result {
             Ok(value) => response_success(None, COMMAND, Some(value)),
             Err(error) => response_failure(None, COMMAND, &error.to_string(), None),

@@ -63,7 +63,7 @@ use pa_agent::types::{AgentEvent, AgentMessage, ThinkingLevel};
 use pa_types::session::AgentMessage as SessionAgentMessage;
 use pa_types::session::FileEntry;
 
-use crate::session::manager::{SessionManager, capture_git_context};
+use crate::session::manager::{capture_git_context, SessionManager};
 use crate::skills::PromptTemplate;
 use slash_commands::{SessionSlashCommand, SlashCommandRegistry};
 

@@ -2,11 +2,11 @@
 //! handlers, the stale-id binding and rebind seam, and the saved-row
 //! builders.
 use super::{
-    Arc, DaemonCommand, DaemonResponse, DaemonSessionLifecycle, NameScope, Outbound, Path, PathBuf,
-    ROUTE_TIMEOUT_MS, ResidentWorker, Result, RosterFamilySeedOwner, RouteAdmission,
-    SUMMARY_TIMEOUT_MS, Supervisor, Value, anyhow, bail, join_all, json, list_sessions, mpsc,
-    name_unavailable_error, paths, reservation_key, response_failure, response_line,
-    response_success, subscribers,
+    anyhow, bail, join_all, json, list_sessions, mpsc, name_unavailable_error, paths,
+    reservation_key, response_failure, response_line, response_success, subscribers, Arc,
+    DaemonCommand, DaemonResponse, DaemonSessionLifecycle, NameScope, Outbound, Path, PathBuf,
+    ResidentWorker, Result, RosterFamilySeedOwner, RouteAdmission, Supervisor, Value,
+    ROUTE_TIMEOUT_MS, SUMMARY_TIMEOUT_MS,
 };
 use crate::session_scan::list_sessions_with;
 
@@ -632,12 +632,20 @@ impl Supervisor {
         client_id: String,
     ) -> Result<Value> {
         let _plan_topology = match command {
-            DaemonCommand::Create { runtime_metadata: Some(metadata), .. } if metadata["kind"] == "subagent" => {
+            DaemonCommand::Create {
+                runtime_metadata: Some(metadata),
+                ..
+            } if metadata["kind"] == "subagent" => {
                 if let Some(parent) = metadata["parentActiveSessionId"].as_str() {
                     let guard = crate::plan_mode::lock_topology(self, parent).await;
-                    anyhow::ensure!(!self.plan_roots.lock().unwrap().contains(parent), "Plan mode does not allow native child admission");
+                    anyhow::ensure!(
+                        !self.plan_roots.lock().unwrap().contains(parent),
+                        "Plan mode does not allow native child admission"
+                    );
                     Some(guard)
-                } else { None }
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -1129,8 +1137,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_named_create_name_check_does_not_wait_out_the_client_deadline_behind_a_wedged_resident()
-     {
+    async fn a_named_create_name_check_does_not_wait_out_the_client_deadline_behind_a_wedged_resident(
+    ) {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let supervisor = Arc::new(supervisor(dir.path()));
         let wedged = resident("w-wedged", None);
