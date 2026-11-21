@@ -20,10 +20,10 @@
 //! error goes back as `respond_host_hook`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::meta::PRIME_AGENT_META_NAMESPACE;
 use super::types::AcpToolKind;
@@ -90,6 +90,8 @@ struct OutstandingRequest {
 pub(crate) struct PermissionRelay {
     opted_in: AtomicBool,
     contract_v1: AtomicBool,
+    plan_mode: AtomicBool,
+    plan_explore: AtomicBool,
     hooks: Mutex<HookOptIn>,
     next_id: AtomicU64,
     outstanding: Mutex<HashMap<String, OutstandingRequest>>,
@@ -120,6 +122,11 @@ impl PermissionRelay {
             .host_contract()
             .then(|| meta.and_then(|meta| meta.get("hostContract")))
             .flatten();
+        self.plan_mode.store(
+            contract.is_some_and(crate::plan_mode::opted_in),
+            Ordering::SeqCst,
+        );
+        self.plan_explore.store(contract.is_some_and(crate::plan_mode::explore_opted_in), Ordering::SeqCst);
         let field = |key: &str| {
             contract
                 .and_then(|contract| contract.get(key))
@@ -143,6 +150,14 @@ impl PermissionRelay {
 
     pub(crate) fn host_contract(&self) -> bool {
         self.contract_v1.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn plan_mode(&self) -> bool {
+        self.plan_mode.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn plan_explore(&self) -> bool {
+        self.plan_explore.load(Ordering::SeqCst)
     }
 
     pub(crate) fn opted_in(&self) -> bool {
@@ -201,6 +216,36 @@ impl PermissionRelay {
         self.request_frame(event, acp_session_id, daemon_session_id)
     }
 
+    pub(crate) fn plan_question_cancelled(
+        &self,
+        event: &Value,
+        acp_session_id: &str,
+        daemon_session_id: &str,
+    ) -> Option<Value> {
+        if event["type"] != "host_hook_resolved"
+            || event["hook"] != crate::plan_mode::QUESTION
+            || event["outcome"] != "failed"
+        {
+            return None;
+        }
+        let request_id = event["requestId"].as_str()?;
+        let mut pending = self.outstanding.lock().expect("permission relay lock");
+        let id = pending
+            .iter()
+            .find(|(_, entry)| {
+                entry.kind == RequestKind::Hook
+                    && entry.daemon_session_id == daemon_session_id
+                    && entry.request_id == request_id
+            })?
+            .0
+            .clone();
+        pending.remove(&id);
+        Some(
+            json!({"jsonrpc":"2.0","method":"_ai.primeintellect.prime-agent/plan_question_cancelled",
+            "params":{"sessionId": acp_session_id,"requestId":id}}),
+        )
+    }
+
     /// The hook request for one `host_hook_request` event.
     fn hook_frame(
         &self,
@@ -210,6 +255,11 @@ impl PermissionRelay {
     ) -> Option<Value> {
         let request_id = event.get("requestId").and_then(Value::as_str)?;
         let hook = event.get("hook").and_then(Value::as_str)?;
+        if crate::plan_mode::required_hook(hook)
+            && (!self.plan_mode() || event["planOwner"].as_str().is_none())
+        {
+            return None;
+        }
         // Only a hook this client listed goes to it; another host answers
         // the rest.
         if !self
@@ -218,7 +268,9 @@ impl PermissionRelay {
             .expect("hook opt-in lock")
             .hooks
             .iter()
-            .any(|listed| listed == hook)
+            .any(|listed| {
+                listed == crate::plan_mode::configured_hook(hook)
+            })
         {
             return None;
         }
@@ -235,7 +287,7 @@ impl PermissionRelay {
         Some(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": HOST_HOOK_METHOD,
+            "method": if hook == crate::plan_mode::QUESTION { "_ai.primeintellect.prime-agent/plan_question" } else { HOST_HOOK_METHOD },
             "params": params,
         }))
     }
@@ -490,8 +542,8 @@ mod tests {
                 timeout_ms: Some(150_000)
             }
         );
-        params["clientCapabilities"]["_meta"][PRIME_AGENT_META_NAMESPACE]["hostContract"]
-            ["version"] = json!(2);
+        params["clientCapabilities"]["_meta"][PRIME_AGENT_META_NAMESPACE]["hostContract"]["version"] =
+            json!(2);
         relay.observe_initialize(&params);
         assert!(!relay.host_contract());
         assert_eq!(relay.hook_opt_in(), HookOptIn::default());

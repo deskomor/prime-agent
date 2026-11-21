@@ -15,6 +15,7 @@ fn priority_test_item(message: &str, policy: TurnPolicy) -> QueuedItem {
         queue_visible: true,
         policy,
         forced_batch: false,
+        plan: None,
     }
 }
 
@@ -430,6 +431,7 @@ async fn forced_batch_arming_classifies_the_visible_plain_rows() {
             queue_visible: true,
             policy: TurnPolicy::Queued,
             forced_batch: false,
+            plan: None,
         });
         core.steering.push_back(QueuedItem {
             priority: QueuePriority::Background,
@@ -444,6 +446,7 @@ async fn forced_batch_arming_classifies_the_visible_plain_rows() {
             queue_visible: true,
             policy: TurnPolicy::Injected,
             forced_batch: false,
+            plan: None,
         });
         core.steering.push_back(QueuedItem {
             priority: QueuePriority::Background,
@@ -458,6 +461,7 @@ async fn forced_batch_arming_classifies_the_visible_plain_rows() {
             queue_visible: true,
             policy: TurnPolicy::Injected,
             forced_batch: false,
+            plan: None,
         });
         core.steering.push_back(QueuedItem {
             priority: QueuePriority::Human,
@@ -472,6 +476,7 @@ async fn forced_batch_arming_classifies_the_visible_plain_rows() {
             queue_visible: true,
             policy: TurnPolicy::Queued,
             forced_batch: false,
+            plan: None,
         });
     }
     assert!(

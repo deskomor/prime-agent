@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::abort::{is_abort_error, AbortSignal};
+use crate::abort::{AbortSignal, is_abort_error};
 use crate::stream::{LlmContext, StreamFn, StreamRequestOptions, ToolDefinition};
 use crate::types::{AgentContext, AgentEvent, AgentMessage, AssistantMessage};
 
@@ -93,7 +93,9 @@ async fn stream_assistant_response_inner(
         .await?;
     }
 
-    if let Some(get_tools) = config.get_tools.as_ref() {
+    if let Some(restricted) = &config.restricted {
+        context.tools.clone_from(&restricted.tools);
+    } else if let Some(get_tools) = config.get_tools.as_ref() {
         context.tools = race_with_abort(get_tools(), signal).await?;
     }
     let llm_messages = race_with_abort((config.convert_to_llm)(messages), signal).await?;
@@ -115,12 +117,17 @@ async fn stream_assistant_response_inner(
     };
 
     let llm_context = LlmContext {
-        system_prompt: Some(
-            config
+        system_prompt: Some({
+            let mut prompt = config
                 .get_system_prompt
                 .as_ref()
-                .map_or_else(|| context.system_prompt.clone(), |hook| hook()),
-        ),
+                .map_or_else(|| context.system_prompt.clone(), |hook| hook());
+            if let Some(restricted) = &config.restricted {
+                prompt.push_str("\n\n");
+                prompt.push_str(&restricted.append_system_prompt);
+            }
+            prompt
+        }),
         messages: llm_messages,
         tools: context
             .tools

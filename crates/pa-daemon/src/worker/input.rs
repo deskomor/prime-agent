@@ -1,15 +1,15 @@
 //! The input handlers behind dispatch: prompt delivery, queue
 //! operations, and agent-message delivery.
 use super::{
-    enqueue_priority, json, oneshot, parse_custom_message, parse_prompt_images, response_success,
-    sender_is_child_of, AgentFamilyRelationship, AgentMessagePromptPayload, Lane, QueueCheckpoint,
-    QueuePriority, QueuedItem, TurnPolicy, Worker, AGENT_MESSAGE_SOURCE,
-    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION, QUEUED_INPUT_SUSPENDED,
+    AGENT_MESSAGE_SOURCE, AgentFamilyRelationship, AgentMessagePromptPayload,
+    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION, Lane, QUEUED_INPUT_SUSPENDED, QueueCheckpoint,
+    QueuePriority, QueuedItem, TurnPolicy, Worker, enqueue_priority, json, oneshot,
+    parse_custom_message, parse_prompt_images, response_success, sender_is_child_of,
 };
 
 use serde_json::Value;
 
-use crate::protocol::{response_failure, DaemonResponse};
+use crate::protocol::{DaemonResponse, response_failure};
 
 impl Worker {
     pub(crate) async fn handle_prompt(&self, payload: &Value, wait: bool) -> DaemonResponse {
@@ -72,6 +72,46 @@ impl Worker {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_string);
+        let plan = match payload.get("requiredPlanMode") {
+            None => None,
+            Some(value) => {
+                let binding = admission_id
+                    .as_ref()
+                    .zip(payload.get("trustedPlanOwner").and_then(Value::as_str));
+                let (Ok(activation), Some((admission, owner))) =
+                    (crate::plan_mode::Activation::parse(value), binding)
+                else {
+                    return response_failure(
+                        None,
+                        "prompt",
+                        "Plan mode requires a valid bound activation",
+                        None,
+                    );
+                };
+                let core = self.core.lock().unwrap();
+                if !wait
+                    || core.parent_active_session_id.is_some()
+                    || core.parent_session_id.is_some()
+                    || core.rlm_depth != 0
+                    || core.rlm_child_id.is_some()
+                    || custom_message.is_some()
+                    || message.trim_start().starts_with('/')
+                {
+                    return response_failure(
+                        None,
+                        "prompt",
+                        "Plan mode only accepts a plain, synchronous root prompt",
+                        None,
+                    );
+                }
+                Some(crate::plan_mode::Scope {
+                    activation,
+                    actor: core.active_session_id.clone(),
+                    admission: admission.clone(),
+                    owner: owner.to_string(),
+                })
+            }
+        };
         if let Some(admission_id) = &admission_id {
             self.register_prompt_admission(admission_id);
         }
@@ -79,6 +119,19 @@ impl Worker {
         let done = if wait { Some(done_tx) } else { None };
         let (snapshot, queued_behind_work) = {
             let mut core = self.core.lock().unwrap();
+            if plan.is_some()
+                && (core.busy
+                    || !core.steering.is_empty()
+                    || !core.follow_up.is_empty()
+                    || core.auto_refine_rounds != 0)
+            {
+                return response_failure(
+                    None,
+                    "prompt",
+                    "Plan mode requires an idle root with no queued work or refinement",
+                    None,
+                );
+            }
             // TS commits before accepting the prompt into its action queue.
             // Hold the queue lock across this transition and enqueue so a
             // cancellation cannot mistake an accepted prompt for waiting.
@@ -132,6 +185,7 @@ impl Worker {
                     TurnPolicy::Direct
                 },
                 forced_batch: false,
+                plan,
             };
             match lane {
                 Lane::Steering => enqueue_priority(&mut core.steering, item),
@@ -213,6 +267,7 @@ impl Worker {
             queue_visible: true,
             policy: TurnPolicy::Queued,
             forced_batch: false,
+            plan: None,
         };
         match lane {
             Lane::Steering => enqueue_priority(&mut core.steering, item),
@@ -379,6 +434,7 @@ impl Worker {
                 queue_visible: true,
                 policy: TurnPolicy::Injected,
                 forced_batch: false,
+                plan: None,
             };
             match lane {
                 Lane::Steering => enqueue_priority(&mut core.steering, item),

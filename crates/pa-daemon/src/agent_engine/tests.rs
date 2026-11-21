@@ -150,6 +150,7 @@ pub(crate) fn admit(engine: &AgentSessionEngine, message: String, events: &mut V
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: Vec::new(),
             message,
             source: "user".to_string(),
@@ -226,6 +227,7 @@ pub(crate) fn admit_parked(
             0,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: Vec::new(),
                 message,
                 source: "user".to_string(),
@@ -347,6 +349,7 @@ fn run_prompts(
             0,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),

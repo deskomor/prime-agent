@@ -183,7 +183,16 @@ impl SessionSubscribers {
         let Some(subscribers) = sessions.get_mut(active_session_id) else {
             return outcome;
         };
+        let owner_connection = payload
+            .pointer("/event/planOwner")
+            .and_then(Value::as_str)
+            .and_then(|owner| owner.strip_prefix("supervisor:"))
+            .and_then(|owner| owner.split_once(':'))
+            .map(|(connection, _)| connection);
         subscribers.retain(|connection_id, subscriber| {
+            if owner_connection.is_some_and(|owner| owner != connection_id) {
+                return true;
+            }
             match subscriber.queue.try_send(Arc::clone(payload)) {
                 Ok(()) => {
                     outcome.delivered += 1;

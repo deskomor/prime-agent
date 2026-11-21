@@ -204,6 +204,11 @@ EXPLICIT EXCEPTION: wire-protocol identifiers that must stay byte-compatible wit
 - Native session identities, finalized exchanges, context refs, and family routing
   remain authoritative. Host snapshots and writes must target the hosted root or
   its native descendants, never arbitrary daemon sessions.
+- Required Plan mode is a negotiated ACP feature, absent by default. It
+  restricts a single root prompt to its bound host tools and must fail closed
+  without that host. The separately negotiated explorer is an ephemeral native
+  read-only child, not ordinary RLM spawn. See `crates/pa-daemon/README.md`
+  for the wire contract.
 - Host detach releases only host-owned prompt/tool adaptations and refinement pause.
   The daemon continues to own native supervision and generic MCP lifetimes.
 - Contract and implementation ownership: `crates/pa-daemon/README.md` (ACP relay,

@@ -1,9 +1,9 @@
 //! The model-turn runner: the streaming run over the built session agent,
 //! the retry/failover policy application, and the quota-park mid-run arm.
 use super::{
-    aborted_message, drop_trailing_assistant, json_round_trip, map_thinking_level,
-    retry_event_to_engine_event, AgentSessionEngine, EngineEvent, ProviderTarget, StopReason,
-    TurnAdmission, TurnOnce, TurnPrompt, TurnResult,
+    AgentSessionEngine, EngineEvent, ProviderTarget, StopReason, TurnAdmission, TurnOnce,
+    TurnPrompt, TurnResult, aborted_message, drop_trailing_assistant, json_round_trip,
+    map_thinking_level, retry_event_to_engine_event,
 };
 
 impl AgentSessionEngine {
@@ -98,8 +98,18 @@ impl AgentSessionEngine {
         // first provider call: the serving target swaps to the image
         // model (the agent state itself never swaps — per-run, like TS).
         self.apply_armed_image_route(&agent);
-        let policy = self.retry_policy();
-        let failover_policy = self.failover_policy();
+        let mut policy = self.retry_policy();
+        let mut failover_policy = self.failover_policy();
+        if matches!(
+            prompt,
+            TurnPrompt::User {
+                restricted: Some(_),
+                ..
+            }
+        ) {
+            policy.enabled = false;
+            failover_policy.enabled = false;
+        }
         // A routed episode serves (and fails over within) the ROUTED
         // model: the candidate chain derives from the serving model.
         let candidates = match self.armed_image_route() {

@@ -109,6 +109,7 @@ fn autonomous_gate_pass_and_failure_drive_the_loop() {
             0,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: Vec::new(),
                 message: prompt.to_string(),
                 source: "user".to_string(),
@@ -231,6 +232,7 @@ fn the_turn_loop_is_driven_by_the_driver_trait() {
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: Vec::new(),
             message: "go".to_string(),
             source: "user".to_string(),

@@ -95,6 +95,31 @@ pub type AfterToolCallFn = Arc<
         + Sync,
 >;
 
+/// A turn-local host dispatch. It handles every call, with no fallback to native tools.
+pub type HostToolDispatch = Arc<
+    dyn Fn(
+            crate::types::ToolCall,
+            AbortSignal,
+        ) -> crate::BoxFut<'static, crate::types::AgentToolResult>
+        + Send
+        + Sync,
+>;
+
+/// Tool inventory, prompt addition and dispatch bound to a single restricted run.
+#[derive(Clone)]
+pub struct RestrictedRun {
+    pub tools: Vec<Arc<dyn crate::types::AgentTool>>,
+    pub append_system_prompt: String,
+    pub dispatch: HostToolDispatch,
+    pub stopped: ShouldStopBeforeTurnFn,
+}
+
+impl std::fmt::Debug for RestrictedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestrictedRun").finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentLoopConfig {
     pub model: Model,
@@ -124,6 +149,7 @@ pub struct AgentLoopConfig {
     pub tool_progress: crate::types::ToolProgressCadence,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    pub restricted: Option<RestrictedRun>,
 }
 
 impl AgentLoopConfig {
@@ -153,6 +179,7 @@ impl AgentLoopConfig {
             tool_progress: crate::types::ToolProgressCadence::default(),
             before_tool_call: None,
             after_tool_call: None,
+            restricted: None,
         }
     }
 

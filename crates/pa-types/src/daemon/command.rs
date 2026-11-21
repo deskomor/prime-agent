@@ -214,6 +214,13 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Private, token-authenticated worker Plan operations.
+    WorkerPlanExplore {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        worker_token: String,
+        request: Value,
+    },
     /// Worker -> supervisor roster delta (TS `roster_delta`): the worker pushes its slim session
     /// summary so the roster tracks live status without polling.
     WorkerRosterDelta {

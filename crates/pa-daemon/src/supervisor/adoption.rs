@@ -200,7 +200,7 @@ impl Supervisor {
     async fn adopt_persisted_worker(
         self: &Arc<Self>,
         path: PathBuf,
-        descriptor: crate::descriptor::WorkerDescriptor,
+        mut descriptor: crate::descriptor::WorkerDescriptor,
         boot: AdoptionBoot,
     ) -> AdoptionOutcome {
         let worker_id = descriptor.worker_id.clone();
@@ -211,6 +211,9 @@ impl Supervisor {
                 "session worker {worker_id} already registered; skipping descriptor adoption"
             ));
             return AdoptionOutcome::AdoptedLive;
+        }
+        if descriptor.create_command.rest.contains_key(crate::plan_mode::EXPLORER) {
+            descriptor.stop_requested_at = Some(crate::util::now_iso());
         }
         let socket_path = PathBuf::from(&descriptor.socket_path);
         // A tombstoned descriptor belongs to its recorded process, not
@@ -628,6 +631,9 @@ impl Supervisor {
         crate::descriptor::validate_descriptor(&descriptor, &self.options.socket_path)?;
         if token != descriptor.authentication_token.as_str() {
             return Err(anyhow!("Session worker authentication failed"));
+        }
+        if descriptor.create_command.rest.contains_key(crate::plan_mode::EXPLORER) {
+            return Err(anyhow!("{}: {}", crate::registration::UNKNOWN_SESSION_WORKER_PREFIX, registration.active_session_id));
         }
         // The same boot-load backfill: a pre-upgrade descriptor wires its
         // orphan journal here too, so a relaunch of this worker journals.

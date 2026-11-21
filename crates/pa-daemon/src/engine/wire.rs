@@ -1,7 +1,7 @@
 //! The engine wire types: the prompt records, the event stream shape, the
 //! goal-continuation + bash-notice plumbing, the RLM session identity, and
 //! the compaction/branch-summary/side-question records.
-use super::{json, json_round_trip, Arc, SideQuestionTurn, Value};
+use super::{Arc, SideQuestionTurn, Value, json, json_round_trip};
 
 /// One user prompt accepted by the engine.
 #[derive(Debug, Clone)]
@@ -20,6 +20,7 @@ pub struct PromptRequest {
     /// (persisted and rendered) in order ahead of the model turn, and the
     /// loop context carries every row as one `agent.prompt` message list.
     pub batch: Vec<PromptBatchRow>,
+    pub restricted: Option<pa_agent::agent_loop::RestrictedRun>,
 }
 
 /// One co-delivered user row of a batched prompt request.

@@ -1,11 +1,11 @@
 //! The once-runner: one model-turn attempt with its retry/failover
 //! selection and the wire-shape serializers for stream events, tool
 //! results, and agent messages.
-use crate::engine::{session_wire_value, AssistantSnapshot};
+use crate::engine::{AssistantSnapshot, session_wire_value};
 
 use super::{
-    json, json_round_trip, AgentSessionEngine, DaemonAllowlist, EngineEvent, TurnOnce, TurnPrompt,
-    Value,
+    AgentSessionEngine, DaemonAllowlist, EngineEvent, TurnOnce, TurnPrompt, Value, json,
+    json_round_trip,
 };
 
 impl AgentSessionEngine {
@@ -420,10 +420,12 @@ impl AgentSessionEngine {
                         text,
                         images,
                         batch,
+                        restricted,
                     } => {
                         // The batched co-delivery rows ride the same admission: one run over
                         // the primary plus every batched row.
                         let options = pa_core::session_engine::PromptOptions {
+                            restricted: restricted.clone(),
                             batch: batch
                                 .iter()
                                 .map(|row| pa_core::session_engine::PromptBatchRow {
@@ -446,6 +448,16 @@ impl AgentSessionEngine {
                         .map(|_| ()),
                 }
             } else {
+                anyhow::ensure!(
+                    !matches!(
+                        prompt,
+                        TurnPrompt::User {
+                            restricted: Some(_),
+                            ..
+                        }
+                    ),
+                    "Plan mode cannot be resumed without its original admission"
+                );
                 agent.continue_run().await
             }
         });

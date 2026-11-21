@@ -1,9 +1,8 @@
 //! Queued input: the item model, the lanes, admission, delivery batching,
 //! and queue recovery.
 use super::{
-    emit_worker_event_with, json, oneshot, Arc, Duration, EventPump, Mutex, Notify, Result,
-    SessionCore, Value, VecDeque, WorkerRecoveryJournal, AGENT_MESSAGE_SOURCE,
-    AUTONOMOUS_QUEUE_KEY,
+    AGENT_MESSAGE_SOURCE, AUTONOMOUS_QUEUE_KEY, Arc, Duration, EventPump, Mutex, Notify, Result,
+    SessionCore, Value, VecDeque, WorkerRecoveryJournal, emit_worker_event_with, json, oneshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +162,7 @@ pub(crate) struct QueuedItem {
     /// Membership of the one-shot forced steering batch: armed items co-deliver as
     /// one batched turn even under "one-at-a-time". Never journaled.
     pub(crate) forced_batch: bool,
+    pub(crate) plan: Option<crate::plan_mode::Scope>,
 }
 
 /// Parse the wire `images` array: entries without payload data or a
@@ -299,6 +299,7 @@ pub(crate) fn checkpoint_queue_recovery(
 pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
     fn items(lane: &VecDeque<QueuedItem>) -> Vec<crate::journal::WorkerQueueItemRecord> {
         lane.iter()
+            .filter(|item| item.plan.is_none())
             .map(|item| crate::journal::WorkerQueueItemRecord {
                 message: item.message.clone(),
                 priority: Some(item.priority),
@@ -410,6 +411,7 @@ pub(crate) fn restore_queue_snapshot(
                     queue_visible: record.queue_visible,
                     policy,
                     forced_batch: record.forced_batch,
+                    plan: None,
                 }
             })
             .collect()
@@ -446,6 +448,7 @@ pub(crate) fn admit_autonomous_follow_up(
             queue_visible: false,
             policy: TurnPolicy::Injected,
             forced_batch: false,
+            plan: None,
         });
     }
     // The admission checkpoint: a continuation admitted while idle is undelivered
@@ -501,6 +504,7 @@ pub(crate) fn admit_goal_follow_up(
             queue_visible: false,
             policy: TurnPolicy::Injected,
             forced_batch: false,
+            plan: None,
         };
         match lane {
             Lane::Steering => enqueue_priority(&mut core.steering, item),
@@ -568,6 +572,7 @@ pub(crate) fn admit_kernel_notice(
             queue_visible,
             policy,
             forced_batch: false,
+            plan: None,
         });
     }
     // The checkpoint re-locks the core (documented order: recovery lock

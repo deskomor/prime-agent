@@ -1,9 +1,9 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
+    KillCloseReason, Lane, PROMPT_ABORTED_BEFORE_DELIVERY, QueueCheckpoint, QueuedItem, Result,
+    SIDE_QUESTION_SETTLE_TIMEOUT, SessionFile, TurnSettle, VecDeque, Worker,
     clear_withdrawn_progress_note, json, persist_custom_row, response_failure, response_success,
-    KillCloseReason, Lane, QueueCheckpoint, QueuedItem, Result, SessionFile, TurnSettle, VecDeque,
-    Worker, PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 use serde_json::Value;
@@ -13,6 +13,11 @@ use crate::session_store::SessionMessagesQuery;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
+        if self.plan_explorer.load(std::sync::atomic::Ordering::Acquire) != 0
+            && !matches!(command_type, "get_state" | "shutdown" | "abort" | "plan_explorer_prompt")
+        {
+            return response_failure(None, command_type, "Native Plan explorer is not an interactive session", None);
+        }
         // Only operations that inspect or change historical branches need hydration.
         // Cancellation is deliberately excluded: it must reach the live turn immediately.
         let history_page = command_type == "get_messages"
@@ -37,6 +42,8 @@ impl Worker {
         }
         match command_type {
             "create" => self.handle_create(payload).await,
+            "plan_explorer_prompt" => self.handle_plan_explorer_prompt(payload).await,
+            "plan_explorer_hook" => self.handle_plan_explorer_hook(payload).await,
             "attach" => self.handle_attach(payload),
             "detach" => self.handle_detach(payload),
             "prompt" => self.handle_prompt(payload, false).await,
@@ -410,7 +417,12 @@ impl Worker {
                 .map_or_else(|| error.to_string(), str::to_string)),
             None => Ok(payload.get("result").cloned().unwrap_or(Value::Null)),
         };
-        if self.host_hooks.resolve(request_id, answer) {
+        let owner = payload.get("planOwner").and_then(Value::as_str);
+        if if owner.is_some() {
+            self.host_hooks.resolve_scoped(request_id, answer, owner)
+        } else {
+            self.host_hooks.resolve(request_id, answer)
+        } {
             response_success(None, "respond_host_hook", None)
         } else {
             response_failure(
@@ -525,7 +537,7 @@ impl Worker {
                     "replace_acp_mcp_servers",
                     &format!("Invalid ACP MCP servers: {error}"),
                     None,
-                )
+                );
             }
         };
         let inherited = match payload
@@ -547,7 +559,7 @@ impl Worker {
                     "replace_acp_mcp_servers",
                     &format!("Invalid Studio MCP servers: {error}"),
                     None,
-                )
+                );
             }
         };
         // Core, then the store: the descriptor's identity and its install sit under the lock
@@ -699,6 +711,7 @@ impl Worker {
             // resume site fires.
             core.queued_input_suspended = true;
         }
+        self.host_hooks.abort_plan();
         // Queue-INVISIBLE turn actions cancel: a direct prompt admitted on an idle
         // session never became a queue row, so the abort must resolve its waiting
         // response, not park it behind the suspension forever. Queue-visible lanes
@@ -1061,6 +1074,44 @@ impl Worker {
         // And the same eager agent abort.
         self.engine.abort_in_flight_turn();
         response_success(None, "abort_and_clear_queue", cleared.data)
+    }
+
+    async fn handle_plan_explorer_prompt(&self, payload: &Value) -> DaemonResponse {
+        use std::sync::atomic::Ordering;
+        const COMMAND: &str = "plan_explorer_prompt";
+        let Some(task) = payload["task"].as_str().filter(|task| crate::plan_mode::valid_task(task)) else {
+            return response_failure(None, COMMAND, "Invalid Plan explorer task", None);
+        };
+        if self.plan_explorer.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return response_failure(None, COMMAND, "Plan explorer kickoff was already consumed or is unbound", None);
+        }
+        let response = self.handle_prompt(&json!({"message":format!("[Plan explorer task from parent]\n\n{task}")}), /*wait*/ true).await;
+        if !response.success { return response; }
+        let text = self.handle_get_last_assistant_text().data.unwrap_or_default();
+        let Some(report) = text["text"].as_str().filter(|report| !report.trim().is_empty()) else {
+            return response_failure(None, COMMAND, "Plan explorer returned no report", None);
+        };
+        response_success(None, COMMAND, Some(json!({"report": &report[..report.floor_char_boundary(crate::plan_mode::MAX_REPORT)]})))
+    }
+
+    async fn handle_plan_explorer_hook(&self, payload: &Value) -> DaemonResponse {
+        const COMMAND: &str = "plan_explorer_hook";
+        let result = async {
+            let scope: crate::plan_mode::Scope = serde_json::from_value(payload["scope"].clone())?;
+            {
+                let core = self.core.lock().unwrap();
+                anyhow::ensure!(core.active_session_id == scope.actor, "Wrong Plan root worker");
+                anyhow::ensure!(payload["hook"] == crate::plan_mode::EXPLORER && payload["payload"]["action"] == "finished"
+                    || core.running_admission_ids.contains(&scope.admission), "Plan root admission ended");
+            }
+            let actor = payload["actor"].as_str().filter(|actor| *actor != scope.actor)
+                .ok_or_else(|| anyhow::anyhow!("Invalid Plan explorer actor"))?;
+            scope.child_read_hook(&self.host_hooks, actor, payload["hook"].as_str().unwrap_or_default(), payload["payload"].clone()).await
+        }.await;
+        match result {
+            Ok(value) => response_success(None, COMMAND, Some(value)),
+            Err(error) => response_failure(None, COMMAND, &error.to_string(), None),
+        }
     }
 
     fn handle_get_last_assistant_text(&self) -> DaemonResponse {

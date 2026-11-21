@@ -3,11 +3,11 @@
 //! turn state machine, and the export/telemetry reads.
 
 use super::{
-    artifact_reference, json, map_thinking_level, now_millis, AgentSessionEngine, Arc,
-    BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun, CompactionOutcome,
-    CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection, ParentIdentity,
-    PromptContextBoundary, PromptRequest, ProviderTarget, SessionEngine, SideQuestionOutcome,
-    SideQuestionRequest, StartupScope, TurnPrompt, Value, DEFAULT_RLM_MAX_DEPTH,
+    AgentSessionEngine, Arc, BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun,
+    CompactionOutcome, CompactionRequest, CompactionRun, DEFAULT_RLM_MAX_DEPTH, EngineEvent,
+    EngineModelSelection, ParentIdentity, PromptContextBoundary, PromptRequest, ProviderTarget,
+    SessionEngine, SideQuestionOutcome, SideQuestionRequest, StartupScope, TurnPrompt, Value,
+    artifact_reference, json, map_thinking_level, now_millis,
 };
 
 impl SessionEngine for AgentSessionEngine {
@@ -195,6 +195,7 @@ impl SessionEngine for AgentSessionEngine {
             Some((
                 crate::engine::PromptRequest {
                     batch: Vec::new(),
+                    restricted: None,
                     message: message.content.text(),
                     images: Vec::new(),
                     source: "user".to_string(),
@@ -675,7 +676,7 @@ impl SessionEngine for AgentSessionEngine {
             Err(error) => {
                 return CompactionOutcome::Failed {
                     error: error.to_string(),
-                }
+                };
             }
         };
         if let Err(error) = self.session_agent(&model) {
@@ -770,7 +771,7 @@ impl SessionEngine for AgentSessionEngine {
             Err(error) => {
                 return BranchSummaryOutcome::Failed {
                     error: error.to_string(),
-                }
+                };
             }
         };
         let api_key = self.resolve_request_api_key(&model);
@@ -1048,7 +1049,7 @@ impl SessionEngine for AgentSessionEngine {
                 return SideQuestionOutcome::Failed {
                     answer: String::new(),
                     error: error.to_string(),
-                }
+                };
             }
         };
         let agent = match self.session_agent(&model) {
@@ -1057,7 +1058,7 @@ impl SessionEngine for AgentSessionEngine {
                 return SideQuestionOutcome::Failed {
                     answer: String::new(),
                     error: error.to_string(),
-                }
+                };
             }
         };
         let question = request.question.clone();
@@ -1394,7 +1395,7 @@ impl SessionEngine for AgentSessionEngine {
         let mut emit = self.goal_tracking_emit(emit);
         // The accepted-turn row carries the skill-expanded text (the
         // transcript renders the skill card).
-        if request.message.starts_with("/skill:") {
+        if request.restricted.is_none() && request.message.starts_with("/skill:") {
             request.message = self.expand_skill_submission(&request.message);
         }
         // The batched rows expand in place before admission:
@@ -1404,6 +1405,16 @@ impl SessionEngine for AgentSessionEngine {
             if row.text.starts_with("/skill:") {
                 row.text = self.expand_skill_submission(&row.text);
             }
+        }
+        if request.restricted.is_some()
+            && (request.custom_message.is_some()
+                || request.message.trim_start().starts_with('/')
+                || !request.batch.is_empty())
+        {
+            emit(EngineEvent::Done(Err(
+                "Plan mode cannot execute a command or batch other input".to_string(),
+            )));
+            return;
         }
         // Session commands never admit a model turn or record a user row
         // (the durable echo row replaces it). Execute before admission so
@@ -1514,6 +1525,7 @@ impl SessionEngine for AgentSessionEngine {
                 text: request.message.clone(),
                 images: request.images.clone(),
                 batch: request.batch,
+                restricted: request.restricted,
             },
         };
         // A batch with image blocks routes to `settings.imageModel` when the

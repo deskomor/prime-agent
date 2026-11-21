@@ -59,6 +59,8 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
         tool_use_count: 0,
     }));
     TurnRunner {
+        plan_explorer: Arc::default(),
+        host_hooks: crate::host_hooks::HostHookBroker::new(Arc::new(|_| {})),
         core,
         input_pauses: crate::session_input_pause::InputPauseTable::new(),
         prompt_admissions: crate::prompt_admission::WorkerAdmissions::new(),
@@ -101,6 +103,7 @@ async fn turn_session_events(engine: Arc<dyn SessionEngine>) -> Vec<Value> {
                 queue_visible: true,
                 policy: TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             }],
         )
         .await;
@@ -234,6 +237,7 @@ async fn gate_sighting_events(
                 queue_visible: true,
                 policy: TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             }],
         )
         .await;
@@ -312,6 +316,7 @@ async fn a_suppressed_abort_still_ends_the_engine_turn() {
                     queue_visible: true,
                     policy: TurnPolicy::Queued,
                     forced_batch: false,
+                    plan: None,
                 }],
             )
             .await;
@@ -366,6 +371,7 @@ async fn a_turns_tool_executions_count_onto_the_summary() {
                 queue_visible: true,
                 policy: TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             }],
         )
         .await;
@@ -483,6 +489,7 @@ async fn model_transitions_reach_the_worker_owned_session_file() {
                     queue_visible: true,
                     policy: TurnPolicy::Queued,
                     forced_batch: false,
+                    plan: None,
                 }],
             )
             .await;
@@ -561,6 +568,7 @@ async fn prompt_restore_boundary_is_supplied_only_for_file_backed_stores() {
                     queue_visible: true,
                     policy: TurnPolicy::Queued,
                     forced_batch: false,
+                    plan: None,
                 }],
             )
             .await;

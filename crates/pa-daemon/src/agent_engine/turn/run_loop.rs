@@ -65,6 +65,30 @@ impl AgentSessionEngine {
         // worker's run-opening frames are the first run's, so the engine
         // forwards the later runs' opening frames.
         let boundary_passed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if matches!(
+            prompt,
+            TurnPrompt::User {
+                restricted: Some(_),
+                ..
+            }
+        ) {
+            self.threshold_checks_enabled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let outcome = self.run_model_turn(
+                TurnAdmission::FreshPrompt,
+                &prompt,
+                &accepted_rows,
+                &boundary_passed,
+                aborted,
+                emit,
+            );
+            match outcome {
+                TurnResult::Message(_) => emit(EngineEvent::Done(Ok(()))),
+                TurnResult::Aborted => emit(EngineEvent::DoneAborted),
+                TurnResult::Error { error, .. } => emit(EngineEvent::Done(Err(error))),
+            };
+            return;
+        }
         // TS resets `_overflowRecovery` when a message that starts an agent run enters the loop.
         self.reset_overflow_recovery();
         self.quota_parked_this_run

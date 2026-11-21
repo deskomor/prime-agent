@@ -12,6 +12,7 @@ fn prompt_images_ride_the_user_message_content() {
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: vec![pa_agent::types::ImageContent {
                 data: "QUJD".to_string(),
                 mime_type: "image/png".to_string(),
@@ -85,6 +86,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),
@@ -159,6 +161,7 @@ fn agent_engine_streams_updates_and_final_message() {
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: Vec::new(),
             message: "hi".to_string(),
             source: "user".to_string(),
@@ -239,6 +242,7 @@ fn lazy_build_restores_only_the_pre_admission_prompt_context() {
             prompt_index,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: vec![pa_agent::types::ImageContent {
                     data: "QUJD".to_string(),
                     mime_type: "image/png".to_string(),

@@ -487,6 +487,7 @@ mod tests {
             0,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: one_image(),
                 message: "describe this".to_string(),
                 source: "user".to_string(),
@@ -555,6 +556,7 @@ mod tests {
             0,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: one_image(),
                 message: "describe this".to_string(),
                 source: "user".to_string(),

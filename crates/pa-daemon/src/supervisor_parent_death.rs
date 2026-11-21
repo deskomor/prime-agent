@@ -6,11 +6,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::backpressure::RouteAdmission;
 use crate::registry::ResidentWorker;
-use crate::supervisor::{Supervisor, ROUTE_TIMEOUT_MS};
+use crate::supervisor::{ROUTE_TIMEOUT_MS, Supervisor};
 use pa_types::daemon::DaemonWorkerDescriptor;
 
 /// Retries for a child that could not be closed at death time (the kill route can
@@ -142,7 +142,10 @@ impl Supervisor {
     /// The resident workers whose durable create names the dead worker as their RLM
     /// parent. The join is the metadata's `parentActiveSessionId` alone: a resumed or
     /// forked copy of the parent's session must never adopt another worker's children.
-    async fn resident_children_of(&self, parent: &Arc<ResidentWorker>) -> Vec<Arc<ResidentWorker>> {
+    pub(crate) async fn resident_children_of(
+        &self,
+        parent: &Arc<ResidentWorker>,
+    ) -> Vec<Arc<ResidentWorker>> {
         let parent_id = {
             let descriptor = parent.descriptor.lock().await;
             descriptor.root_active_session_id.clone()

@@ -1,14 +1,14 @@
 //! Client connections: the per-connection task - read loop, dispatch,
 //! and the parsed-command execution surface.
 use super::{
-    app_version, broadcast, command_type_name, current_protocol_info,
+    Arc, AsyncBufReadExt, AsyncWriteExt, BufReader, ClientRouting, DAEMON_SCHEMA_ID,
+    DAEMON_SCHEMA_REVISION, DaemonCommand, DaemonOutbound, DaemonRuntimeIdentity, Duration,
+    EnvelopeParseError, Map, Ordering, Outbound, ROUTE_TIMEOUT_MS, ResidentWorker, Result,
+    RouteAdmission, Supervisor, TransportStream, TypedCreateRejection, UPDATE_PREPARING_MESSAGE,
+    Value, app_version, broadcast, command_type_name, current_protocol_info,
     daemon_closing_shutdown_event, input_admission_id, json, parse_supervisor_command_line,
     response_failure, response_line, response_success, salvage_command_type, salvage_id,
-    subscribers, update_gate_refuses, util, Arc, AsyncBufReadExt, AsyncWriteExt, BufReader,
-    ClientRouting, DaemonCommand, DaemonOutbound, DaemonRuntimeIdentity, Duration,
-    EnvelopeParseError, Map, Ordering, Outbound, ResidentWorker, Result, RouteAdmission,
-    Supervisor, TransportStream, TypedCreateRejection, Value, DAEMON_SCHEMA_ID,
-    DAEMON_SCHEMA_REVISION, ROUTE_TIMEOUT_MS, UPDATE_PREPARING_MESSAGE,
+    subscribers, update_gate_refuses, util,
 };
 
 /// TS `OWNED_WORKER_DISCONNECT_GRACE_MS`: how long a client-owned worker
@@ -774,6 +774,13 @@ impl Supervisor {
                     .await;
                 (vec![response_line(&response)], false)
             }
+            DaemonCommand::WorkerPlanExplore { worker_token, request, .. } => {
+                let response = match self.worker_plan_explore(worker_token, request.clone()).await {
+                    Ok(value) => response_success(Some(&command_id), &type_name, Some(value)),
+                    Err(error) => response_failure(Some(&command_id), &type_name, &error.to_string(), None),
+                };
+                (vec![response_line(&response)], false)
+            }
             DaemonCommand::WorkerRosterDelta {
                 worker_token,
                 summary,
@@ -949,6 +956,44 @@ impl Supervisor {
                     command_id,
                     type_name,
                     active_session_id,
+                )
+                .await
+            }
+            DaemonCommand::Prompt { rest, .. } | DaemonCommand::PromptAndWait { rest, .. }
+                if rest.contains_key("requiredPlanMode")
+                    || rest.contains_key("trustedPlanOwner") =>
+            {
+                Self::admission_failure(
+                    &command_id,
+                    &type_name,
+                    "Plan mode requires native prompt admission",
+                )
+            }
+            DaemonCommand::RespondHostHook {
+                active_session_id, ..
+            } => {
+                let owner = connection
+                    .host_hook_sessions
+                    .lock()
+                    .await
+                    .as_ref()
+                    .and_then(|sessions| sessions.get(active_session_id))
+                    .cloned();
+                let mut scoped = command.clone();
+                if let DaemonCommand::RespondHostHook { rest, .. } = &mut scoped {
+                    rest.remove("planOwner");
+                    if let Some(owner) = owner {
+                        rest.insert("planOwner".to_string(), json!(owner));
+                    }
+                }
+                let client_id = effective_client_id.lock().unwrap().clone();
+                self.route_client_command(
+                    &scoped,
+                    &client_id,
+                    attached,
+                    command_id,
+                    type_name,
+                    Some(stream),
                 )
                 .await
             }

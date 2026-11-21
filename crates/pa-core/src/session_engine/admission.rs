@@ -1,7 +1,7 @@
 use super::slash_commands::parse_session_command;
 use super::{
-    session_message_to_loop, user_prompt_message, AgentSession, PromptOptions, PromptOutcome,
-    SessionAgentMessage, SessionSlashCommand, StreamingBehavior,
+    AgentSession, PromptOptions, PromptOutcome, SessionAgentMessage, SessionSlashCommand,
+    StreamingBehavior, session_message_to_loop, user_prompt_message,
 };
 
 impl AgentSession {
@@ -110,7 +110,8 @@ impl AgentSession {
             super::host_resources::HostResourceInventory::default()
         };
         let skills = self.effective_skills();
-        let expand = options.expand_prompt_templates.unwrap_or(true);
+        let expand =
+            options.restricted.is_none() && options.expand_prompt_templates.unwrap_or(true);
         // TS `_finishSubmissionNormalization` order: skill commands expand first, prompt templates
         // second; both are gated by the same policy flag.
         let (normalized, used_skill) = if expand {
@@ -123,6 +124,10 @@ impl AgentSession {
         };
 
         if let Some(command) = parse_session_command(&self.slash_commands, &normalized) {
+            anyhow::ensure!(
+                options.restricted.is_none(),
+                "Plan mode does not execute session commands"
+            );
             return Ok(PromptOutcome::SessionCommand(command));
         }
 
@@ -139,7 +144,7 @@ impl AgentSession {
                 telemetry.note_skill_used();
             }
         }
-        if busy && options.streaming_behavior.is_none() {
+        if busy && (options.restricted.is_some() || options.streaming_behavior.is_none()) {
             anyhow::bail!(
                 "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
             );
@@ -270,7 +275,11 @@ impl AgentSession {
                     }),
                 );
             }
-            if options.return_after_accepted {
+            if let Some(restricted) = options.restricted {
+                self.agent
+                    .prompt_restricted(prompt_messages, restricted)
+                    .await?;
+            } else if options.return_after_accepted {
                 // `returnAfterAccepted`: this prompt never started, so its
                 // route must not survive (the failure path unwinds it like
                 // the plain prompt branch below).

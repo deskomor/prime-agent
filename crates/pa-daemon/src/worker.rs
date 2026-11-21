@@ -99,6 +99,8 @@ use crate::types::{AgentConnectionState, SessionActionSnapshot};
 
 pub struct Worker {
     pub(crate) config: WorkerConfig,
+    /// 0: ordinary worker, 1: unopened explorer, 2: explorer task already consumed.
+    pub(crate) plan_explorer: Arc<std::sync::atomic::AtomicU8>,
     /// The bind-time filesystem identity of this worker's own socket file
     /// (TS daemon-mode captures `socketIdentity` in the listen callback,
     /// daemon-mode.ts:718): the exit cleanups pass it as the unlink's
@@ -290,6 +292,7 @@ impl Worker {
     #[must_use]
     pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
         let events = Arc::new(EventPump::new());
+        let plan_explorer = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let core = SessionCore {
             active_session_id: config.active_session_id.clone(),
@@ -386,6 +389,28 @@ impl Worker {
             Arc::clone(&events),
             Arc::clone(&recovery),
         ));
+        let hook_core = Arc::clone(&core);
+        let hook_events = events.clone();
+        let host_hooks = crate::host_hooks::HostHookBroker::new(Arc::new(move |mut event| {
+            if event.get("type").and_then(serde_json::Value::as_str) == Some("host_hook_request")
+                && event.get("origin").is_none()
+            {
+                let core = hook_core.lock().unwrap();
+                event["origin"] = serde_json::json!({
+                    "activeSessionId": core.active_session_id,
+                    "sessionId": core.store.as_ref().map(SessionFile::session_id),
+                    "sessionFile": core.store.as_ref().map(|store| store.path.to_string_lossy()),
+                    "cwd": core.cwd,
+                    "parentSessionId": core.parent_session_id,
+                    "parentActiveSessionId": core.parent_active_session_id,
+                    "rlmChildId": core.rlm_child_id,
+                    "generation": core.generation,
+                    "eventSequence": core.last_event_sequence,
+                    "admissionIds": core.running_admission_ids,
+                });
+            }
+            emit_worker_event_with(&hook_core, &hook_events, event);
+        }));
         let (engine, agent_engine, roster_pushes): (
             std::sync::Arc<dyn SessionEngine>,
             Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
@@ -698,6 +723,8 @@ impl Worker {
                 );
             }
             let runner = TurnRunner {
+                plan_explorer: Arc::clone(&plan_explorer),
+                host_hooks: Arc::clone(&host_hooks),
                 recovery: Arc::clone(&recovery),
                 core: Arc::clone(&core),
                 input_pauses: input_pauses.clone(),
@@ -731,28 +758,6 @@ impl Worker {
             }),
             crate::tool_permission::TOOL_PERMISSION_TIMEOUT,
         );
-        let hook_core = Arc::clone(&core);
-        let hook_events = events.clone();
-        let host_hooks = crate::host_hooks::HostHookBroker::new(Arc::new(move |mut event| {
-            if event.get("type").and_then(serde_json::Value::as_str) == Some("host_hook_request")
-                && event.get("origin").is_none()
-            {
-                let core = hook_core.lock().unwrap();
-                event["origin"] = serde_json::json!({
-                    "activeSessionId": core.active_session_id,
-                    "sessionId": core.store.as_ref().map(SessionFile::session_id),
-                    "sessionFile": core.store.as_ref().map(|store| store.path.to_string_lossy()),
-                    "cwd": core.cwd,
-                    "parentSessionId": core.parent_session_id,
-                    "parentActiveSessionId": core.parent_active_session_id,
-                    "rlmChildId": core.rlm_child_id,
-                    "generation": core.generation,
-                    "eventSequence": core.last_event_sequence,
-                    "admissionIds": core.running_admission_ids,
-                });
-            }
-            emit_worker_event_with(&hook_core, &hook_events, event);
-        }));
         if let Some(concrete) = agent_engine.as_ref() {
             if let Some(reader) = concrete
                 .extra_host_handlers()
@@ -842,6 +847,7 @@ impl Worker {
             listener_closed: tokio::sync::Notify::new(),
             registration,
             supervisor_claims,
+            plan_explorer,
             core,
             engine,
             agent_engine,

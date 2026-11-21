@@ -1,7 +1,7 @@
 //! The quota-park machinery: the park policies, the resume-job lifecycle,
 //! the wake recovery, and the durable park/resume entries.
 use super::{
-    AgentSessionEngine, QuotaParkState, QUOTA_WAKE_MAX_RETRIES, QUOTA_WAKE_RETRY_DELAY_MS,
+    AgentSessionEngine, QUOTA_WAKE_MAX_RETRIES, QUOTA_WAKE_RETRY_DELAY_MS, QuotaParkState,
 };
 
 impl AgentSessionEngine {
@@ -91,8 +91,8 @@ impl AgentSessionEngine {
         abort: &str,
     ) -> Option<pa_core::session_engine::provider_park::ProviderParkOutcome> {
         use pa_core::session_engine::provider_park::{
-            is_quota_block_failure, provider_park_decision, quota_failure_reset_ms,
-            quota_parked_final_error, NoParkReason, ProviderParkDecision, ProviderParkOutcome,
+            NoParkReason, ProviderParkDecision, ProviderParkOutcome, is_quota_block_failure,
+            provider_park_decision, quota_failure_reset_ms, quota_parked_final_error,
         };
         let error = message
             .error_message
@@ -291,11 +291,13 @@ impl AgentSessionEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state);
         let resume_at_iso = pa_core::session::manager::format_iso(resume_at_ms as i64);
-        Some(pa_core::session_engine::provider_park::ProviderParkOutcome {
-            status_message: format!(
-                "Session is parked until {resume_at_iso} waiting for the provider usage reset; this turn ended without a retry: {error}"
-            ),
-        })
+        Some(
+            pa_core::session_engine::provider_park::ProviderParkOutcome {
+                status_message: format!(
+                    "Session is parked until {resume_at_iso} waiting for the provider usage reset; this turn ended without a retry: {error}"
+                ),
+            },
+        )
     }
 
     /// Record a park's resume (or drop) transition.
@@ -414,6 +416,7 @@ impl AgentSessionEngine {
                         agent_message_id: None,
                         custom_message: None,
                         batch: Vec::new(),
+                        restricted: None,
                     },
                     // A synthetic admission, not a minted continuation: no pending guard.
                     goal_update: None,

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::abort::{is_abort_error, AbortSignal};
+use crate::abort::{AbortSignal, is_abort_error};
 use crate::types::{
     AfterToolCallContext, AgentContext, AgentEvent, AgentMessage, AgentTool, AgentToolResult,
     AgentToolUpdateCallback, AssistantMessage, BeforeToolCallContext, ToolCall,
@@ -13,7 +13,7 @@ use crate::types::{
 
 use super::abort::race_with_abort;
 use super::run::clone_context;
-use super::tools::{find_tool, FinalizedToolCallOutcome, Preparation, PreparedToolCall};
+use super::tools::{FinalizedToolCallOutcome, Preparation, PreparedToolCall, find_tool};
 use super::{AgentEventSink, AgentLoopConfig};
 
 /// Tool lookup, `prepareArguments`, schema validation, and the
@@ -26,6 +26,11 @@ pub(crate) async fn prepare_tool_call(
     config: &AgentLoopConfig,
     signal: Option<&AbortSignal>,
 ) -> Preparation {
+    if let Some(restricted) = &config.restricted {
+        let result =
+            (restricted.dispatch)(tool_call.clone(), signal.cloned().unwrap_or_default()).await;
+        return Preparation::Immediate(result);
+    }
     let Some(tool) = find_tool(&current_context.tools, &tool_call.name) else {
         return Preparation::Immediate(AgentToolResult::error(format!(
             "Tool {} not found",

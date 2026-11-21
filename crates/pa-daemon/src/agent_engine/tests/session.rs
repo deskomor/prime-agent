@@ -469,6 +469,7 @@ fn run_skill_prompt_body(
     engine.run_prompt(
         0,
         PromptRequest {
+            restricted: None,
             batch: batch
                 .iter()
                 .map(|text| PromptBatchRow {
@@ -728,6 +729,7 @@ fn host_advice_is_published_once_without_repeating_the_accepted_custom_row() {
             message: String::new(),
             images: Vec::new(),
             batch: Vec::new(),
+            restricted: None,
             source: "user".to_string(),
             agent_message_id: None,
             custom_message: Some(json!({

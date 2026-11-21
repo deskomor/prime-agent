@@ -35,7 +35,7 @@ use pa_agent::agent_loop::AfterToolCallFn;
 use pa_agent::types::{AfterToolCallResult, ToolResultContent};
 use pa_core::kernel::shared::{HostHandlerFn, HostRequestPayload};
 use pa_core::session_engine::host_hooks::HostCallGateFn;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 /// The tool-result override hook (optional).
@@ -59,7 +59,7 @@ pub(crate) const MESSAGE_END: &str = "message_end";
 /// Hear each finished user `!` bash run (optional, notification).
 pub(crate) const USER_BASH_END: &str = "user_bash_end";
 /// Every hook a client may enable.
-pub(crate) const KNOWN_HOOKS: [&str; 20] = [
+pub(crate) const KNOWN_HOOKS: [&str; 23] = [
     "session_start",
     "agent_start",
     "turn_start",
@@ -80,6 +80,9 @@ pub(crate) const KNOWN_HOOKS: [&str; 20] = [
     RESOURCES_DISCOVER,
     MESSAGE_END,
     USER_BASH_END,
+    crate::plan_mode::PROMPT,
+    crate::plan_mode::VETO,
+    crate::plan_mode::TOOL,
 ];
 
 /// How long one hook waits for its answer unless the client sets another.
@@ -127,10 +130,11 @@ impl Default for HookConfig {
 #[derive(Default)]
 struct BrokerState {
     config: HookConfig,
-    pending: HashMap<String, oneshot::Sender<HookAnswer>>,
+    pending: HashMap<String, (oneshot::Sender<HookAnswer>, Option<String>)>,
     /// Set on an RLM child: its hooks go to the parent session.
     upstream: Option<HostHookUpstream>,
     owner_token: Option<String>,
+    plan_abort: Option<pa_agent::abort::AbortController>,
     /// The executing worker's ungated native observe reader, never its relay parent's.
     family_reader: Option<HostHandlerFn>,
 }
@@ -222,7 +226,7 @@ impl HostHookBroker {
             host_call_types,
             timeout: timeout.unwrap_or(HOST_HOOK_DEFAULT_TIMEOUT),
         };
-        for (_, answer) in state.pending.drain() {
+        for (_, (answer, _)) in state.pending.drain() {
             let _ = answer.send(Err("the host hooks changed".to_string()));
         }
         Ok(())
@@ -255,6 +259,19 @@ impl HostHookBroker {
     /// # Panics
     ///
     /// Panics when the broker lock is poisoned.
+    pub(crate) fn begin_plan(&self) -> AbortSignal {
+        let controller = pa_agent::abort::AbortController::new();
+        let signal = controller.signal();
+        self.state.lock().expect("host hook lock").plan_abort = Some(controller);
+        signal
+    }
+
+    pub(crate) fn abort_plan(&self) {
+        if let Some(controller) = self.state.lock().expect("host hook lock").plan_abort.take() {
+            controller.abort();
+        }
+    }
+
     pub(crate) fn set_owner_token(&self, owner: Option<String>) {
         self.state.lock().expect("host hook lock").owner_token = owner;
     }
@@ -269,17 +286,57 @@ impl HostHookBroker {
     ///
     /// Panics when the broker lock is poisoned.
     pub(crate) fn resolve(&self, request_id: &str, answer: HookAnswer) -> bool {
-        let Some(sender) = self
-            .state
-            .lock()
-            .expect("host hook lock")
-            .pending
-            .remove(request_id)
-        else {
+        self.resolve_scoped(request_id, answer, None)
+    }
+
+    pub(crate) fn resolve_scoped(
+        &self,
+        request_id: &str,
+        answer: HookAnswer,
+        owner: Option<&str>,
+    ) -> bool {
+        let mut state = self.state.lock().expect("host hook lock");
+        let Some((_, expected)) = state.pending.get(request_id) else {
             return false;
         };
+        if expected.as_deref().is_some_and(|expected| {
+            Some(expected) != owner || Some(expected) != state.owner_token.as_deref()
+        }) {
+            return false;
+        }
+        let (sender, _) = state.pending.remove(request_id).expect("pending checked");
         let _ = sender.send(answer);
         true
+    }
+
+    pub(crate) async fn call_plan(
+        &self,
+        hook: &str,
+        payload: Value,
+        signal: Option<AbortSignal>,
+        owner: &str,
+    ) -> HookAnswer {
+        self.call_bound(hook, payload, signal, None, Some(owner))
+            .await
+            .unwrap_or_else(|| Err("required host hook not enabled".to_string()))
+    }
+
+    pub(crate) async fn call_child_plan_read(
+        &self, hook: &str, payload: Value, owner: &str, actor: &str,
+    ) -> HookAnswer {
+        let signal = if hook == crate::plan_mode::EXPLORER && payload["action"] == "finished" {
+            None
+        } else {
+            let signal = self.state.lock().expect("host hook lock").plan_abort.as_ref()
+                .map(pa_agent::abort::AbortController::signal);
+            let Some(signal) = signal.filter(|signal| !signal.is_aborted()) else {
+                return Err("root Plan turn ended".into());
+            };
+            Some(signal)
+        };
+        let origin = (hook != crate::plan_mode::EXPLORER).then(|| json!({"activeSessionId":actor,"parentActiveSessionId":payload["scope"]["rootActiveSessionId"]}));
+        self.call_bound(hook, payload, signal, origin, Some(owner)).await
+            .unwrap_or_else(|| Err("required host hook not enabled".to_string()))
     }
 
     /// Ask the client one hook. `None` when the hook is off; otherwise the
@@ -307,11 +364,33 @@ impl HostHookBroker {
         signal: Option<AbortSignal>,
         origin: Option<Value>,
     ) -> Option<HookAnswer> {
+        self.call_bound(hook, payload, signal, origin, None).await
+    }
+
+    async fn call_bound(
+        &self,
+        hook: &str,
+        payload: Value,
+        signal: Option<AbortSignal>,
+        origin: Option<Value>,
+        owner: Option<&str>,
+    ) -> Option<HookAnswer> {
+        if crate::plan_mode::required_hook(hook) != owner.is_some() {
+            return None;
+        }
         let bounded_close = hook == "session_shutdown"
             && self.contract_v1.load(std::sync::atomic::Ordering::SeqCst);
         let route = {
             let mut state = self.state.lock().expect("host hook lock");
-            if !state.config.enabled.contains(hook) {
+            if owner.is_some_and(|owner| state.owner_token.as_deref() != Some(owner) || state.upstream.is_some())
+            {
+                return Some(Err("bound Plan host is no longer the session owner".into()));
+            }
+            if !state
+                .config
+                .enabled
+                .contains(crate::plan_mode::configured_hook(hook))
+            {
                 return None;
             }
             if let Some(upstream) = state.upstream.clone() {
@@ -319,8 +398,14 @@ impl HostHookBroker {
             } else {
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let (sender, receiver) = oneshot::channel();
-                state.pending.insert(request_id.clone(), sender);
-                let timeout = if bounded_close {
+                state
+                    .pending
+                    .insert(request_id.clone(), (sender, owner.map(str::to_string)));
+                let timeout = if hook == crate::plan_mode::QUESTION {
+                    Duration::from_secs(300)
+                } else if owner.is_some() {
+                    state.config.timeout.min(Duration::from_secs(15))
+                } else if bounded_close {
                     state.config.timeout.min(Duration::from_secs(2))
                 } else {
                     state.config.timeout
@@ -348,6 +433,9 @@ impl HostHookBroker {
         if let Some(origin) = origin {
             request["origin"] = origin;
         }
+        if let Some(owner) = owner {
+            request["planOwner"] = json!(owner);
+        }
         (self.emit)(request);
         let answer = tokio::select! {
             answer = receiver => answer.unwrap_or_else(|_| Err("the worker dropped the hook".to_string())),
@@ -359,12 +447,16 @@ impl HostHookBroker {
             .expect("host hook lock")
             .pending
             .remove(&request_id);
-        (self.emit)(json!({
+        let mut resolved = json!({
             "type": "host_hook_resolved",
             "requestId": request_id,
             "hook": hook,
             "outcome": if answer.is_ok() { "answered" } else { "failed" },
-        }));
+        });
+        if let Some(owner) = owner {
+            resolved["planOwner"] = json!(owner);
+        }
+        (self.emit)(resolved);
         Some(answer)
     }
 
@@ -530,16 +622,23 @@ impl HostHookBroker {
                     });
                 }
                 match broker.call(HOST_CALL, payload, None).await {
-                    None if broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst) && (request_type.starts_with("agent_message.")
-                        || request_type.starts_with("agent_observe.")) => Err(anyhow!(
-                        "The host could not provide a native session scope for {request_type}, so it was refused."
-                    )),
+                    None if broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst)
+                        && (request_type.starts_with("agent_message.")
+                            || request_type.starts_with("agent_observe.")) =>
+                    {
+                        Err(anyhow!(
+                            "The host could not provide a native session scope for {request_type}, so it was refused."
+                        ))
+                    }
                     None => Ok(None),
                     Some(Ok(answer)) => {
                         let scoped = broker.contract_v1.load(std::sync::atomic::Ordering::SeqCst);
-                        if !scoped && answer.get("allow").and_then(Value::as_bool) == Some(true) { Ok(None) }
-                        else { host_call_verdict(&request_type, &answer) }
-                    },
+                        if !scoped && answer.get("allow").and_then(Value::as_bool) == Some(true) {
+                            Ok(None)
+                        } else {
+                            host_call_verdict(&request_type, &answer)
+                        }
+                    }
                     Some(Err(reason)) => Err(anyhow!(
                         "The host could not check {request_type} ({reason}), so it was refused."
                     )),
@@ -708,9 +807,11 @@ mod tests {
             .await
             .unwrap();
         assert!(events.lock().unwrap().is_empty());
-        assert!(broker
-            .set_hooks(&["before_everything".to_string()], None, None)
-            .is_err());
+        assert!(
+            broker
+                .set_hooks(&["before_everything".to_string()], None, None)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -972,9 +1073,11 @@ mod tests {
         child.set_family_reader(pa_core::kernel::shared::host_handler(|_| async {
             anyhow::bail!("native roster unavailable")
         }));
-        assert!(gate("agent_observe.list".to_string(), json!({}))
-            .await
-            .is_err());
+        assert!(
+            gate("agent_observe.list".to_string(), json!({}))
+                .await
+                .is_err()
+        );
         assert!(events.lock().unwrap().is_empty());
     }
 
@@ -1004,9 +1107,11 @@ mod tests {
             })
         }));
         // The enforcement gate refuses without a parent answer.
-        assert!(broker.host_call_gate()("rlm.spawn".to_string(), json!({}))
-            .await
-            .is_err());
+        assert!(
+            broker.host_call_gate()("rlm.spawn".to_string(), json!({}))
+                .await
+                .is_err()
+        );
         // An optional hook the parent has off is no answer.
         assert!(broker.optional(TURN_END, json!({})).await.is_none());
         // Off in the child too: the parent is never asked.

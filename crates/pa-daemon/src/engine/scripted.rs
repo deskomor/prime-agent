@@ -2,10 +2,10 @@
 //! integration harness, its script records, the `SessionEngine` impl, and
 //! the abortable delay helper.
 use super::{
-    json, AbortSignal, AssistantSnapshot, BranchSummaryOutcome, BranchSummaryRequest,
-    BranchSummaryRun, CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent,
-    PromptRequest, ProviderRetryPolicy, Result, SessionEngine, SideQuestionOutcome,
-    SideQuestionRequest, SideQuestionSink, Value, UNBOUNDED_BACKOFF_MS,
+    AbortSignal, AssistantSnapshot, BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun,
+    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, PromptRequest,
+    ProviderRetryPolicy, Result, SessionEngine, SideQuestionOutcome, SideQuestionRequest,
+    SideQuestionSink, UNBOUNDED_BACKOFF_MS, Value, json,
 };
 
 /// A scripted faux session: replays a deterministic sequence of assistant
@@ -242,6 +242,7 @@ impl SessionEngine for ScriptedEngine {
         Some(crate::engine::GoalContinuation {
             request: crate::engine::PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 message: goal.message.clone(),
                 images: Vec::new(),
                 source: "user".to_string(),
@@ -271,6 +272,12 @@ impl SessionEngine for ScriptedEngine {
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
+        if request.restricted.is_some() {
+            emit(EngineEvent::Done(Err(
+                "Plan mode requires the native model engine".to_string(),
+            )));
+            return;
+        }
         let cancelled = || EngineEvent::Done(Err("prompt cancelled".to_string()));
         let scripted = self.responses.get(prompt_index).cloned();
         let text = match &scripted {
@@ -466,10 +473,10 @@ impl SessionEngine for ScriptedEngine {
         sink: &SideQuestionSink,
     ) -> SideQuestionOutcome {
         use pa_core::session_engine::provider_retry::{
-            complete_with_provider_retry, DEFAULT_PROVIDER_RETRY_POLICY,
+            DEFAULT_PROVIDER_RETRY_POLICY, complete_with_provider_retry,
         };
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Unscripted side questions echo, like the prompt fallback.
         if self.side_question.responses.is_empty() {

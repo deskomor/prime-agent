@@ -22,6 +22,7 @@ use crate::protocol::{response_failure, response_success, DaemonResponse};
 pub(crate) enum RosterFamilySeedOwner {
     Create,
     Registration,
+    PlanExplorer,
 }
 
 impl Supervisor {
@@ -280,6 +281,9 @@ impl Supervisor {
         let worker_socket = socket::worker_socket_path(&self.options.socket_path, &worker_id);
         let now = util::now_iso();
         let mut durable_rest = serde_json::Map::new();
+        if matches!(family_seed_owner, RosterFamilySeedOwner::PlanExplorer) {
+            durable_rest.insert(crate::plan_mode::EXPLORER.into(), json!(true));
+        }
         durable_rest.insert("cwd".to_string(), json!(cwd_value));
         if let Some(session_dir) = &session_dir {
             durable_rest.insert("sessionDir".to_string(), json!(session_dir));
@@ -405,7 +409,7 @@ impl Supervisor {
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, descriptor_path.clone());
         // Claim before registration can observe the newly inserted resident.
         resident.roster_family_seed_owned_by_create.store(
-            matches!(family_seed_owner, RosterFamilySeedOwner::Create),
+            matches!(family_seed_owner, RosterFamilySeedOwner::Create | RosterFamilySeedOwner::PlanExplorer),
             Ordering::SeqCst,
         );
         // TS stores `worker.launchEnv` before the spawn.

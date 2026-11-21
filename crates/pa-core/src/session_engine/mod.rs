@@ -63,7 +63,7 @@ use pa_agent::types::{AgentEvent, AgentMessage, ThinkingLevel};
 use pa_types::session::AgentMessage as SessionAgentMessage;
 use pa_types::session::FileEntry;
 
-use crate::session::manager::{capture_git_context, SessionManager};
+use crate::session::manager::{SessionManager, capture_git_context};
 use crate::skills::PromptTemplate;
 use slash_commands::{SessionSlashCommand, SlashCommandRegistry};
 
@@ -96,6 +96,7 @@ pub struct PromptOptions {
     /// TS `returnAfterAccepted: true`: the turn runs detached, admission
     /// returns once its run registers.
     pub return_after_accepted: bool,
+    pub restricted: Option<pa_agent::agent_loop::RestrictedRun>,
 }
 
 /// One co-delivered user row of a batched prompt admission.

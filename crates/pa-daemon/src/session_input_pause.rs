@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::protocol::{response_failure, response_success, DaemonResponse};
+use crate::protocol::{DaemonResponse, response_failure, response_success};
 use crate::worker::Worker;
 
 /// One held pause: the session it gates, the owning client identity, and
@@ -313,6 +313,7 @@ mod tests {
                 queue_visible: true,
                 policy: crate::worker::TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             });
         }
         // Clear a create-time permit so acquisition must wake this waiter.

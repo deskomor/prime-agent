@@ -52,10 +52,11 @@ pub(crate) async fn execute_tool_calls(
         .into_iter()
         .cloned()
         .collect::<Vec<ToolCall>>();
-    let has_sequential_tool_call = tool_calls.iter().any(|tc| {
-        find_tool(&current_context.tools, &tc.name).and_then(|tool| tool.execution_mode())
-            == Some(ToolExecutionMode::Sequential)
-    });
+    let has_sequential_tool_call = config.restricted.is_none()
+        && tool_calls.iter().any(|tc| {
+            find_tool(&current_context.tools, &tc.name).and_then(|tool| tool.execution_mode())
+                == Some(ToolExecutionMode::Sequential)
+        });
     if config.tool_execution == ToolExecutionMode::Sequential || has_sequential_tool_call {
         execute_tool_calls_sequential(
             current_context,

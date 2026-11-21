@@ -320,6 +320,23 @@ hook registration restores native tools and clears host prompt overrides.
 
 ## Optional Studio ACP host contract
 
+### Required Plan mode (v1)
+
+Request `required_plan_mode` in `clientCapabilities._meta["ai.primeintellect.prime-agent"].hostContract.features` with `version: 1` and hooks `plan_prompt`, `plan_tool_veto`, and `plan_tool`. Require the matching feature in the initialize result. Activate one `session/prompt` with `_meta["ai.primeintellect.prime-agent"].planMode = {version: 1, turnId, askEnabled?}`. Omission leaves ordinary tool permissions unchanged. Plan admits plain prompts to an idle root with no resident or wakeable children. Normal native child creation from that root is fenced until settle.
+
+Plan hook payloads contain `scope: {turnId, admissionId, rootActiveSessionId, actorActiveSessionId}`. Echo the exact scope on success and structured refusal. The host lease authenticates the answering socket; the scope correlates the answer. `plan_prompt` replies with `appendSystemPrompt`. `plan_tool_veto` receives `toolName`, `toolCallId`, `input`, and replies with `allow` and a `reason` on denial. Only a positive decision allows lookup of the fixed host tools. `plan_tool` receives the same call fields and returns `{scope, ok:true, result}` or `{scope, ok:false, reason}`. A missing or unusable answer never falls back to a normal tool.
+
+Tools: `studio_plan_read {command,args}`, `studio_plan_propose {title,markdown,steps:[{text,note?}]}`, and, with `askEnabled:true`, `studio_plan_ask {questions:[{question,header,options:[{label,description,preview?}],multiSelect?}]}`. Proposal success has `result: {accepted:true,proposalId,proposal:{title,markdown,steps}}`. The validated host result is stored as the tool result and ends the restricted run. That run does not drive automatic refinement or autonomous continuation.
+
+Questions use JSON-RPC `_ai.primeintellect.prime-agent/plan_question` with the same tool payload and result envelope. The question wait is separate from the bounded policy hook wait and lasts up to 300 seconds. `_ai.primeintellect.prime-agent/plan_question_cancelled` carries `{sessionId,requestId}` with the original JSON-RPC request ID. Dismiss the pending question without sending an answer after cancellation.
+
+
+#### Read-only Plan exploration
+
+Negotiate and require the `required_plan_explore` feature in addition to `required_plan_mode`, then set `exploreEnabled: true` on the root activation. `studio_plan_explore {task}` accepts only a nonblank task, at most 4,000 UTF-8 bytes. It uses `plan_tool_veto` but does not invoke `plan_tool` for the spawn. The native supervisor starts one explorer at a time in the root's workspace, using the same engine. The explorer has only `studio_plan_read`; its report returns as `{report}` with at most 12,000 UTF-8 bytes. It cannot propose, delegate, or accept ordinary session commands. It has no saved session or RLM ledger edge.
+
+The supervisor requests `hook: "plan_explorer"` over the existing authenticated ACP hook transport. It uses the root origin and `payload: {scope, action: "admitted" | "finished"}`. The host must bind the assigned child actor to the active root admission before acknowledging `admitted` with `{scope, ok:true}`. Only then can that child send `plan_tool_veto` and `plan_tool` for `studio_plan_read`, with the child's identity in `scope.actorActiveSessionId` and `origin.activeSessionId`, and the root in `origin.parentActiveSessionId`. An unrelated actor cannot reuse the root's admission. `finished` permanently revokes the actor for that turn, including when an admission acknowledgment never arrived, and expects the same acknowledgment. Stop cancels admission, prevents future child reads, and closes the child even if startup returns late.
+
 Initialize opts in with `clientCapabilities._meta["ai.primeintellect.prime-agent"].hostContract.version = 1`.
 The response publishes the implemented v1 features. Hook callbacks use
 `_ai.primeintellect.prime-agent/hook`; negotiated hooks default to 150 seconds.

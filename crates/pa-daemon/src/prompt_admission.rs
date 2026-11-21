@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::backpressure::RouteAdmission;
-use crate::protocol::{response_failure, response_line, response_success, DaemonResponse};
+use crate::protocol::{DaemonResponse, response_failure, response_line, response_success};
 use crate::supervisor::{
-    client_command_payload, client_route_timeout, Supervisor, ROUTE_TIMEOUT_MS,
+    ROUTE_TIMEOUT_MS, Supervisor, client_command_payload, client_route_timeout,
 };
 use crate::worker::Worker;
 
@@ -218,13 +218,27 @@ impl Supervisor {
             .prompt_admissions
             .with(&key, |admission| admission.worker_admission_id.clone())
         else {
+            if matches!(command, pa_types::daemon::DaemonCommand::Prompt { rest, .. } | pa_types::daemon::DaemonCommand::PromptAndWait { rest, .. }
+                if rest.contains_key("requiredPlanMode") || rest.contains_key("trustedPlanOwner"))
+            {
+                return Self::admission_failure(
+                    &command_id,
+                    &type_name,
+                    "Plan mode admission is no longer live",
+                );
+            }
             // An admission that vanished before the route: prompt through
             // the generic path.
             return self
                 .route_client_command(command, client_id, attached, command_id, type_name, None)
                 .await;
         };
-        let timeout = client_route_timeout(command);
+        let timeout = if matches!(command, pa_types::daemon::DaemonCommand::PromptAndWait { rest, .. } if rest.contains_key("requiredPlanMode"))
+        {
+            30 * 60 * 1000
+        } else {
+            client_route_timeout(command)
+        };
         // Resolve the session (the generic route's wake-aware resolution).
         let mut rebound_to: Option<String> = None;
         let resident = if let Ok(resident) = self.registry.resolve(active_session_id).await {
@@ -285,9 +299,55 @@ impl Supervisor {
         let (command_type, mut payload) = match client_command_payload(command, client_id) {
             Ok(payload) => payload,
             Err(error) => {
-                return Self::admission_failure(&command_id, &type_name, &error.to_string())
+                return Self::admission_failure(&command_id, &type_name, &error.to_string());
             }
         };
+        payload
+            .as_object_mut()
+            .expect("command payload")
+            .remove("trustedPlanOwner");
+        if payload.get("requiredPlanMode").is_some() {
+            let leases = connection.host_hook_sessions.lock().await;
+            let owner = leases
+                .as_ref()
+                .and_then(|sessions| sessions.get(active_session_id));
+            let Some(owner) = owner else {
+                connection.prompt_admissions.remove(&key);
+                return Self::admission_failure(
+                    &command_id,
+                    &type_name,
+                    "Plan mode requires the bound root host lease",
+                );
+            };
+            if rebound_to.is_some() || !self.active_host_owners.lock().unwrap().contains(owner) {
+                connection.prompt_admissions.remove(&key);
+                return Self::admission_failure(
+                    &command_id,
+                    &type_name,
+                    "Plan mode cannot move to an unbound session",
+                );
+            }
+            payload["trustedPlanOwner"] = json!(owner);
+        }
+        let _family = if payload.get("requiredPlanMode").is_some() {
+            match crate::plan_mode::FamilyGuard::acquire(self, &resident).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    connection.prompt_admissions.remove(&key);
+                    return Self::admission_failure(&command_id, &type_name, &error.to_string());
+                }
+            }
+        } else {
+            None
+        };
+        let _explore = if let Some(activation) = payload.get("requiredPlanMode")
+            .and_then(|value| crate::plan_mode::Activation::parse(value).ok())
+            .filter(|activation| activation.explore_enabled)
+        {
+            Some(crate::supervisor::plan_explore::ExploreGuard::register(self, &resident,
+                crate::plan_mode::Scope { activation, actor: active_session_id.to_string(),
+                    admission: worker_admission_id.clone(), owner: payload["trustedPlanOwner"].as_str().unwrap_or_default().to_string() }))
+        } else { None };
         payload["admissionId"] = json!(worker_admission_id);
         if let Some(current) = &rebound_to {
             payload["activeSessionId"] = json!(current);
@@ -426,7 +486,7 @@ impl Supervisor {
                 {
                     Ok(response) => response,
                     Err(error) => {
-                        return Self::admission_failure(command_id, type_name, &error.to_string())
+                        return Self::admission_failure(command_id, type_name, &error.to_string());
                     }
                 };
                 // The mapped status updates the supervisor record (TS
@@ -455,7 +515,11 @@ impl Supervisor {
         }
     }
 
-    fn admission_failure(command_id: &str, type_name: &str, error: &str) -> (Vec<Value>, bool) {
+    pub(crate) fn admission_failure(
+        command_id: &str,
+        type_name: &str,
+        error: &str,
+    ) -> (Vec<Value>, bool) {
         (
             vec![response_line(&response_failure(
                 Some(command_id),

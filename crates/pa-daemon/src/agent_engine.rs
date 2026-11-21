@@ -112,6 +112,7 @@ enum PromptContextBoundary {
 pub struct AgentSessionEngine {
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,
+    pub(crate) kernel_prewarm_disabled: std::sync::atomic::AtomicBool,
     /// The session-scoped ACP MCP store, shared with the core engine's prompt gating.
     pub(crate) mcp: std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
     /// The last emitted `goal_update`; unchanged states stay silent.

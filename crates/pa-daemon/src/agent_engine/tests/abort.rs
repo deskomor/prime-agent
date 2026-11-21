@@ -71,6 +71,7 @@ fn abort_in_flight_turn_cancels_a_mid_provider_wait() {
             0,
             PromptRequest {
                 batch: Vec::new(),
+                restricted: None,
                 images: Vec::new(),
                 message: "hello".to_string(),
                 source: "user".to_string(),
@@ -184,6 +185,7 @@ fn abort_racing_the_admission_prefix_settles_the_turn_before_the_provider_call()
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: Vec::new(),
             message: "held turn for the racing abort".to_string(),
             source: "user".to_string(),
@@ -581,6 +583,7 @@ fn abort_in_flight_turn_cancels_a_running_kernel_cell() {
                 0,
                 PromptRequest {
                     batch: Vec::new(),
+                    restricted: None,
                     images: Vec::new(),
                     message: "run the wedge cell".to_string(),
                     source: "user".to_string(),

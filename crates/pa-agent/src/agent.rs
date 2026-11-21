@@ -683,7 +683,7 @@ impl AgentInner {
         messages: Vec<AgentMessage>,
         skip_initial_steering_poll: bool,
     ) -> anyhow::Result<()> {
-        self.run_prompt_messages_with_start_signal(messages, skip_initial_steering_poll, None)
+        self.run_prompt_messages_with_start_signal(messages, skip_initial_steering_poll, None, None)
             .await
     }
 
@@ -694,19 +694,29 @@ impl AgentInner {
         messages: Vec<AgentMessage>,
         skip_initial_steering_poll: bool,
         started: Option<tokio::sync::oneshot::Sender<()>>,
+        restricted: Option<crate::agent_loop::RestrictedRun>,
     ) -> anyhow::Result<()> {
         let inner = Arc::clone(self);
         self.run_with_lifecycle(|signal, model_override| async move {
             if let Some(started) = started {
                 let _ = started.send(());
             }
-            let (context, config) = {
+            let (context, mut config) = {
                 let shared = inner.shared.lock().await;
                 (
                     Self::snapshot_locked(&shared),
                     inner.loop_config(&shared, skip_initial_steering_poll, model_override.as_ref()),
                 )
             };
+            if let Some(restricted) = restricted {
+                config.get_steering_messages = None;
+                config.get_follow_up_messages = None;
+                config.get_continuation_messages = None;
+                config.should_stop_after_turn = None;
+                config.should_stop_before_turn = Some(Arc::clone(&restricted.stopped));
+                config.tool_execution = ToolExecutionMode::Sequential;
+                config.restricted = Some(restricted);
+            }
             let emit: AgentEventSink = {
                 let inner = Arc::clone(&inner);
                 Arc::new(move |event| {
@@ -1273,6 +1283,17 @@ impl Agent {
         self.inner.run_prompt_messages(messages, false).await
     }
 
+    /// Start a restricted run without changing the session's normal tools or prompt.
+    pub async fn prompt_restricted(
+        &self,
+        messages: Vec<AgentMessage>,
+        restricted: crate::agent_loop::RestrictedRun,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .run_prompt_messages_with_start_signal(messages, true, None, Some(restricted))
+            .await
+    }
+
     /// Admit the prompt, return once its run registers, and let the run
     /// settle on its own; later failures ride the events, not this result.
     ///
@@ -1298,7 +1319,7 @@ impl Agent {
         let (failed_tx, failed_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
         tokio::spawn(async move {
             let result = inner
-                .run_prompt_messages_with_start_signal(messages, false, Some(started_tx))
+                .run_prompt_messages_with_start_signal(messages, false, Some(started_tx), None)
                 .await;
             if let Err(error) = result {
                 let _ = failed_tx.send(error);

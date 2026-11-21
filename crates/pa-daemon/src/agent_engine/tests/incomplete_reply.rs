@@ -91,6 +91,7 @@ fn run_request(
         0,
         PromptRequest {
             batch: Vec::new(),
+            restricted: None,
             images: Vec::new(),
             message: message.to_string(),
             source: "user".to_string(),

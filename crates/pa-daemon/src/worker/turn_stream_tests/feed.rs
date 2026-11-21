@@ -29,6 +29,7 @@ async fn the_waiting_prompt_resolves_only_after_the_turn_settles() {
                     queue_visible: true,
                     policy: TurnPolicy::Queued,
                     forced_batch: false,
+                    plan: None,
                 }],
             )
             .await;
@@ -70,6 +71,8 @@ fn live_feed_runner(engine: Arc<dyn SessionEngine>, socket: std::path::PathBuf) 
         });
     crate::roster_activity::spawn_roster_activity_watch(&events, roster_pushes.clone());
     TurnRunner {
+        plan_explorer: Arc::default(),
+        host_hooks: crate::host_hooks::HostHookBroker::new(Arc::new(|_| {})),
         recovery: Arc::new(Mutex::new(None)),
         core,
         input_pauses: crate::session_input_pause::InputPauseTable::new(),
@@ -136,6 +139,7 @@ async fn roster_feed_publishes_live_tool_activity() {
                 queue_visible: true,
                 policy: TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             }],
         )
         .await;

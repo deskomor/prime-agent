@@ -38,6 +38,7 @@ pub(crate) enum TurnPrompt {
         text: String,
         images: Vec<pa_agent::types::ImageContent>,
         batch: Vec<crate::engine::PromptBatchRow>,
+        restricted: Option<pa_agent::agent_loop::RestrictedRun>,
     },
     /// An injected custom row (goal continuations, RLM child terminal
     /// notices): the admission carries the row itself, so the transcript

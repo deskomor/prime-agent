@@ -308,6 +308,7 @@ impl Worker {
                     // "preparation" the direct hand-off; absent restores as queued.
                     policy: crate::worker::restored_turn_policy(payload),
                     forced_batch: false,
+                    plan: None,
                 };
                 if lane_follow_up {
                     core.follow_up.push_back(item);

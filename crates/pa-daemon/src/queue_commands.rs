@@ -5,9 +5,9 @@
 
 use serde_json::Value;
 
-use crate::protocol::{response_failure, response_success, DaemonResponse};
+use crate::protocol::{DaemonResponse, response_failure, response_success};
 use crate::worker::Lane;
-use crate::worker::{parse_prompt_images, TurnSettle, Worker};
+use crate::worker::{TurnSettle, Worker, parse_prompt_images};
 
 /// The wire lane names: `"steering"` and `"followUp"`.
 fn wire_lane(value: Option<&Value>) -> Option<Lane> {
@@ -274,6 +274,7 @@ mod tests {
                 queue_visible: true,
                 policy: crate::worker::TurnPolicy::Injected,
                 forced_batch: false,
+                plan: None,
             });
         }
         let queue = worker.dispatch("get_queue", &json!({})).await;
@@ -334,6 +335,7 @@ mod tests {
                 queue_visible: true,
                 policy: crate::worker::TurnPolicy::Injected,
                 forced_batch: false,
+                plan: None,
             });
         }
         let expected = "Heartbeat prompt: [heartbeat: every 10m run#0]\n\nnudge the mission";
@@ -539,6 +541,7 @@ mod tests {
                 queue_visible: true,
                 policy: crate::worker::TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             });
         }
         let response = worker
@@ -605,6 +608,7 @@ mod tests {
                 queue_visible: true,
                 policy: crate::worker::TurnPolicy::Queued,
                 forced_batch: false,
+                plan: None,
             });
 
         let replaced = worker

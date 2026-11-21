@@ -126,6 +126,13 @@ impl Worker {
         // One create in flight at a time: a concurrent create joins this open and
         // answers with the created summary instead of racing a second init.
         let _create_gate = self.create_gate.lock().await;
+        let explorer = payload[crate::plan_mode::EXPLORER] == true;
+        if explorer {
+            self.plan_explorer.store(1, std::sync::atomic::Ordering::Release);
+            if let Some(engine) = &self.agent_engine {
+                engine.kernel_prewarm_disabled.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let existing_summary = {
             let (core, inputs) = self.summary_inputs();
             core.created.then(|| self.summary_locked(&core, inputs))
@@ -896,7 +903,7 @@ impl Worker {
         }
         // Deliberate divergence from TS's eager create build: the response stays
         // model-independent; a build failure surfaces on the first demand seam.
-        if let Some(agent_engine) = &self.agent_engine {
+        if let Some(agent_engine) = self.agent_engine.as_ref().filter(|_| !explorer) {
             let engine = std::sync::Arc::clone(agent_engine);
             tokio::spawn(async move {
                 let Ok(model) = engine.resolve_model() else {
@@ -907,8 +914,10 @@ impl Worker {
         }
         // Bind the schedule catalog onto the session (artifact partition,
         // job rebind, scheduler start) — TS `rebindCronJobsToState`.
-        if let Err(error) = self.bind_scheduled_jobs().await {
-            return response_failure(None, "create", &error.to_string(), None);
+        if !explorer {
+            if let Err(error) = self.bind_scheduled_jobs().await {
+                return response_failure(None, "create", &error.to_string(), None);
+            }
         }
         // Recovery journal writes must not happen while holding the core
         // lock: record_recovery locks the core to read the store.

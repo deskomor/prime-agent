@@ -9,6 +9,7 @@ mod clients;
 mod launch_budget;
 mod notes;
 mod options;
+pub(crate) mod plan_explore;
 mod root_identity;
 mod routing;
 mod sessions;
@@ -53,7 +54,7 @@ pub(crate) use clients::client_command_payload;
 // The routing consts and refusal string keep their crate::supervisor::* paths stable
 // (external callers: supervisor_parent_death, create_reuse, prompt_admission, update_restore).
 pub(crate) use routing::{
-    client_route_timeout, ROUTE_TIMEOUT_MS, SUMMARY_TIMEOUT_MS, WORKER_NOT_CONNECTED,
+    ROUTE_TIMEOUT_MS, SUMMARY_TIMEOUT_MS, WORKER_NOT_CONNECTED, client_route_timeout,
 };
 
 // Called only by the supervision sibling module and in-file tests; lib-target unused.
@@ -62,55 +63,55 @@ pub(crate) use worker_lifecycle::RosterFamilySeedOwner;
 use worker_lifecycle::{probe_worker_socket, worker_connect_deadline};
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::future::join_all;
 use pa_types::daemon::{
     DaemonCommand, DaemonErrorInfo, DaemonOutbound, DaemonSessionLifecycle, DaemonWorkerDescriptor,
     DaemonWorkerLifecycle, DurableDaemonCreateCommand, SnapshotPurpose, UpdateId,
     UpdatePreparedMarker, UpdateTimeoutBudget,
 };
-use pa_types::platform::transport::{bind_transport, connect_transport, TransportStream};
-use serde_json::{json, Map, Value};
+use pa_types::platform::transport::{TransportStream, bind_transport, connect_transport};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backpressure::RouteAdmission;
 use crate::descriptor::{
-    create_command_payload, load_descriptors, persist_supervisor_config, persist_worker,
-    persist_worker_at, PersistedSupervisorConfig, TempSync, SUPERVISOR_CONFIG_FILE_NAME,
+    PersistedSupervisorConfig, SUPERVISOR_CONFIG_FILE_NAME, TempSync, create_command_payload,
+    load_descriptors, persist_supervisor_config, persist_worker, persist_worker_at,
 };
 use crate::engine::EngineModelSelection;
-use crate::framing::{write_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMITS};
+use crate::framing::{DEFAULT_PRIVATE_FRAME_LIMITS, PrivateFrameReader, write_frame};
 use crate::paths;
 use crate::prompt_admission::input_admission_id;
 use crate::protocol::{
-    app_version, command_active_session_id, command_type_name, current_protocol_info,
-    parse_supervisor_command_line, response_failure, response_line, response_success,
-    DaemonResponse, DaemonRuntimeIdentity, EnvelopeParseError, TypedCreateRejection,
-    DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
+    DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION, DaemonResponse, DaemonRuntimeIdentity,
+    EnvelopeParseError, TypedCreateRejection, app_version, command_active_session_id,
+    command_type_name, current_protocol_info, parse_supervisor_command_line, response_failure,
+    response_line, response_success,
 };
 use crate::registry::{
     ResidentWorker, SessionRegistry, WorkerRegistration, WorkerReply, WorkerRequest,
 };
-use crate::saved_session_commands::{name_unavailable_error, reservation_key, NameScope};
+use crate::saved_session_commands::{NameScope, name_unavailable_error, reservation_key};
 use crate::session_store::list_sessions;
 use crate::snapshot_stream::{attach_client_capabilities, stream_attach, wants_chunked};
 use crate::update_prepare::{
-    marker_expires_at_iso, update_gate_refuses, write_prepared_artifacts, AbortOutcome,
-    BeginOutcome, MutationDrainLatch, PrepareCoordinator, PrepareOp, UPDATE_PREPARING_MESSAGE,
+    AbortOutcome, BeginOutcome, MutationDrainLatch, PrepareCoordinator, PrepareOp,
+    UPDATE_PREPARING_MESSAGE, marker_expires_at_iso, update_gate_refuses, write_prepared_artifacts,
 };
 // The drain-state machine that names it is the unix signal path.
 #[cfg(unix)]
 use crate::update_prepare::PrepareState;
 use crate::update_roster::{
-    build_update_roster, supervisor_identity, UpdateRosterInputs, WorkerSnapshot,
+    UpdateRosterInputs, WorkerSnapshot, build_update_roster, supervisor_identity,
 };
-use crate::update_stop::{stop_workers_gracefully, WorkerStopVerdict, WORKER_REQUEST_TIMEOUT_MS};
+use crate::update_stop::{WORKER_REQUEST_TIMEOUT_MS, WorkerStopVerdict, stop_workers_gracefully};
 use crate::{socket, util};
 
 pub struct Supervisor {
@@ -162,6 +163,11 @@ pub struct Supervisor {
         std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<String>>>>,
     /// Child hook inheritance cannot cross an owner disconnect's cleanup scan.
     pub(crate) host_owner_admission: tokio::sync::Mutex<()>,
+    pub(crate) plan_topology: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+    pub(crate) plan_explorers: crate::supervisor::plan_explore::ExploreRegistry,
+    pub(crate) plan_roots: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(crate) active_host_owners: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The supervisor's agent roster (classified entries; the roster arms
     /// live in `supervisor_roster.rs`).
@@ -270,6 +276,9 @@ impl Supervisor {
             session_subscribers: subscribers::SessionSubscribers::new(),
             client_connections: std::sync::Mutex::new(std::collections::HashMap::new()),
             host_owner_admission: tokio::sync::Mutex::new(()),
+            plan_topology: std::sync::Mutex::default(),
+            plan_explorers: Arc::default(),
+            plan_roots: Arc::default(),
             active_host_owners: std::sync::Mutex::new(std::collections::HashSet::new()),
             roster: std::sync::Mutex::new(crate::agent_roster::AgentRoster::new()),
             last_published_roster: std::sync::Mutex::new(std::collections::HashMap::new()),

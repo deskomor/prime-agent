@@ -1,17 +1,19 @@
 //! One agent turn: the runner that admits queued input, drives the
 //! engine, and settles the result.
 use super::{
-    checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta,
-    emit_refinement_event_for_session, emit_refinement_row, gather_delivery_batch, json, oneshot,
-    session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify,
-    OutboundFrame, PromptRequest, QueueCheckpoint, QueuePriority, QueuedItem, Result,
+    ABORTED_TURN_SETTLE_ERROR, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane,
+    Map, Notify, OutboundFrame, PromptRequest, QueueCheckpoint, QueuePriority, QueuedItem, Result,
     SessionActionSnapshot, SessionCore, SessionEngine, TurnPolicy, TurnSettle, Value,
-    WorkerRecoveryJournal, ABORTED_TURN_SETTLE_ERROR,
+    WorkerRecoveryJournal, checkpoint_queue_recovery, compact_action_label,
+    create_daemon_event_meta, emit_refinement_event_for_session, emit_refinement_row,
+    gather_delivery_batch, json, oneshot, session_snapshot,
 };
 
 use std::sync::{Arc, Mutex};
 
 pub(super) struct TurnRunner {
+    pub(super) plan_explorer: Arc<std::sync::atomic::AtomicU8>,
+    pub(super) host_hooks: Arc<crate::host_hooks::HostHookBroker>,
     pub(crate) core: Arc<Mutex<SessionCore>>,
     pub(super) input_pauses: crate::session_input_pause::InputPauseTable,
     /// The prompt-admission registry: an admitted prompt clears when its
@@ -357,7 +359,29 @@ impl TurnRunner {
                 .map_or(0, crate::session_store::SessionFile::message_count)
                 / 2
         };
+        let plan = first.plan.clone();
+        let explorer = self.plan_explorer.load(std::sync::atomic::Ordering::Acquire) == 2;
+        let plan_run = plan.is_some() || explorer;
+        let restricted = match plan {
+            Some(scope) => {
+                let signal = self.host_hooks.begin_plan();
+                if self.core.lock().unwrap().abort_requested {
+                    self.host_hooks.abort_plan();
+                }
+                let explore = crate::plan_mode::native_explore(
+                    Arc::clone(&self.passivation.link), self.passivation.worker_token.clone(), scope.admission.clone(), signal.clone());
+                scope
+                    .start(Arc::clone(&self.host_hooks), signal, Some(explore))
+                    .await
+                    .map(Some)
+            }
+            None if explorer => Ok(Some(crate::plan_mode::child_run(crate::plan_mode::native_read(
+                Arc::clone(&self.passivation.link), self.passivation.worker_token.clone())))),
+            None => Ok(None),
+        };
+        let plan_error = restricted.as_ref().err().map(ToString::to_string);
         let request = PromptRequest {
+            restricted: restricted.ok().flatten(),
             batch: batched
                 .iter()
                 .map(|item| crate::engine::PromptBatchRow {
@@ -1139,7 +1163,15 @@ impl TurnRunner {
             if file_backed {
                 engine.set_prompt_context_boundary(prompt_context_leaf);
             }
-            engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
+            if let Some(error) = plan_error {
+                if aborted_probe() {
+                    emit(EngineEvent::DoneAborted);
+                } else {
+                    emit(EngineEvent::Done(Err(error)));
+                }
+            } else {
+                engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
+            }
             let persistence_failed = persistence_error_seen.lock().unwrap().is_some();
             if persistence_failed {
                 emit(EngineEvent::DoneAborted);
@@ -1267,11 +1299,17 @@ impl TurnRunner {
         }
         // The turn is fully unwound: the waiting prompt now resolves, so
         // a client's next request always observes the idle session.
+        if plan_run {
+            self.host_hooks.abort_plan();
+        }
         let settled_outcome = turn_outcome.lock().unwrap().take();
         if let Some(result) = settled_outcome {
             for done in items_done {
                 let _ = done.send(result.clone());
             }
+        }
+        if plan_run {
+            return;
         }
         // The compact-trigger review services off the settle as a
         // background round: the queued next prompt's admission never
